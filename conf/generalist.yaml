@@ -1,0 +1,79 @@
+# conf/generalist.yaml
+# PHASE 1: Unified Generalist configuration.
+
+defaults:
+  - /dataset: default
+  - _self_
+
+# --- Experiment Metadata ---
+run_name: "gen_v1_${now:%Y-%m-%d_%H-%M-%S}"
+seed: 42
+compile_model: false
+
+# --- Directory Paths ---
+output_dir: "outputs/phase1"           # Main output directory
+checkpoint_dir: "outputs/phase1/checkpoints"  # Where checkpoints are saved
+log_dir: "outputs/phase1/logs"         # Training logs directory
+backup_dir: null                        # Remote/backup directory
+resume_from: null                       # Explicit checkpoint to resume from (optional)
+
+# --- Model Architecture (ICUUnifiedPlanner) ---
+model:
+  input_dim: 28
+  static_dim: 6
+  history_len: 24
+  pred_len: 6
+  d_model: 512
+  n_heads: 8
+  n_layers: 6
+  encoder_layers: 4
+  ffn_dim_ratio: 4
+  dropout: 0.1
+  use_rope: true
+  use_swiglu: true
+  use_flash_attn: true
+  gradient_checkpointing: false
+  timesteps: 100
+  beta_schedule: "cosine"
+  prediction_type: "epsilon"
+  use_ddim_sampling: true
+  use_auxiliary_head: true
+  num_phases: 3 # Tri-Phase: Stable, Pre-Sepsis, Sepsis
+
+# --- Training Hyperparameters ---
+train:
+  phase: "phase1"
+  epochs: 100
+  batch_size: 64
+  num_workers: 2
+  lr: 2e-4
+  min_lr: 1e-6
+  weight_decay: 1e-4
+  grad_clip: 1.0
+  pos_weight: 32.6  # Handling 3.1% Sepsis imbalance
+  precision: "16-mixed"
+  accumulate_grad_batches: 1
+  log_every_n_steps: 10
+  val_batches: 50  # Number of validation batches per epoch
+  
+  # AWR (Advantage Weighted Regression) v2.0
+  awr_beta: 0.5        # Optimal temperature (target ESS ~ 50%)
+  awr_max_weight: 20.0 # Clips extreme clinical gradients
+  
+  # EMA (Exponential Moving Average)
+  ema_decay: 0.9999
+  monitor: "val/clinical_auroc"
+  patience: 10
+  
+  # Optimization Groups
+  backbone_lr_ratio: 1.0
+  backbone_modules:
+    - "encoder"
+    - "backbone"
+
+# --- Logging ---
+logging:
+  use_wandb: true
+  wandb_project: "icu-diffusion-phase1"
+  wandb_mode: "offline"
+  run_name: ${run_name}

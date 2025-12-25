@@ -1,0 +1,79 @@
+# conf/specialist.yaml
+# PHASE 2: Unified Specialist (APEX-MoE) configuration.
+
+defaults:
+  - /dataset: default
+  - _self_
+
+# --- Experiment Metadata ---
+run_name: "apex_v1_${now:%Y-%m-%d_%H-%M-%S}"
+seed: 42
+compile_model: false
+
+# --- Directory Paths ---
+output_dir: "outputs/phase2"
+checkpoint_dir: "outputs/phase2/checkpoints"
+log_dir: "outputs/phase2/logs"
+backup_dir: null
+resume_from: null
+
+# --- Model Architecture ---
+# MUST matches Phase 1 for weight loading.
+model:
+  input_dim: 28
+  static_dim: 6
+  history_len: 24
+  pred_len: 6
+  d_model: 512
+  n_heads: 8
+  n_layers: 6
+  encoder_layers: 4
+  ffn_dim_ratio: 4
+  dropout: 0.1
+  use_rope: true
+  use_swiglu: true
+  use_flash_attn: true
+  gradient_checkpointing: false
+  timesteps: 100
+  beta_schedule: "cosine"
+  prediction_type: "epsilon"
+  use_ddim_sampling: true
+  use_auxiliary_head: true
+  num_phases: 3 # Tri-Phase: Stable, Pre-Sepsis, Sepsis
+
+# --- Training / Specialist Hyperparameters ---
+train:
+  phase: "phase2"
+  # Mandatory for Phase 2: Update this path after Phase 1!
+  pretrained_path: "outputs/phase1/gen_v1_.../checkpoints/latest_checkpoint.pt"
+  
+  epochs: 50
+  batch_size: 64
+  num_workers: 2
+  lr: 1e-4
+  min_lr: 1e-6
+  weight_decay: 1e-4
+  grad_clip: 1.0
+  precision: "16-mixed"
+  accumulate_grad_batches: 1
+  log_every_n_steps: 10
+  
+  # APEX-MoE Specifics
+  crash_weight: 5.0   # Up-weight Sepsis gradients
+  lambda_reg: 0.05    # Cross-expert tether (prevents mode drift)
+  
+  # AWR Optimization v2.0
+  awr_beta: 0.5
+  awr_max_weight: 20.0
+  ema_decay: 0.999    # Faster EMA update for adaptation
+  
+  # Optimization Groups
+  backbone_lr_ratio: 1.0
+  backbone_modules: []
+
+# --- Logging ---
+logging:
+  use_wandb: true
+  wandb_project: "icu-diffusion-phase2"
+  wandb_mode: "online"
+  run_name: ${run_name}
