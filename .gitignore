@@ -26,7 +26,7 @@ share/python-wheels/
 *.egg
 MANIFEST
 .redhot
-
+APEX_MoE_Colab_Master.ipynb
 docs/
 # Unit test / coverage reports
 .coverage
