@@ -39,7 +39,7 @@ APEX-MoE features an automated, tiered data acquisition pipeline that ensures re
 | Tier | Source | Priority | Description |
 | :--- | :--- | :--- | :--- |
 | **0** | Local Storage | ⚡ Immediate | Uses lightning-fast SoA LMDB files from `./data`. |
-| **1** | Hugging Face | ⬇️ Auto-Fallback | Downloads pre-built datasets from `hellxhell/sepsis-icu`. |
+| **1** | Hugging Face | ⬇️ Auto-Fallback | Downloads pre-built datasets from `hellxhell/sepsis-clinical-28`. |
 | **2** | Kaggle Raw | 🛠️ Full Build | Ultimate fallback: Downloads raw PSV and builds LMDBs locally. |
 
 ---
