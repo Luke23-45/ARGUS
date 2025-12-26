@@ -1,0 +1,8 @@
+# conf/dataset/default.yaml
+# Dataset configuration for the ICU forecasting task.
+
+dataset_dir: "sepsis_clinical_28" # Root folder for data storage
+hf_repo: "hellxhell/sepsis-clinical-28" # Public pre-processed data
+augment_noise: 0.01      # Noise injection (Std Dev) for training robustness
+max_cache_size: 128      # LRU cache size for LMDB chunks
+force_download: false    # Redownload from HF even if local data exists

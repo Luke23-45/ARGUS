@@ -1,0 +1,15 @@
+torch
+pytorch-lightning
+hydra-core
+omegaconf
+huggingface_hub
+pandas
+numpy
+lmdb
+tqdm
+wandb
+einops
+kagglehub
+matplotlib
+seaborn
+scikit-learn
