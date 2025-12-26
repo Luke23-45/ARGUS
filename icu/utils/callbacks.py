@@ -30,12 +30,22 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
     Callback,
     RichProgressBar,
-    RichProgressBarTheme,
     ModelSummary,
     LearningRateMonitor,
     DeviceStatsMonitor,
     EarlyStopping
 )
+
+# [FIX: Robust Import for RichProgressBarTheme (Colab/Older PL versions)]
+try:
+    from pytorch_lightning.callbacks import RichProgressBarTheme
+except ImportError:
+    try:
+        from pytorch_lightning.callbacks.progress.rich_progress import RichProgressBarTheme
+    except ImportError:
+        # Fallback: Create a dummy if it literally doesn't exist (safety first)
+        logger.warning("RichProgressBarTheme not found in PL callbacks. Using default.")
+        RichProgressBarTheme = lambda **kwargs: None
 from torchmetrics.classification import BinaryAUROC, BinaryAveragePrecision, BinaryCalibrationError
 from omegaconf import DictConfig, OmegaConf
 

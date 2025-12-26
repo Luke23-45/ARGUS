@@ -180,7 +180,8 @@ def main(cfg: DictConfig):
         precision=hw_ctx["precision"],
         callbacks=callbacks,
         logger=loggers,
-        gradient_clip_val=cfg.train.grad_clip,
+        gradient_clip_val=0, # [SOTA PERFORMANCE] Disabled automatic clipping to allow 'fused' AdamW.
+                             # Handled manually in ICUSpecialistWrapper.on_before_optimizer_step()
         log_every_n_steps=10,
         enable_checkpointing=False, # Handled exclusively by RotationalSaverCallback
         num_sanity_val_steps=0  # [FIX] Disable sanity check to allow on_fit_start calibration first

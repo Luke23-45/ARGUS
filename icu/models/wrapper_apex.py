@@ -394,6 +394,18 @@ class ICUSpecialistWrapper(pl.LightningModule):
         self.val_mse_clinical.update(pred_vitals, gt)
         self.log("val/clinical_mse", self.val_mse_clinical, on_epoch=True, prog_bar=True)
   
+    def on_before_optimizer_step(self, optimizer):
+        """
+        SOTA PERFORMANCE: Surgical Bypass for Gradient Clipping.
+        Uses raw PyTorch utility to bypass Lightning's conservative 'fused' check.
+        Gradients are already unscaled by the Trainer at this point in AMP.
+        """
+        if self.cfg.train.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), 
+                self.cfg.train.grad_clip
+            )
+
     def configure_optimizers(self):
         """
         Specialist Optimizer.

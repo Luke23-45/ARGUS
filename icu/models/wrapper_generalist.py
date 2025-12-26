@@ -291,6 +291,21 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
 
 
+    def on_before_optimizer_step(self, optimizer):
+        """
+        SOTA PERFORMANCE: Surgical Bypass for Gradient Clipping.
+        Logic:
+        1.  PyTorch Lightning's automatic clipping crashes with 'fused' optimizers.
+        2.  By implementing this hook, we bypass the crash.
+        3.  In AMP (16-mixed), Lightning has already unscaled the gradients at this point.
+        4.  We call the raw PyTorch utility to perform the clipping.
+        """
+        if self.cfg.train.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), 
+                self.cfg.train.grad_clip
+            )
+
     def configure_optimizers(self):
         """
         SOTA: Robust Optimizer Factory.

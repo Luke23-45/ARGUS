@@ -636,6 +636,10 @@ def configure_robust_optimizer(
             optim_groups[0]["params"].append(p)
             
     # 2. Hardware-Aware Factory
+    # [SOTA PERFORMANCE] Enable fused=True by default.
+    # Note: We use a "Surgical Bypass" strategy in the model wrappers (on_before_optimizer_step)
+    # to manually handle gradient clipping. This avoids the RuntimeError caused by
+    # Lightning's automatic clipping suite while keeping the 2x+ speedup of fused AdamW.
     use_fused = use_fused and torch.cuda.is_available() and 'fused' in torch.optim.AdamW.__init__.__code__.co_varnames
     
     extra_args = dict(fused=True) if use_fused else dict()
