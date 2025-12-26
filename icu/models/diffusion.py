@@ -322,7 +322,7 @@ class TemporalFusionEncoder(nn.Module):
         # 5. Encoding
         for layer in self.layers:
             if self.cfg.gradient_checkpointing:
-                x = checkpoint(layer, x, cos, sin, full_mask)
+                x = checkpoint(layer, x, cos, sin, full_mask, use_reentrant=False)
             else:
                 x = layer(x, cos, sin, full_mask)
         
@@ -505,7 +505,8 @@ class DiffusionActionHead(nn.Module):
             if self.cfg.gradient_checkpointing:
                 x = checkpoint(
                     block, x, cond, context_seq, 
-                    cos_fut, sin_fut, cos_hist, sin_hist, ctx_mask
+                    cos_fut, sin_fut, cos_hist, sin_hist, ctx_mask,
+                    use_reentrant=False
                 )
             else:
                 x = block(
@@ -646,7 +647,13 @@ class ICUUnifiedPlanner(nn.Module):
             
             if self.cfg.use_auxiliary_head and "phase_label" in batch:
                 logits = self.aux_head(global_ctx)
-                aux_loss = F.cross_entropy(logits, batch["phase_label"].long(), reduction='none')
+                
+                # [CRITICAL FIX] Logic Parity: Slice to Clinical Phases (3)
+                # This prevents anti-gradients from affecting dormant MoE experts in Phase 1.
+                K = 3 # Clinical Phases: Stable, Pre-Shock, Shock
+                effective_logits = logits[:, :K] if logits.shape[-1] > K else logits
+                
+                aux_loss = F.cross_entropy(effective_logits, batch["phase_label"].long(), reduction='none')
             else:
                 aux_loss = torch.zeros(B, device=past.device)
         else:
@@ -657,9 +664,17 @@ class ICUUnifiedPlanner(nn.Module):
                 
                 # SOTA: Apply class weighting for the 3.1% Sepsis Imbalance
                 # Expected Order: [Stable, Pre-Shock, Shock]
-                # Default weight of 32.6 corresponds to the User's Research Findings.
                 w = batch.get("aux_weight") 
-                aux_loss = F.cross_entropy(logits, batch["phase_label"].long(), weight=w)
+                
+                # [CRITICAL FIX] Handle num_phases > labels mismatch (e.g. 6 vs 3)
+                # If weights are provided for fewer classes than logits, we slice the logits.
+                # This ensures the Generalist can be built with 6 outputs (ready for MoE)
+                # while still being trained on 3 clinical phases.
+                effective_logits = logits
+                if w is not None and logits.shape[-1] > w.shape[0]:
+                    effective_logits = logits[:, :w.shape[0]]
+                
+                aux_loss = F.cross_entropy(effective_logits, batch["phase_label"].long(), weight=w)
                 
         # [PATCH] Dead Critic Fix: Include Value Loss if Target Provided
         # Get Dense Value Sequence [B, pred_len]
@@ -677,6 +692,7 @@ class ICUUnifiedPlanner(nn.Module):
             "loss": total,
             "diffusion_loss": diff_loss,
             "aux_loss": aux_loss,
+            "aux_logits": logits, # [FIX] Return logits for Metric Callback
             "value_loss": value_loss,
             "pred_value": pred_val
         }

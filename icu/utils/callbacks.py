@@ -16,11 +16,13 @@ Status: PRODUCTION-READY / FRONTIER-PROJECT (v3.6.2 - Patched)
 
 from __future__ import annotations
 
+
 import logging
 import os
 import sys
 import time
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -36,7 +38,10 @@ from pytorch_lightning.callbacks import (
     EarlyStopping
 )
 
+from rich.progress import TextColumn, BarColumn, TimeRemainingColumn
+from rich.table import Column
 # [FIX: Robust Import for RichProgressBarTheme (Colab/Older PL versions)]
+logger = logging.getLogger("icu.callbacks")
 try:
     from pytorch_lightning.callbacks import RichProgressBarTheme
 except ImportError:
@@ -48,6 +53,7 @@ except ImportError:
         RichProgressBarTheme = lambda **kwargs: None
 from torchmetrics.classification import BinaryAUROC, BinaryAveragePrecision, BinaryCalibrationError
 from omegaconf import DictConfig, OmegaConf
+from pytorch_lightning.callbacks import TQDMProgressBar
 
 # Project Imports
 # [FIX: Import get_rank to prevent NameError crash]
@@ -59,7 +65,7 @@ from icu.utils.train_utils import (
     get_rank 
 )
 
-logger = logging.getLogger("icu.callbacks")
+
 
 # ==============================================================================
 # 0. UI: CLINICAL CONSOLE (Aesthetic Overhaul)
@@ -74,76 +80,102 @@ APEX_RICH_THEME = RichProgressBarTheme(
     metrics="bold spring_green3"
 )
 
+from rich.text import Text
+
+class ProcessingSpeedColumn(TextColumn):
+    def __init__(self, style="grey53"):
+        super().__init__("", style=style)
+
+    def render(self, task) -> Text:
+        if task.speed is None:
+            return Text("", style=self.style) 
+        return Text(f"{task.speed:.2f} it/s", style=self.style)
+
+class APEXMetricsColumn(TextColumn):
+    def __init__(self):
+        super().__init__("") 
+
+    def render(self, task) -> Text:
+        m_str = task.fields.get("metrics_str", "")
+        return Text(m_str, style="spring_green3", no_wrap=True, overflow="ellipsis")
+
+
+
 class APEXProgressBar(RichProgressBar):
     """
-    Subclass of RichProgressBar for the APEX-MoE "Clinical Console".
-    
-    Fixes reported by USER:
-    1.  **Metric Surgery**: Removes noisy 'v_num' (Version Number).
-    2.  **Scientific Precision**: Rounds all floats to 4 decimals for readability.
-    3.  **Branding**: Prepend stethoscope icon to indicate clinical context.
-    4.  **Layout**: High-contrast medical theme (SkyBlue/SpringGreen).
+    Standard PL RichProgressBar with 'SOTA' metric formatting.
+    Removes dangerous custom column overrides to ensure stability.
     """
-    def get_metrics(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> Dict[str, Union[int, str]]:
-        # 1. Grab raw metrics
+    def get_metrics(self, trainer, pl_module) -> Dict[str, str]:
+        # 1. Let Parent calculate standard metrics (Loss, v_num, etc.)
         items = super().get_metrics(trainer, pl_module)
         
-        # 2. Metric Surgery: Remove noise
+        # 2. Remove internal keys we don't want to see
         items.pop("v_num", None)
         
-        # 3. CONSOLIDATION: Merge all losses into one high-density string 
-        # to prevent Rich from wrapping columns vertically.
-        loss_telemetry = []
-        other_metrics = {}
-        
+        # 3. Format the remaining metrics tightly
+        clean_metrics = {}
         for k, v in items.items():
-            # Formatting
-            val = f"{v:.3f}" if isinstance(v, float) else str(v)
+            # Format numbers to 3 decimals
+            val = f"{v:.3f}" if isinstance(v, (float, int)) else str(v)
             
-            # Shorten keys logic
-            sk = k.replace("train/", "").replace("val/", "")
-            sk = sk.replace("total_loss", "L").replace("loss", "L") 
-            sk = sk.replace("diff_L", "D").replace("aux_L", "A")
-            sk = sk.replace("expert_L", "Exp").replace("reg_L", "Reg")
-            sk = sk.replace("critic_L", "Crt").replace("value_L", "Crt")
-            sk = sk.replace("stable_L", "S").replace("preshock_L", "P").replace("crash_L", "C")
-            sk = sk.replace("batch_size", "B")
+            # Create Short Keys (SOTA Style)
+            # Example: val/clinical_auroc -> A
+            sk = k.replace("train/", "").replace("val/", "").replace("health/", "")
+            sk = sk.replace("total_loss", "L").replace("loss", "L")
+            sk = sk.replace("diff_L", "D").replace("aux_L", "A").replace("value_L", "V")
+            sk = sk.replace("clinical_", "").replace("auroc", "AUC").replace("auprc", "PRC")
+            sk = sk.replace("generative_mse", "GMSE").replace("generative_mae", "GMAE")
+            sk = sk.replace("policy_entropy", "E").replace("explained_variance", "EV")
+            sk = sk.replace("preshock_L", "PS").replace("stable_L", "S").replace("crash_L", "C")
+            sk = sk.replace("ood_rate", "OOD").replace("grad_norm_total", "GN").replace("max_weight", "MW")
             
-            # Categorize: Losses vs Metrics
-            if any(x in sk for x in ["L", "D", "A", "Exp", "Reg", "Crt", "S", "P", "C", "ess"]):
-                loss_telemetry.append(f"{sk}:{val}")
+            clean_metrics[sk] = val
+            
+        return clean_metrics
+
+
+
+class APEXTQDMProgressBar(TQDMProgressBar):
+    """
+    Stabilized TQDM Bar for ICU Research.
+    Guarantees 'In-Place' updates (No Newline Spam) while keeping SOTA metric formatting.
+    """
+    def __init__(self):
+        # Update every 20 steps to reduce IO overhead
+        super().__init__(refresh_rate=20)
+
+    def get_metrics(self, trainer, pl_module) -> Dict[str, Union[int, str]]:
+        # 1. Get standard metrics from Lightning
+        items = super().get_metrics(trainer, pl_module)
+        
+        # 2. Remove internal/noisy keys
+        items.pop("v_num", None)
+        
+        # 3. Reformat Keys for 'SOTA' Compactness
+        # Output will look like: L:0.342 | A:0.891 | D:0.012
+        clean_metrics = {}
+        for k, v in items.items():
+            # Apply formatting to floats (3 decimals)
+            if isinstance(v, (float, int)):
+                val = f"{v:.3f}"
             else:
-                other_metrics[sk] = val
-        
-        # 4. Final Payload: One "Stats" entry + any others (AUC, etc)
-        res = {}
-        if loss_telemetry:
-            res["Stats"] = "|".join(loss_telemetry)
-        res.update(other_metrics)
-        
-        return res
-
-    def configure_columns(self, trainer: pl.Trainer) -> list:
-        # Get standard columns
-        cols = super().configure_columns(trainer)
-        
-        # STRIP REDUNDANCY: Maximize space for clinical metrics
-        # We identify columns by their class name string to be robust across PL versions
-        new_cols = []
-        for c in cols:
-            c_type = str(type(c)).lower()
-            # Remove Speed and Elapsed time to save horizontal real-estate
-            if "speed" in c_type or "elapsed" in c_type:
-                continue
-            new_cols.append(c)
+                val = str(v)
             
-        return new_cols
-
-    def on_train_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
-        # Branding injection
-        if self.progress is not None:
-             self.progress.console.print("🩺 [bold cyan]APEX Clinical Console Initializing...[/]")
-        super().on_train_start(trainer, pl_module)
+            # Shorten Keys
+            # train/loss -> L, val/clinical_auroc -> A, diff_L -> D
+            sk = k.replace("train/", "").replace("val/", "").replace("health/", "")
+            sk = sk.replace("total_loss", "L").replace("loss", "L")
+            sk = sk.replace("diff_L", "D").replace("aux_L", "A").replace("value_L", "V")
+            sk = sk.replace("clinical_", "").replace("auroc", "AUC").replace("auprc", "PRC")
+            sk = sk.replace("generative_mse", "GMSE").replace("generative_mae", "GMAE")
+            sk = sk.replace("policy_entropy", "E").replace("explained_variance", "EV")
+            sk = sk.replace("preshock_L", "PS").replace("stable_L", "S").replace("crash_L", "C")
+            sk = sk.replace("ood_rate", "OOD").replace("grad_norm_total", "GN").replace("max_weight", "MW")
+            
+            clean_metrics[sk] = val
+            
+        return clean_metrics
 
 # ==============================================================================
 # 1. SAFETY: ANOMALY GUARDIAN
@@ -346,10 +378,9 @@ class GradientHealthMonitor(Callback):
             
             total_norm = torch.cat(all_grads).norm(2).item()
             
-            # [FIX: Telemetry Z-Fighting]
             # Use sync_dist=True with reduce_fx="max" to log the WORST gradient norm across GPUs.
             # This prevents noisy logs and highlights instability on any rank.
-            pl_module.log("health/grad_norm_total", total_norm, on_step=True, sync_dist=True, reduce_fx="max")
+            pl_module.log("health/grad_norm_total", total_norm, on_step=True, sync_dist=True, reduce_fx="max", prog_bar=True)
             
             # 2. Expert Utilization (MoE Check)
             expert_patterns = {} 
@@ -452,86 +483,80 @@ class EMACallback(Callback):
 # ==============================================================================
 
 class RotationalSaverCallback(Callback):
-    """
-    High-Resilience Atomic Saver for Life-Critical AI.
-    """
-    def __init__(
-        self, 
-        save_dir: str, 
-        remote_dir: Optional[str] = None, 
-        monitor: str = "val/clinical_auroc",
-        filename_prefix: str = "icu_model"
-    ):
+    def __init__(self, save_dir: str, remote_dir: Optional[str] = None, monitor: str = "val/clinical_auroc", filename_prefix: str = "icu_model"):
         super().__init__()
-        self.saver = RotationalSaver(
-            save_dir=save_dir, 
-            remote_dir=remote_dir, 
-            keep_last_n=3,
-            snapshot_every_n=50
-        )
+        self.saver = RotationalSaver(save_dir=save_dir, remote_dir=remote_dir, keep_last_n=3, snapshot_every_n=50)
         self.monitor = monitor
-        # Detect direction based on metric name for sensible default
-        if "loss" in monitor or "mse" in monitor or "mae" in monitor:
-            self.best_metric_val = float('inf')
-            self.mode = "min"
-        else:
-            self.best_metric_val = -1.0
-            self.mode = "max"
-            
         self.filename_prefix = filename_prefix
+        
+        # Determine mode
+        if any(x in monitor for x in ["loss", "mse", "mae", "error"]):
+            self.mode = "min"
+            self.best_metric_val = float('inf')
+        else:
+            self.mode = "max"
+            self.best_metric_val = -float('inf') # Use neg inf, not -1 (metrics can be negative)
 
-    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
-        if not is_main_process():
-            return
+    # [FIX 3] Move logic to Validation End to ensure metrics are fresh
+    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        if not is_main_process(): return
+        if trainer.sanity_checking: return # Don't save during sanity check
 
         epoch = trainer.current_epoch
         metrics = trainer.callback_metrics
         
-        # 1. Determine 'Is Best'
+        # [FIX 4] Robust Fetching
         current_val = metrics.get(self.monitor)
-        is_best = False
         
-        if current_val is not None:
-            cv = current_val.item() if torch.is_tensor(current_val) else current_val
-            
-            if self.mode == "min":
-                if cv < self.best_metric_val:
-                    self.best_metric_val = cv
-                    is_best = True
-            else:
-                if cv > self.best_metric_val:
-                    self.best_metric_val = cv
-                    is_best = True
+        # If metric is missing (e.g. first epoch or wrong name), skip logic but maybe save latest
+        if current_val is None:
+            return 
 
-        # 2. Extract Robust State
+        cv = current_val.item() if torch.is_tensor(current_val) else current_val
+        
+        # [FIX 5] Handle "Amnesia" - If best_val is default, try to read from PL's internal checkpoint state
+        # (Note: A full fix for Amnesia requires loading state_dict, but this is a quick guard)
+        # If current value is WAY off (e.g. 0.5 vs 0.9), we might be in a resume. 
+        # For now, we simply compare. 
+        
+        is_best = False
+        if self.mode == "min":
+            if cv < self.best_metric_val:
+                self.best_metric_val = cv
+                is_best = True
+        else:
+            if cv > self.best_metric_val:
+                self.best_metric_val = cv
+                is_best = True
+
+        # Prepare State
         full_state = {
             'epoch': epoch,
             'global_step': trainer.global_step,
             'state_dict': pl_module.model.state_dict(),
-            # Safely grab EMA state if available
             'ema_state_dict': pl_module.ema.state_dict() if hasattr(pl_module, 'ema') and pl_module.ema else None,
             'optimizer_states': [opt.state_dict() for opt in trainer.optimizers],
-            'config': OmegaConf.to_container(pl_module.cfg, resolve=True),
+            'config': OmegaConf.to_container(pl_module.cfg, resolve=True) if hasattr(pl_module, 'cfg') else {},
             'metrics': {k: v.item() if torch.is_tensor(v) else v for k, v in metrics.items()}
         }
         
-        # 3. Atomic Save
-        self.saver.save(
-            state_dict=full_state, 
-            epoch=epoch, 
-            is_best=is_best,
-            filename_prefix=self.filename_prefix
-        )
+        self.saver.save(state_dict=full_state, epoch=epoch, is_best=is_best, filename_prefix=self.filename_prefix)
+
+    # [FIX 6] Add load_state_dict to fix Amnesia properly
+    def load_state_dict(self, state_dict):
+        self.best_metric_val = state_dict.get("best_metric_val", self.best_metric_val)
+
+    def state_dict(self):
+        return {"best_metric_val": self.best_metric_val}
 
 # ==============================================================================
 # 6. SOTA FACTORY
 # ==============================================================================
 
 def get_sota_callbacks(cfg: DictConfig) -> List[Callback]:
-    """Generates the definitive Guardian Battery for APEX-MoE."""
     callbacks = []
 
-    # 1. Core Engines
+    # 1. Core Engines (Saver, EMA) - Keep as is
     save_dir = f"{cfg.output_dir}/{cfg.run_name}/checkpoints"
     saver_cb = RotationalSaverCallback(
         save_dir=save_dir,
@@ -545,20 +570,22 @@ def get_sota_callbacks(cfg: DictConfig) -> List[Callback]:
     if ema_decay > 0:
         callbacks.append(EMACallback(decay=ema_decay))
 
-    # 2. Guardians
+    # 2. Guardians (Anomaly, Metric, Health) - Keep as is
     callbacks.append(AnomalyGuardian(halt_on_anomaly=True))
-    callbacks.append(ClinicalMetricCallback(inputs_are_logits=True)) # Default assumption
+    callbacks.append(ClinicalMetricCallback(inputs_are_logits=True))
     callbacks.append(GradientHealthMonitor(log_every_n_steps=100))
 
-    # 3. Standard SOTA Monitoring
-    callbacks.append(APEXProgressBar(theme=APEX_RICH_THEME, leave=True))
+    # 3. Standard SOTA Monitoring (TQDM PATCH)
+    # [FIX] Switched to TQDM to kill newline spam in Notebooks/Colab
+    callbacks.append(APEXTQDMProgressBar())
+    
     callbacks.append(ModelSummary(max_depth=3))
     callbacks.append(LearningRateMonitor(logging_interval='step'))
     
     if torch.cuda.is_available():
         callbacks.append(DeviceStatsMonitor())
 
-    # 4. Early Stopping
+    # 4. Early Stopping - Keep as is
     patience = cfg.train.get("patience", 0)
     if patience > 0:
         callbacks.append(EarlyStopping(

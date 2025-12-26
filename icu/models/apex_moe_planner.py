@@ -57,10 +57,11 @@ class APEX_MoE_Planner(nn.Module):
         self, 
         generalist_model: ICUUnifiedPlanner, 
         phase_weights: Optional[List[float]] = None,
-        lambda_reg: float = 0.01
+        lambda_reg: float = 0.01,
+        lambda_lb: float = 0.01  # [SOTA-Clinical] Load-balancing coefficient (Switch Transformer)
     ):
         super().__init__()
-        logger.info("Initializing APEX-MoE Specialist (Tri-Phase)...")
+        logger.info(f"Initializing APEX-MoE Specialist (SOTA-Clinical: {generalist_model.cfg.num_phases} Experts)...")
         
         # --- 1. BOOTSTRAPPING (Organ Harvesting) ---
         # We steal the initialized components from the pre-trained generalist.
@@ -89,11 +90,15 @@ class APEX_MoE_Planner(nn.Module):
         self.history_rope = getattr(generalist_model, 'history_rope', None)
         
         # --- 2. PHASE-LOCKING (Freeze Perception) ---
-        # The "Eyes" (Encoder) and "Brain" (Router) must remain fixed 
-        # so the "Hands" (Experts) train against a stable reality.
+        # The "Eyes" (Encoder) must remain fixed so the "Hands" (Experts) train
+        # against a stable reality.
+        # [v4.1 FIX] UNFREEZE Router to allow sub-phase specialization.
+        # With 6 experts but only 3 GT phases, the router must learn which
+        # sub-expert (e.g., Expert 0 vs Expert 3) should handle each sample.
         
         self.encoder.requires_grad_(False)
-        self.router.requires_grad_(False)
+        # [v4.1] Router is now TRAINABLE for sub-phase discovery
+        self.router.requires_grad_(True)
         # [PATCH] Unfreeze Value Head to allow Critic adaptation during specialization
         self.value_head.requires_grad_(True) 
         
@@ -102,11 +107,12 @@ class APEX_MoE_Planner(nn.Module):
             
         # Put frozen parts in eval mode
         self.encoder.eval()
-        self.router.eval()
+        # [v4.1] Router stays in TRAIN mode
+        self.router.train()
         # [PATCH] Keep Value Head in train mode
         self.value_head.train()
         
-        logger.info(" - Perception Layer (Encoder/Router) FROZEN.")
+        logger.info(" - Encoder FROZEN. Router/Value Head TRAINABLE (v4.1 Sub-Phase Mode).")
         
         # --- 3. CLONING (Expert Forking) ---
         # Create N independent copies of the Diffusion Backbone
@@ -118,8 +124,9 @@ class APEX_MoE_Planner(nn.Module):
         
         # --- 4. CONFIGURATION ---
         self.lambda_reg = lambda_reg
+        self.lambda_lb = lambda_lb  # [SOTA-Clinical] Load-balancing coefficient
         
-        # Default weighting if none provided: [1.0, 5.0, 10.0] style
+        # Default weighting if none provided: [1.0, 5.0, 5.0, ...] style
         if phase_weights is None:
             # Auto-balance: Phase 0 is 1.0, others scale up
             self.phase_weights = [1.0] + [5.0] * (self.cfg.num_phases - 1)
@@ -130,17 +137,20 @@ class APEX_MoE_Planner(nn.Module):
             
         self.register_buffer("loss_weights", torch.tensor(self.phase_weights))
         logger.info(f" - Phase Weights: {self.phase_weights}")
-        logger.info(f" - Tethering Regularization: lambda={lambda_reg}")
+        logger.info(f" - Regularization: lambda_reg={lambda_reg}, lambda_lb={lambda_lb}")
+
 
     def train(self, mode: bool = True):
         """
         Robust Train Mode.
         Ensures frozen components stay in EVAL mode even when model.train() is called.
+        [v4.1] Router is now trainable and stays in train mode.
         """
         super().train(mode)
         # Force frozen parts to eval
         self.encoder.eval()
-        self.router.eval()
+        # [v4.1] Router is trainable - keep in train mode
+        self.router.train()
         # [PATCH] Keep Value Head in train mode
         self.value_head.train()
         return self
@@ -159,7 +169,13 @@ class APEX_MoE_Planner(nn.Module):
         awr_weights: Optional[torch.Tensor] = None # [PATCH] Re-add AWR support
     ) -> Dict[str, torch.Tensor]:
         """
-        The "Gradient Surgery" Forward Pass (Hard Gating).
+        The "Gradient Surgery" Forward Pass with GT-Masked Routing (v4.1).
+        
+        [v4.1] GT-Masked Routing:
+        - GT phases from dataset: {0: Stable, 1: Pre-Shock, 2: Shock}
+        - Model experts: {0, 1, 2, 3, 4, 5} (6 total, 2 per phase)
+        - Mapping: Phase L -> Experts {L, L+3}
+        - Router picks Top-1 within the allowed set for each sample.
         """
         if not self.training:
             return self.forward_inference(batch)
@@ -170,18 +186,17 @@ class APEX_MoE_Planner(nn.Module):
         static = batch["static_context"]
         src_mask = batch.get("src_mask", None)
         
-        # [PATCH] Robust Phase Label Resolution (Fixing Bug #3)
-        # If dataset provides 'phase_label', use it. 
-        # If not, fallback to 'outcome_label' mapping (Binary Compatibility).
+        # [CRITICAL FIX] Pull weights from batch if not passed explicitly as argument
+        # This occurs when calling self.model(batch) from Lightning's training_step
+        awr_weights = awr_weights if awr_weights is not None else batch.get("awr_weights", None)
+        
+        # [PATCH] Robust Phase Label Resolution
         if "phase_label" in batch:
-            phase_labels = batch["phase_label"]
+            gt_phases = batch["phase_label"]  # Values in {0, 1, 2}
         elif "outcome_label" in batch:
-            # Fallback: Map 0->Stable(0), 1->Shock(Last Phase)
-            # This allows training to proceed even if Pre-Shock (Phase 1) is missing
             gt = batch["outcome_label"].long()
-            phase_labels = torch.zeros_like(gt)
-            # Map Class 1 to the highest Phase Index (e.g., 2)
-            phase_labels[gt == 1] = self.cfg.num_phases - 1
+            gt_phases = torch.zeros_like(gt)
+            gt_phases[gt == 1] = 2  # Map positive outcome to Shock (Phase 2)
         else:
             raise ValueError("Batch missing both 'phase_label' and 'outcome_label'. Cannot route experts.")
 
@@ -190,27 +205,54 @@ class APEX_MoE_Planner(nn.Module):
         
         B = past.shape[0]
         device = past.device
+        N_GT_PHASES = 3  # Dataset provides 3 phases
+        N_SUB_EXPERTS = self.cfg.num_phases // N_GT_PHASES  # 2 sub-experts per phase
         
-        # --- 2. Shared Perception (No Grad) ---
+        # [DEFENSIVE] Validate GT phases are in expected range
+        assert gt_phases.max() < N_GT_PHASES, \
+            f"Invalid phase label detected: max={gt_phases.max()}, expected < {N_GT_PHASES}"
+        
+        # --- 2. Shared Perception (Encoder frozen, Router trainable) ---
         with torch.no_grad():
-            # [SOTA Fix] Handle triplet return from fixed TemporalFusionEncoder
-            # ctx_seq: [B, T_hist+1, D]
-            # global_ctx: [B, D]
-            # ctx_mask: [B, T_hist+1] (or similar)
             ctx_seq, global_ctx, ctx_mask = self.encoder(past_norm, static_norm, src_mask)
             
-            # RoPE Prep (Shared)
-            # The scheduler noise loop generates 't', so we prepare 'context_cos/sin'
             if self.history_rope:
-                # History length is T_hist+1 (due to static token)
                 context_cos, context_sin = self.history_rope(ctx_seq.shape[1], device)
             else:
                 context_cos, context_sin = None, None
 
-        # --- 3. Expert Execution Loop (With AWR Support) ---
+        # --- 3. Router Decision (TRAINABLE in v4.1) ---
+        router_logits = self.router(global_ctx)  # [B, 6] - Router predicts over all 6 experts
+        router_probs = F.softmax(router_logits, dim=-1)
+        
+        # --- 4. GT-Masked Routing ---
+        # For each sample, compute which expert to route to:
+        # Phase L (GT) -> allowed experts {L, L+3}
+        # Router picks the higher-prob one within this set.
+        
+        selected_experts = torch.zeros(B, dtype=torch.long, device=device)
+        
+        for gt_phase in range(N_GT_PHASES):
+            mask = (gt_phases == gt_phase)
+            if not mask.any():
+                continue
+            
+            # Allowed experts for this GT phase: {gt_phase, gt_phase + 3, ...}
+            # [SOTA-Clinical] v4.1 supports arbitrary sub-experts per phase
+            allowed_experts = [gt_phase + i * N_GT_PHASES for i in range(N_SUB_EXPERTS)]
+            allowed_experts = [exp for exp in allowed_experts if exp < self.cfg.num_phases]
+            
+            # Get router probs for the allowed experts/sub-experts
+            # If N_SUB_EXPERTS = 2, we pick the stronger of the two
+            sub_probs = router_probs[mask][:, allowed_experts] # [N_mask, N_sub]
+            sub_winner_idx = torch.argmax(sub_probs, dim=1)    # [N_mask] indices in {0, ..., N_sub-1}
+            
+            # Map back to absolute indices
+            selected_experts[mask] = torch.tensor(allowed_experts, device=device)[sub_winner_idx]
+        
+        # --- 5. Expert Execution Loop (Sparse) ---
         total_loss = torch.tensor(0.0, device=device)
         
-        # [PATCH] Explicit Compatibility Accumulators (Fixing Bug #1)
         loss_stable = torch.tensor(0.0, device=device)
         loss_preshock = torch.tensor(0.0, device=device)
         loss_crash = torch.tensor(0.0, device=device)
@@ -221,13 +263,13 @@ class APEX_MoE_Planner(nn.Module):
         t = torch.randint(0, self.cfg.timesteps, (B,), device=device)
         noisy_fut, noise_eps = self.scheduler.add_noise(fut_norm, t)
 
-        for phase_idx in range(self.cfg.num_phases):
-            # A. Identification
-            idx_mask = (phase_labels == phase_idx)
+        # Loop over experts that have at least one sample
+        for expert_idx in range(self.cfg.num_phases):
+            idx_mask = (selected_experts == expert_idx)
             indices = torch.nonzero(idx_mask).squeeze(-1)
             
-            count = len(indices)
-            batch_counts[f"count_phase_{phase_idx}"] = float(count)
+            count = indices.numel() if indices.dim() > 0 else (1 if len(indices) > 0 else 0)
+            batch_counts[f"count_expert_{expert_idx}"] = float(count)
             
             if count == 0:
                 continue
@@ -240,7 +282,7 @@ class APEX_MoE_Planner(nn.Module):
             sub_ctx_mask = ctx_mask[indices] if ctx_mask is not None else None
             
             # C. Expert Forward
-            expert = self.experts[phase_idx]
+            expert = self.experts[expert_idx]
             pred_noise = expert(
                 sub_noisy, sub_t, 
                 sub_ctx_seq, sub_global_ctx, 
@@ -259,22 +301,26 @@ class APEX_MoE_Planner(nn.Module):
                 loss_mse = loss_raw.mean()
             
             # E. Weighting & Accumulation
-            # Apply configured phase weight (e.g. 10.0 for Shock)
-            p_weight = self.loss_weights[phase_idx]
+            # [v4.1] Use expert_idx for loss weighting, not phase_idx
+            # Map expert to its base phase for legacy loss weights: expert % 3
+            base_phase = expert_idx % 3  # Maps {0,3}->0, {1,4}->1, {2,5}->2
+            p_weight = self.loss_weights[base_phase]
             weighted_loss = loss_mse * p_weight
             
-            # [PATCH] Mapping to Standardized Output Keys
-            if phase_idx == 0:
-                loss_stable = loss_mse
-            elif phase_idx == self.cfg.num_phases - 1:
-                loss_crash = loss_mse
+            # [v4.1] Mapping to Standardized Output Keys (by base phase)
+            if base_phase == 0:
+                loss_stable += loss_mse
+            elif base_phase == 2:
+                loss_crash += loss_mse
             else:
-                # Sum intermediate phases for preshock slot
                 loss_preshock += loss_mse
             
             # Add to total (scaled by batch proportion to maintain magnitude)
             if B > 0:
                 total_loss += weighted_loss * (count / B)
+            
+            # [Telemetry] Log individual expert losses
+            batch_counts[f"loss_expert_{expert_idx}"] = float(loss_mse.item())
 
         # --- 4. Tethering Regularization (Manifold Smoothing) ---
         # We sample a small random subset to minimize overhead
@@ -296,17 +342,78 @@ class APEX_MoE_Planner(nn.Module):
             for expert in self.experts:
                 outputs.append(expert(reg_noisy, t_reg, reg_ctx, reg_glob, reg_mask))
             
-            # Chain Loss: MSE(Exp0, Exp1) + MSE(Exp1, Exp2) ...
+            # Chain Loss: Link experts by severity and within phases
+            # Group 1: 0 -> 1 -> 2 | Group 2: 3 -> 4 -> 5 | Cross: 0-3, 1-4, 2-5
             chain_loss = 0.0
-            for i in range(len(outputs) - 1):
-                chain_loss += F.mse_loss(outputs[i], outputs[i+1])
-                
-            reg_loss = chain_loss * self.lambda_reg
+            N = self.cfg.num_phases
+            G = 3 # Clinical Phases
+            
+            # 1. Severity Continuum (Horizontal)
+            # Expert L -> Expert L+1 (within same sub-ensemble)
+            for i in [0, 1, 3, 4]:
+                if i+1 < N:
+                    chain_loss += F.mse_loss(outputs[i], outputs[i+1])
+            
+            # 2. Expert Pairing (Vertical)
+            # Expert i -> Expert i+G (Sub-experts specializing in the same clinical state)
+            for i in range(G):
+                if i+G < N:
+                    chain_loss += F.mse_loss(outputs[i], outputs[i+G])
+            
+            # 3. Temporal Smoothness (Self-Regularization)
+            # Penalize sudden jumps in the PREDICTED vitals over time
+            smoothness_loss = 0.0
+            for out in outputs:
+                # out: [B, T, D]
+                # diff: [B, T-1, D]
+                diff = out[:, 1:] - out[:, :-1]
+                smoothness_loss += (diff**2).mean()
+            
+            reg_loss = (chain_loss + 0.5 * smoothness_loss) * self.lambda_reg
             total_loss += reg_loss
+
+        # --- 6. Load-Balancing Auxiliary Loss (Switch Transformer Style) ---
+        # [v4.1] Updated to use SELECTED_EXPERTS (Router-driven) not GT phases
+        load_balance_loss = torch.tensor(0.0, device=device)
+        
+        if self.lambda_lb > 0 and B > 0:
+            # f_i: Fraction of samples ROUTED TO expert i (by Router)
+            # P_i: Mean probability assigned to expert i
+            N = self.cfg.num_phases
+            f = torch.zeros(N, device=device)
+            P = router_probs.mean(dim=0)  # [N] - Mean prob per expert
+            
+            for exp_idx in range(N):
+                f[exp_idx] = (selected_experts == exp_idx).float().mean()
+            
+            # Load balance loss: N * Σ(f_i * P_i)
+            load_balance_loss = self.lambda_lb * N * (f * P).sum()
+            total_loss += load_balance_loss
+        
+        # --- 7. Router Cross-Entropy Loss (Sub-Expert Supervision) ---
+        # [v4.1 CRITICAL FIX] Train router to predict BASE GT phase, not its own decisions
+        # Original bug: router_ce_loss = F.cross_entropy(router_logits, selected_experts)
+        # This created a self-supervision loop where the router learned to predict
+        # its own Top-1 choices, not the ground truth.
+        # 
+        # Fix: Map selected_experts back to GT phases for supervision
+        # {0,3}→0, {1,4}→1, {2,5}→2
+        gt_phase_targets = selected_experts % N_GT_PHASES
+        
+        # [SOTA 2025] Acuity-Aware Router Weighting
+        # Sepsis events are rare (3.1%). We boost the loss for Pre-Shock (1) and Shock (2)
+        # to ensure the router doesn't bias towards the 'Healthy' majority.
+        router_ce_loss_raw = F.cross_entropy(router_logits[:, :N_GT_PHASES], gt_phase_targets, reduction='none')
+        acuity_weights = torch.ones_like(gt_phase_targets, dtype=torch.float32)
+        acuity_weights[gt_phase_targets >= 1] = 5.0 # 5x focus on sepsis phases
+        
+        router_ce_loss = (router_ce_loss_raw * acuity_weights).mean()
+        total_loss += 0.1 * router_ce_loss  # Weighted at 0.1
 
         return {
             "loss": total_loss,
             "reg_loss": reg_loss,
+            "load_balance_loss": load_balance_loss,  # [SOTA-Clinical] MoE health metric
             "stable_loss": loss_stable,
             "crash_loss": loss_crash,
             "preshock_loss": loss_preshock,
@@ -314,86 +421,96 @@ class APEX_MoE_Planner(nn.Module):
             **batch_counts
         }
 
+
     @torch.no_grad()
     def sample(
         self, 
         batch: Dict[str, torch.Tensor], 
         num_steps: Optional[int] = None, 
-        hard_gating: bool = False
+        hard_gating: bool = False,
+        top_k: int = 2  # [SOTA-Clinical] Top-K sparse routing (default=2)
     ) -> Dict[str, torch.Tensor]:
         """
-        Inference Sampling (Soft or Hard Gated).
+        Inference Sampling with SOTA Top-K Sparse Routing.
         
         Args:
-            hard_gating: If True, uses argmax(Router) -> Single Expert.
-                         If False, blends sum(Prob_i * Expert_i).
+            hard_gating: If True, uses argmax(Router) -> Single Expert (top_k=1).
+            top_k: Number of experts to activate per sample (default=2).
+                   Set to cfg.num_phases for full soft-gating (legacy behavior).
         """
         past = batch["observed_data"]
         static = batch["static_context"]
         src_mask = batch.get("src_mask", None)
         
         B = past.shape[0]
+        device = past.device
         
-        # 1. Perception
+        # 1. Perception (Frozen)
         past_norm, static_norm = self.normalize(past, static)
         ctx_seq, global_ctx, ctx_mask = self.encoder(past_norm, static_norm, src_mask)
         
         # 2. Router Decision
-        logits = self.router(global_ctx) # [B, N_phases]
-        probs = F.softmax(logits, dim=-1) # [B, N]
+        logits = self.router(global_ctx)  # [B, N_experts]
+        probs = F.softmax(logits, dim=-1)  # [B, N]
         
-        # 3. Diffusion Loop
-        x_t = torch.randn(B, self.cfg.pred_len, self.cfg.input_dim, device=past.device)
+        # 3. Select Top-K Experts (SOTA Sparse Routing)
+        if hard_gating:
+            k = 1  # Single winner
+        else:
+            k = min(top_k, self.cfg.num_phases)  # Ensure K <= N_experts
+        
+        top_k_probs, top_k_indices = torch.topk(probs, k, dim=-1)  # [B, K], [B, K]
+        # Renormalize the K probabilities to sum to 1.0
+        # [DEFENSIVE] Add epsilon to prevent division by zero
+        top_k_probs = top_k_probs / (top_k_probs.sum(dim=-1, keepdim=True) + 1e-8)
+        
+        # 4. Diffusion Loop with Sparse Routing
+        x_t = torch.randn(B, self.cfg.pred_len, self.cfg.input_dim, device=device)
         steps = num_steps or self.cfg.timesteps
         
         for i in reversed(range(steps)):
-            t = torch.full((B,), i, dtype=torch.long, device=past.device)
+            t = torch.full((B,), i, dtype=torch.long, device=device)
             
-            if hard_gating:
-                # Efficient: Run only the winner expert per sample
-                # Note: This is complex to vectorize efficiently in PyTorch without
-                # running all experts or creating N sub-batches.
-                # For simplicity/speed balance, we run soft gating usually.
-                # Implementing naive hard gating via masking for correctness demo:
+            # Sparse Expert Execution: Only run experts in someone's Top-K
+            unique_experts = torch.unique(top_k_indices)
+            
+            # Accumulator for blended predictions
+            accum_pred = torch.zeros_like(x_t)
+            
+            for expert_idx_tensor in unique_experts:
+                expert_idx = expert_idx_tensor.item()
                 
-                preds = torch.zeros_like(x_t)
-                winners = torch.argmax(probs, dim=-1) # [B]
+                # Create mask: which samples have this expert in their Top-K?
+                mask = (top_k_indices == expert_idx).any(dim=-1)  # [B]
                 
-                for k in range(self.cfg.num_phases):
-                    idx = (winners == k)
-                    if idx.any():
-                        out_k = self.experts[k](
-                            x_t[idx], t[idx], 
-                            ctx_seq[idx], global_ctx[idx], 
-                            ctx_mask[idx] if ctx_mask is not None else None
-                        )
-                        preds[idx] = out_k
+                if not mask.any():
+                    continue
                 
-                final_pred = preds
+                # Run expert on relevant samples
+                expert_out = self.experts[expert_idx](
+                    x_t[mask], t[mask],
+                    ctx_seq[mask], global_ctx[mask],
+                    ctx_mask[mask] if ctx_mask is not None else None
+                )
                 
-            else:
-                # Soft Gating: Run ALL experts, weighted average
-                # This captures uncertainty ("Is it Pre-Shock or Stable?")
-                accum_pred = 0.0
+                # Get the weight for this expert for each relevant sample
+                position_mask = (top_k_indices[mask] == expert_idx)  # [n_selected, K]
+                weights = (top_k_probs[mask] * position_mask.float()).sum(dim=-1)  # [n_selected]
+                weights = weights.view(-1, 1, 1)  # [n_selected, 1, 1]
                 
-                for k in range(self.cfg.num_phases):
-                    # Local Expert Prediction
-                    out_k = self.experts[k](x_t, t, ctx_seq, global_ctx, ctx_mask)
-                    
-                    # Weighting: P_k [B, 1] * Out_k [B, T, D]
-                    w_k = probs[:, k].view(B, 1, 1)
-                    accum_pred += w_k * out_k
-                
-                final_pred = accum_pred
+                # Weighted accumulation
+                accum_pred[mask] += weights * expert_out
             
             # Scheduler Step
-            x_t = self.scheduler.step(final_pred, t, x_t, use_ddim=self.cfg.use_ddim_sampling)
+            x_t = self.scheduler.step(accum_pred, t, x_t, use_ddim=self.cfg.use_ddim_sampling)
             
         return {
             "vitals": self.unnormalize(x_t),
             "logits": logits,
-            "probs": probs
+            "probs": probs,
+            "top_k_indices": top_k_indices  # [SOTA] Expose routing for analysis
         }
+
 
     def forward_inference(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """

@@ -233,9 +233,17 @@ class ICUGeneralistModule(pl.LightningModule):
         # prog_bar=True for essential metrics to be visible during training
         B = batch["observed_data"].shape[0]
         self.log("train/loss", total_loss, prog_bar=True, batch_size=B)
-        self.log("train/diff_loss", diff_loss, prog_bar=True, batch_size=B)  # [FIX] Show in progress bar
-        self.log("train/aux_loss", aux_loss, prog_bar=True, batch_size=B)    # [FIX] Show in progress bar
+        self.log("train/diff_loss", diff_loss, prog_bar=True, batch_size=B)
+        self.log("train/aux_loss", aux_loss, prog_bar=True, batch_size=B)
         self.log("train/value_loss", value_loss, prog_bar=True, batch_size=B)
+        
+        # 5. Explained Variance (Prime Check)
+        if "outcome_label" in batch and out.get("pred_value") is not None:
+             from icu.utils.metrics_advanced import compute_explained_variance
+             target_val = batch["outcome_label"].float()
+             pred_val = out.get("pred_value").mean(dim=1) if out.get("pred_value").dim() > 1 else out.get("pred_value")
+             ev = compute_explained_variance(pred_val, target_val)
+             self.log("train/explained_variance", ev, prog_bar=True, batch_size=B)
         
         return total_loss
 
@@ -271,8 +279,8 @@ class ICUGeneralistModule(pl.LightningModule):
         mae = F.l1_loss(pred_future, gt_future)
         
         B = batch["observed_data"].shape[0]
-        self.log("val/generative_mse", mse, on_epoch=True, sync_dist=True, batch_size=B)
-        self.log("val/generative_mae", mae, on_epoch=True, sync_dist=True, batch_size=B)
+        self.log("val/generative_mse", mse, on_epoch=True, sync_dist=True, batch_size=B, prog_bar=True)
+        self.log("val/generative_mae", mae, on_epoch=True, sync_dist=True, batch_size=B, prog_bar=True)
 
     def on_before_optimizer_step(self, optimizer):
         """

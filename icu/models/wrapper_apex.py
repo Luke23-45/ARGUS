@@ -38,6 +38,11 @@ from icu.models.diffusion import ICUUnifiedPlanner, ICUConfig
 from icu.models.apex_moe_planner import APEX_MoE_Planner
 from icu.utils.train_utils import configure_robust_optimizer, SurgicalCheckpointLoader
 from icu.utils.advantage_calculator import ICUAdvantageCalculator
+from icu.utils.metrics_advanced import (
+    compute_policy_entropy, compute_ece, compute_explained_variance, 
+    compute_overconfidence_error, compute_action_continuity, compute_demographic_accuracy_gaps
+)
+from icu.utils.safety import OODGuardian
 
 logger = logging.getLogger("APEX_Specialist_v2.2")
 
@@ -67,15 +72,19 @@ class ICUSpecialistWrapper(pl.LightningModule):
         SurgicalCheckpointLoader.load_model(generalist, ckpt_path, strict=True)
         
         # --- 3. TRANSFORMATION (The Specialist) ---
-        crash_weight = cfg.train.get("crash_weight", 5.0)
+        # [SOTA-Clinical] Phase weights are now auto-generated in APEX_MoE_Planner 
+        # based on num_phases (6 experts), not hardcoded for 3 phases.
         reg_weight = cfg.train.get("lambda_reg", 0.01)
+        lb_weight = cfg.train.get("lambda_lb", 0.01)  # [SOTA-Clinical] Load-balancing coefficient
         
-        # Construct the Tri-Phase Planner using the pre-loaded generalist
+        # Construct the 6-Expert Planner using the pre-loaded generalist
         self.model = APEX_MoE_Planner(
             generalist, 
-            phase_weights=[1.0, crash_weight, crash_weight * 2.0], # Progressive weighting
-            lambda_reg=reg_weight
+            phase_weights=None,  # Auto-generate [1.0, 5.0, 5.0, ...] for N experts
+            lambda_reg=reg_weight,
+            lambda_lb=lb_weight  # [SOTA-Clinical] Switch Transformer load-balancing
         )
+
         
         # --- 4. OPTIMIZATION HYGIENE ---
         # AWR Engine
@@ -92,6 +101,9 @@ class ICUSpecialistWrapper(pl.LightningModule):
         # [SAFETY FIX] Use binary accuracy since target is binary (0=Stable, 1=Sepsis)
         # Original bug: 3-class metric with binary target caused misleading metrics
         self.val_acc_sepsis = Accuracy(task="binary")
+        
+        # 5. SOTA Safety Guardian (NeurIPS 2024 Alignment)
+        self.safety_guardian = OODGuardian()
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Inference Forward (Soft Gated Sampling)."""
@@ -149,7 +161,12 @@ class ICUSpecialistWrapper(pl.LightningModule):
                     logger.info(f"[Rank {self.global_rank}] Syncing EMA shadow with calibrated normalizer...")
                     # Update only the normalizer buffers in the shadow
                     for name, buffer in self.model.normalizer.named_buffers():
-                        full_name = f"normalizer.{name}"
+                        # [FIX] Prefix must match the model's attribute name in the wrapper
+                        full_name = f"model.normalizer.{name}"
+                        # Ensure buffer is synced across DDP ranks before EMA update
+                        if torch.distributed.is_initialized():
+                            torch.distributed.broadcast(buffer.data, src=0)
+                        
                         if full_name in self.ema.shadow:
                             self.ema.shadow[full_name] = buffer.data.detach().cpu().clone()
                     logger.info(f"[Rank {self.global_rank}] EMA shadow sync complete.")
@@ -192,7 +209,9 @@ class ICUSpecialistWrapper(pl.LightningModule):
                         lbl = s["outcome_label"].unsqueeze(0).to(self.device)
                     elif "phase_label" in s:
                         p_lbl = s["phase_label"]
-                        shock_idx = self.model.cfg.num_phases - 1
+                        # [FIX] Canonical Phase for Shock is 2 (from dataset.py)
+                        # Original bug: used num_phases - 1, which mismatches with dataset {0,1,2}
+                        shock_idx = 2 
                         is_shock = (torch.as_tensor(p_lbl) == shock_idx).float()
                         lbl = is_shock.unsqueeze(0).to(self.device)
                     else:
@@ -223,8 +242,9 @@ class ICUSpecialistWrapper(pl.LightningModule):
                         # Step 3: Compute GAE advantages
                         advantages = self.awr_calculator.compute_gae(r, pred_values)
                         
-                        # [SAFETY FIX] Use mean() to match training scale
-                        advantages_list.append(advantages.mean().item())
+                        # [VRAM SAFETY] Move scalars to CPU before list accumulation
+                        # Prevents accumulation of graph fragments in VRAM during sync
+                        advantages_list.append(advantages.mean().detach().cpu().item())
                         valid_samples += 1
                 except Exception as e:
                     logger.warning(f"AWR Sync Error at idx {i}: {e}")
@@ -253,7 +273,10 @@ class ICUSpecialistWrapper(pl.LightningModule):
     # TRAINING LOOP
     # ==========================================================================
 
-    def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
+    def training_step(self, batch: Dict[str, Any], batch_idx: int) -> Optional[torch.Tensor]:
+        if not batch or "observed_data" not in batch:
+            return None # Skip empty batches from robust_collate
+            
         past = batch["observed_data"]
         future_vitals = batch["future_data"]
         static = batch["static_context"]
@@ -286,24 +309,41 @@ class ICUSpecialistWrapper(pl.LightningModule):
                 pred_values = pred_values[:, :future_vitals.shape[1]]
 
             # 3. Clinical Reward Calculation
-            # Unit Safety Check implicitly handled by 'compute_clinical_reward' if implemented correctly,
-            # but we logged warnings in preflight.
             rewards = self.awr_calculator.compute_clinical_reward(
                 future_vitals, gt_label, normalizer=None
             )
+            B_curr, T_curr = rewards.shape
+
+            # [CRITICAL FIX] Scalar-to-Sequence Broadcasting
+            # If Value Head is a sequence-level critic (e.g. Outcome prediction),
+            # we must expand it to match the horizon [B, T] for GAE.
+            if pred_values.dim() == 1 or (pred_values.dim() == 2 and pred_values.shape[1] == 1):
+                # Shape: [B, 1] -> [B, T]
+                pred_values = pred_values.view(B_curr, 1).expand(B_curr, T_curr)
+            elif pred_values.shape[1] != T_curr:
+                # Horizon truncation if critic predicted longer/shorter horizon
+                pred_values = pred_values[:, :T_curr]
 
             # 4. GAE Calculation (Using Calibrated Stats)
             advantages = self.awr_calculator.compute_gae(rewards, pred_values)
             
             # 5. Weight Calculation
             traj_adv = advantages.mean(dim=1)
-            weights, ess = self.awr_calculator.calculate_weights(traj_adv)
+            # Pass values and rewards for Explained Variance calculation
+            weights, diag = self.awr_calculator.calculate_weights(
+                traj_adv, 
+                values=pred_values.mean(dim=1), 
+                rewards=rewards.mean(dim=1)
+            )
             
             # Normalize weights to preserve gradient magnitude
             weights = weights / (weights.mean() + 1e-8)
             
             # 6. Critic Target (Stop Gradient on Advantage)
             critic_target = (advantages + pred_values).detach()
+            # Ensure target shape matches [B, T] if horizon was sliced
+            if critic_target.shape[1] != future_vitals.shape[1]:
+                critic_target = critic_target[:, :future_vitals.shape[1]]
 
         # --- C. Execute Experts (Gradient Surgery) ---
         # Pass weights to Hard-Gating mechanism
@@ -323,16 +363,26 @@ class ICUSpecialistWrapper(pl.LightningModule):
         # --- F. Logging ---
         # PATCH v2.2: Removed 'val_loss' (deceptive). Added 'preshock_loss' (visibility).
         B = batch["observed_data"].shape[0]  # [FIX] Explicit batch_size for PL
+        
+        # Policy Entropy (Diagnostic for decision collapse)
+        with torch.no_grad():
+            logits = out.get("logits", torch.zeros(1, 1, device=self.device))
+            # [MoE] Router predicts over num_phases experts
+            probs = F.softmax(logits, dim=-1)
+            entropy = compute_policy_entropy(probs)
+
         self.log_dict({
             "train/total_loss": total_loss,
             "train/expert_loss": out["loss"], 
             "train/reg_loss": out["reg_loss"],
             "train/critic_loss": critic_loss,
-            # "train/val_loss": REMOVED - The MoE Planner does not compute this, avoiding 0.0 log
+            "train/explained_variance": diag["explained_variance"],
+            "train/policy_entropy": entropy,
             "train/stable_loss": out.get("stable_loss", 0.0),
             "train/preshock_loss": out.get("preshock_loss", 0.0), # Added
             "train/crash_loss": out.get("crash_loss", 0.0),
-            "train/ess": ess
+            "train/ess": diag["ess"],
+            "train/max_weight": diag["max_weight"]
         }, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=B)
         
         # CRITICAL: Must return loss for PyTorch Lightning to compute gradients
@@ -342,12 +392,15 @@ class ICUSpecialistWrapper(pl.LightningModule):
     # VALIDATION LOOP
     # ==========================================================================
 
-    def validation_step(self, batch: Dict[str, Any], batch_idx: int) -> Dict[str, Any]:
+    def validation_step(self, batch: Dict[str, Any], batch_idx: int) -> Optional[Dict[str, Any]]:
         """
         Dual Validation: 
         1. Clinical Sampling (Vitals Generation) using EMA weights.
         2. Routing Metrics (Sepsis Classification) using Router outputs.
         """
+        if not batch or "observed_data" not in batch:
+            return None
+            
         try:
             # 1. Run Soft-Gated Inference (Returns Dict: 'vitals', 'logits', 'probs')
             # This implicitly uses the EMA context if the EMACallback is active/swapped
@@ -363,8 +416,39 @@ class ICUSpecialistWrapper(pl.LightningModule):
             
             # Fallback if outcome_label missing
             if target is None and "phase_label" in batch:
-                shock_idx = self.model.cfg.num_phases - 1
-                target = (batch["phase_label"] == shock_idx).to(dtype=torch.float32)
+                # [FIX] Align with training logic: Sepsis = Pre-Shock (1) or Shock (2)
+                # target = (batch["phase_label"] == 2) was too conservative 
+                target = (batch["phase_label"] >= 1).to(dtype=torch.float32)
+
+            # E. Calibration Error (ECE) & Overconfidence Error (OE)
+            if target is not None:
+                # Use only the base phase logits for ECE (if multiclass router)
+                # target is binary {0, 1}
+                router_probs = out_payload["probs"]
+                # Map 6 experts -> 2 classes (Healthy [0,3], Sepsis [1,2,4,5])
+                sepsis_prob = router_probs[:, [1,2,4,5]].sum(dim=1)
+                
+                ece = compute_ece(sepsis_prob, target)
+                oe = compute_overconfidence_error(sepsis_prob, target)
+                
+                self.log_dict({
+                    "val/ece": ece,
+                    "val/oe": oe
+                }, on_epoch=True, sync_dist=True)
+                
+                # F. Fairness Audit (Gender/Age)
+                # Static context: [Age (0), Gender (1), ...]
+                static = batch["static_context"]
+                if static.shape[-1] >= 2:
+                    is_female = (static[:, 1] > 0.5)
+                    is_male = (static[:, 1] <= 0.5)
+                    is_elderly = (static[:, 0] > 65.0) # Assuming Age is in years
+                    
+                    fairness_results = compute_demographic_accuracy_gaps(
+                        sepsis_prob, target, 
+                        {"female": is_female, "male": is_male, "elderly": is_elderly}
+                    )
+                    self.log_dict({f"val/fairness_{k}": v for k, v in fairness_results.items()}, on_epoch=True, sync_dist=True)
 
             return {
                 "preds": out_payload["logits"],  # Pass Router Logits to Metric Callback
@@ -390,9 +474,23 @@ class ICUSpecialistWrapper(pl.LightningModule):
         if pred_vitals.device != gt.device:
             pred_vitals = pred_vitals.to(gt.device)
             
-        # Metric Object Update
+        # 1. Metric Object Update
         self.val_mse_clinical.update(pred_vitals, gt)
-        self.log("val/clinical_mse", self.val_mse_clinical, on_epoch=True, prog_bar=True)
+        
+        # 2. SOTA OOD Guardian (Dynamics Safety)
+        past = batch["observed_data"]
+        safety_results = self.safety_guardian.check_trajectories(past, pred_vitals)
+        
+        # 3. Action Continuity (Smoothness)
+        smoothness = compute_action_continuity(pred_vitals)
+        
+        self.log_dict({
+            "val/clinical_mse": self.val_mse_clinical,
+            "val/ood_rate": safety_results["ood_rate"],
+            "val/safety_sbp_delta": safety_results["sbp_delta_mean"],
+            "val/safety_lac_max": safety_results["lac_max_mean"],
+            "val/action_smoothness": smoothness
+        }, on_epoch=True, prog_bar=True)
   
     def on_before_optimizer_step(self, optimizer):
         """

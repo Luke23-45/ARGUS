@@ -33,6 +33,8 @@ from omegaconf import DictConfig
 from icu.models.diffusion import ICUUnifiedPlanner, ICUConfig
 from icu.utils.train_utils import EMA, configure_robust_optimizer
 from icu.utils.advantage_calculator import ICUAdvantageCalculator
+from icu.utils.metrics_advanced import compute_policy_entropy, compute_ece, compute_explained_variance, compute_overconfidence_error
+from icu.utils.safety import OODGuardian
 
 logger = logging.getLogger("APEX_Generalist")
 
@@ -68,6 +70,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
         from torchmetrics import MeanSquaredError, Accuracy
         self.val_mse_clinical = MeanSquaredError() # Real unit error
         self.val_acc_sepsis = Accuracy(task="multiclass", num_classes=2)
+        
+        # 5. SOTA Safety Guardian
+        self.safety_guardian = OODGuardian()
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Inference Forward (Student Model)."""
@@ -199,7 +204,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
             
             # C. Trajectory Weights
             traj_advantage = advantages.mean(dim=1)
-            weights, ess = self.awr_calculator.calculate_weights(traj_advantage)
+            # Pass values and rewards for Explained Variance calculation
+            weights, diag = self.awr_calculator.calculate_weights(
+                traj_advantage, 
+                values=pred_values.mean(dim=1), 
+                rewards=rewards.mean(dim=1)
+            )
             weights = weights / (weights.mean() + 1e-8)
             
             # [PATCH] Gradient Barrier
@@ -222,13 +232,20 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # 4. EMA Update
         self.ema.update(self.model)
         
-        # 5. Logging
+        # 5. Policy Entropy (Diagnostic for mode collapse)
+        with torch.no_grad():
+            router_probs = F.softmax(out.get("aux_logits", torch.zeros(1, 1, device=self.device)), dim=-1)
+            entropy = compute_policy_entropy(router_probs)
+
+        # 6. Logging
         self.log_dict({
             "train/total_loss": total_loss,
             "train/diff_loss": weighted_loss,
             "train/critic_loss": critic_loss,
-            "train/ess": ess,
-            "train/weight_mean": weights.mean(),
+            "train/ess": diag["ess"],
+            "train/explained_variance": diag["explained_variance"],
+            "train/max_weight": diag["max_weight"],
+            "train/policy_entropy": entropy,
             "train/reward_mean": rewards.mean()
         }, on_step=True, on_epoch=True, prog_bar=True)
         
@@ -250,8 +267,24 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # D. Support ClinicalMetricCallback
         # This allows the 'Guardian' suite to compute AUROC/AUPRC
         if "outcome_label" in batch:
+            logits = out.get("aux_logits", torch.zeros_like(batch["outcome_label"]))
+            
+            # E. Calibration Error (ECE) & Overconfidence Error (OE)
+            # [FIX] Multiclass-Aware: Use Softmax (3 classes) and Sum Sepsis categories (1, 2)
+            # Original bug: used sigmoid on multiclass logits, corrupting calibration metrics
+            probs_all = F.softmax(logits, dim=-1)
+            sepsis_prob = probs_all[:, 1:].sum(dim=1) if probs_all.shape[-1] > 1 else torch.sigmoid(logits)
+            
+            ece = compute_ece(sepsis_prob, batch["outcome_label"])
+            oe = compute_overconfidence_error(sepsis_prob, batch["outcome_label"])
+            
+            self.log_dict({
+                "val/ece": ece,
+                "val/oe": oe
+            }, on_epoch=True, sync_dist=True)
+
             return {
-                "preds": out.get("aux_logits", torch.zeros_like(batch["outcome_label"])), 
+                "preds": logits, 
                 "target": batch["outcome_label"]
             }
         return {}
@@ -279,7 +312,6 @@ class ICUGeneralistWrapper(pl.LightningModule):
         self.val_acc_sepsis(logits, batch["outcome_label"].long())
         self.log("val/sepsis_acc", self.val_acc_sepsis, on_epoch=True, sync_dist=True)
 
-
     def _validate_clinical_sampling(self, batch):
         """
         Generates trajectories for clinical validation.
@@ -296,9 +328,17 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Model already has EMA weights during validation (handled by EMACallback)
             pred = self.model.sample(subset) 
             
-        # Clinical MSE
+        # 1. Clinical MSE
         clinical_mse = self.val_mse_clinical(pred, gt)
-        self.log("val/clinical_mse", clinical_mse, on_epoch=True, prog_bar=True, sync_dist=True)
+        
+        # 2. OOD Guarding (SOTA Safety)
+        safety_results = self.safety_guardian.check_trajectories(subset["observed_data"], pred)
+        
+        self.log_dict({
+            "val/clinical_mse": clinical_mse,
+            "val/ood_rate": safety_results["ood_rate"],
+            "val/safety_sbp_delta": safety_results["sbp_delta_mean"]
+        }, on_epoch=True, prog_bar=True, sync_dist=True)
 
 
 

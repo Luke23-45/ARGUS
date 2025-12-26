@@ -407,7 +407,8 @@ class ICUSotaDataset(ICUTrajectoryDataset):
             
             # --- Robustness Checks ---
             # Guard against NaNs that might have slipped through imputation
-            if torch.isnan(sample["observed_data"]).any():
+            # [SAFETY FIX] Check both observed and future data to prevent AWR NaN-poisoning
+            if torch.isnan(sample["observed_data"]).any() or torch.isnan(sample["future_data"]).any():
                 # In prod, we might try to fix this. For now, we drop the sample to protect gradients.
                 logger.debug(f"Dropped NaN sample at idx {idx}")
                 return None

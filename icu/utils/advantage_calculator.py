@@ -107,29 +107,45 @@ class ICUAdvantageCalculator:
         terminal_reward = (1.0 - outcome_label) * 5.0 + (outcome_label * -5.0)
         rewards[:, -1] += terminal_reward
 
-        # 2. Dense qSOFA Proxy (Negative Reward for organ failure)
+        # 2. Sepsis-3 Safety Guardrails (2016 Consensus updates)
         idx_sbp = feature_indices.get('sbp', 2)
-        idx_resp = feature_indices.get('resp', 4)
+        idx_resp = feature_indices.get('resp', 5) # Corrected to CANONICAL index 5
         
         if idx_sbp < D and idx_resp < D:
             sbp = vitals[..., idx_sbp]
             resp = vitals[..., idx_resp]
             
-            # Penalize Low SBP (Sigmoid centered at 100 mmHg)
-            pen_sbp = torch.sigmoid((100.0 - sbp) / 10.0) 
+            # Sepsis-3: SBP <= 100 mmHg is a critical marker for Shock/Organ Failure
+            # We use a steeper sigmoid centered at 100 to enforce the SOTA boundary
+            pen_sbp = torch.sigmoid((100.0 - sbp) / 5.0) 
             
-            # Penalize High Resp (Sigmoid centered at 22 bpm)
-            pen_resp = torch.sigmoid((resp - 22.0) / 5.0)
+            # Resp > 22 bpm (qSOFA criteria)
+            pen_resp = torch.sigmoid((resp - 22.0) / 3.0)
             
-            rewards -= 0.1 * (pen_sbp + pen_resp)
+            # Weighting: SBP is more critical for Shock detection
+            rewards -= 0.2 * pen_sbp + 0.05 * pen_resp
+            
+            # [SOTA 2025] Proactive Improvement Reward (Delta)
+            # Reward increase in SBP if it was low, or decrease in Lactate
+            if T > 1:
+                # SBP Delta: positive if increasing
+                sbp_delta = sbp[:, 1:] - sbp[:, :-1]
+                # Only reward SBP increase if it's below 110 (prevent hypertension)
+                rewards[:, 1:] += 0.01 * torch.clamp(sbp_delta, min=0) * (sbp[:, 1:] < 110.0).float()
 
-        # 3. Lactate Penalty (The Silent Killer)
+        # 3. Lactate Penalty (The Metabolic Safety Boundary)
         idx_lac = feature_indices.get('lactate', 7)
         if idx_lac < D:
             lactate = vitals[..., idx_lac]
-            # Penalize if Lactate > 2.0 mmol/L
+            # Sepsis-3: Lactate > 2.0 mmol/L defines Metabolic Dysfunction
             pen_lac = F.relu(lactate - 2.0) 
-            rewards -= 0.2 * pen_lac
+            rewards -= 0.3 * pen_lac  
+            
+            # [SOTA 2025] Metabolic Recovery Reward
+            if T > 1:
+                lac_delta = lactate[:, 1:] - lactate[:, :-1]
+                # Reward Lactate DECREASE (negative delta)
+                rewards[:, 1:] += 0.05 * torch.clamp(-lac_delta, min=0)
 
         return rewards
 
@@ -176,57 +192,79 @@ class ICUAdvantageCalculator:
         # This is fast for T=30 (typical window)
         for t in reversed(range(T)):
             # GAE formula: delta_t + (gamma * lambda) * previous_advantage
-            # (Note: previous in computation order, which is future in time)
-            advantages[:, t] = deltas[:, t] + (self.gamma * self.lambda_gae) * last_gae_lam
+            # [SAFETY FIX] Detach the future advantage to treat it as a static target
+            # for the current timestep's weight.
+            is_tensor = isinstance(last_gae_lam, torch.Tensor)
+            prev_adv = last_gae_lam.detach() if is_tensor else last_gae_lam
+            
+            advantages[:, t] = deltas[:, t] + (self.gamma * self.lambda_gae) * prev_adv
             last_gae_lam = advantages[:, t]
             
         return advantages
 
     def calculate_weights(
         self, 
-        advantages: torch.Tensor
-    ) -> Tuple[torch.Tensor, float]:
+        advantages: torch.Tensor,
+        values: Optional[torch.Tensor] = None,
+        rewards: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Computes the safe AWR weights.
+        Computes the safe AWR weights and gathers diagnostics.
         
         Formula: weight = exp( (A - mu) / sigma / beta )
         
         Returns:
             weights: [B, T] Tensor (clamped)
-            ess: Effective Sample Size (scalar float 0.0-1.0)
+            diagnostics: Dict of metrics (ESS, Max Weight, Explained Var)
         """
         # 1. Global Whitening (Standardization)
-        # If stats are not set, we fall back to batch statistics (less stable but works)
         if self.stats_initialized:
             mu = self.adv_mean
             sigma = self.adv_std
         else:
-            # Fallback to Batch Norm logic (Risk: batch might be homogenous)
             mu = advantages.mean()
             sigma = advantages.std() + 1e-8
 
         normalized_adv = (advantages - mu) / sigma
 
         # 2. Exponentiation with Temperature
-        # Weights = exp( A_norm / beta )
         raw_weights = torch.exp(normalized_adv / self.beta)
         
         # 3. Safety Clipping
-        # Prevents a single trajectory from hijacking the gradient
         weights = torch.clamp(raw_weights, max=self.max_weight)
         
         # 4. Diagnostics: Effective Sample Size (ESS)
-        # ESS = (Sum w)^2 / Sum (w^2)
-        # Normalized ESS = ESS / N
         sum_w = weights.sum()
         sum_w_sq = (weights ** 2).sum()
         
         if sum_w_sq == 0:
             ess_val = 0.0
         else:
+            # Normalized ESS in [0, 1]
             ess_val = (sum_w ** 2) / (sum_w_sq * weights.numel())
             
-        return weights, ess_val.item()
+        # 5. Explained Variance
+        # Formula: 1 - Var(Returns - Values) / Var(Returns)
+        exp_var = 0.0
+        if values is not None and rewards is not None:
+            # Simple approximation of returns (Reward-to-go)
+            # In AWR, returns = target values for the critic
+            # We can use the simple sum of rewards as a proxy for the 'Y' in ESS formula
+            # Y = rewards (discounted)
+            target_returns = rewards # Simplification for diagnostic
+            y_diff = target_returns - values
+            var_y = torch.var(target_returns)
+            var_diff = torch.var(y_diff)
+            if var_y > 1e-8:
+                exp_var = (1.0 - var_diff / var_y).item()
+
+        diagnostics = {
+            "ess": ess_val.item(),
+            "max_weight": weights.max().item(),
+            "explained_variance": exp_var
+        }
+            
+        return weights, diagnostics
 
 # ==============================================================================
 # Smoke Test / Example Usage
