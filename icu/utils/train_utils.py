@@ -70,6 +70,14 @@ def is_main_process() -> bool:
     """True if this is the coordinator (Rank 0) or a single-process run."""
     return get_rank() == 0
 
+def print_apex_branding():
+    """Project Branding Signature."""
+    if is_main_process():
+        print("\n" + "="*80)
+        print("  🩺 APEX-MoE: Advanced Physiological Expert (Mixture-of-Experts)")
+        print("  State-of-the-Art ICU Strategy v4.0 | Clinical Grade Intelligence")
+        print("="*80 + "\n")
+
 def rank_zero_only(fn):
     """Decorator: Ensures the function ONLY executes on Rank 0."""
     @functools.wraps(fn)
@@ -98,9 +106,10 @@ def set_seed(seed: int = 42, worker: bool = False):
         torch.cuda.manual_seed_all(seed) # For multi-GPU
         
     # Cudnn algorithms
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False # Slower but reproducible
-    
+    if torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False # Slower but reproducible
+        
     if worker:
         # Closure for DataLoader
         def worker_init_fn(worker_id):

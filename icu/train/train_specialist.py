@@ -48,8 +48,9 @@ from icu.datasets.dataset import ICUSotaDataset, robust_collate_fn, ensure_data_
 from icu.utils.train_utils import (
     set_seed, 
     rank_zero_only, 
-    get_rank,
-    get_hardware_context
+    get_hardware_context,
+    print_apex_branding,
+    get_rank
 )
 from icu.utils.callbacks import get_sota_callbacks
 
@@ -126,7 +127,8 @@ class ICUSpecialistDataModule(pl.LightningDataModule):
 
 @hydra.main(version_base=None, config_path="../../conf", config_name="specialist")
 def main(cfg: DictConfig):
-    # 0. Hardware Detection
+    # 0. Boot Branding & Hardware Optimization
+    print_apex_branding()
     hw_ctx = get_hardware_context()
     logger.info(f"Specialist Hardware Context: {hw_ctx}")
 

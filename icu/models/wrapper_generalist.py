@@ -97,6 +97,17 @@ class ICUGeneralistWrapper(pl.LightningModule):
             if index_path and ts_cols:
                 # The correct SOTA API call
                 self.model.normalizer.calibrate_from_stats(index_path, ts_cols)
+                
+                # [CRITICAL FIX] EMA Shadow Sync
+                # The EMA callback initializes shadow weights BEFORE this calibration runs.
+                # We must force-update the shadow's normalizer buffers to match the calibrated state.
+                if hasattr(self, 'ema') and self.ema is not None:
+                    logger.info(f"[Rank {self.global_rank}] Syncing EMA shadow with calibrated normalizer...")
+                    for name, buffer in self.model.normalizer.named_buffers():
+                        full_name = f"normalizer.{name}"
+                        if full_name in self.ema.shadow:
+                            self.ema.shadow[full_name] = buffer.data.detach().cpu().clone()
+                    logger.info(f"[Rank {self.global_rank}] EMA shadow sync complete.")
             else:
                 raise ValueError("Dataset missing 'index_path' or 'metadata.ts_columns'")
                 

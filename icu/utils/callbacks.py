@@ -91,15 +91,53 @@ class APEXProgressBar(RichProgressBar):
         # 2. Metric Surgery: Remove noise
         items.pop("v_num", None)
         
-        # 3. Precision Overhaul: Round all metrics to 4 decimals
-        new_items = {}
-        for k, v in items.items():
-            if isinstance(v, float):
-                new_items[k] = f"{v:.4f}"
-            else:
-                new_items[k] = v
+        # 3. CONSOLIDATION: Merge all losses into one high-density string 
+        # to prevent Rich from wrapping columns vertically.
+        loss_telemetry = []
+        other_metrics = {}
         
-        return new_items
+        for k, v in items.items():
+            # Formatting
+            val = f"{v:.3f}" if isinstance(v, float) else str(v)
+            
+            # Shorten keys logic
+            sk = k.replace("train/", "").replace("val/", "")
+            sk = sk.replace("total_loss", "L").replace("loss", "L") 
+            sk = sk.replace("diff_L", "D").replace("aux_L", "A")
+            sk = sk.replace("expert_L", "Exp").replace("reg_L", "Reg")
+            sk = sk.replace("critic_L", "Crt").replace("value_L", "Crt")
+            sk = sk.replace("stable_L", "S").replace("preshock_L", "P").replace("crash_L", "C")
+            sk = sk.replace("batch_size", "B")
+            
+            # Categorize: Losses vs Metrics
+            if any(x in sk for x in ["L", "D", "A", "Exp", "Reg", "Crt", "S", "P", "C", "ess"]):
+                loss_telemetry.append(f"{sk}:{val}")
+            else:
+                other_metrics[sk] = val
+        
+        # 4. Final Payload: One "Stats" entry + any others (AUC, etc)
+        res = {}
+        if loss_telemetry:
+            res["Stats"] = "|".join(loss_telemetry)
+        res.update(other_metrics)
+        
+        return res
+
+    def configure_columns(self, trainer: pl.Trainer) -> list:
+        # Get standard columns
+        cols = super().configure_columns(trainer)
+        
+        # STRIP REDUNDANCY: Maximize space for clinical metrics
+        # We identify columns by their class name string to be robust across PL versions
+        new_cols = []
+        for c in cols:
+            c_type = str(type(c)).lower()
+            # Remove Speed and Elapsed time to save horizontal real-estate
+            if "speed" in c_type or "elapsed" in c_type:
+                continue
+            new_cols.append(c)
+            
+        return new_cols
 
     def on_train_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         # Branding injection

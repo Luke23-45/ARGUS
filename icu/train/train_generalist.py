@@ -51,8 +51,9 @@ from icu.utils.train_utils import (
     rank_zero_only, 
     set_seed,
     is_main_process,
-    get_rank,
-    get_hardware_context
+    get_hardware_context,
+    print_apex_branding,
+    get_rank
 )
 from icu.utils.callbacks import get_sota_callbacks
 
@@ -234,7 +235,7 @@ class ICUGeneralistModule(pl.LightningModule):
         self.log("train/loss", total_loss, prog_bar=True, batch_size=B)
         self.log("train/diff_loss", diff_loss, prog_bar=True, batch_size=B)  # [FIX] Show in progress bar
         self.log("train/aux_loss", aux_loss, prog_bar=True, batch_size=B)    # [FIX] Show in progress bar
-        self.log("train/value_loss", value_loss, batch_size=B)
+        self.log("train/value_loss", value_loss, prog_bar=True, batch_size=B)
         
         return total_loss
 
@@ -272,6 +273,22 @@ class ICUGeneralistModule(pl.LightningModule):
         B = batch["observed_data"].shape[0]
         self.log("val/generative_mse", mse, on_epoch=True, sync_dist=True, batch_size=B)
         self.log("val/generative_mae", mae, on_epoch=True, sync_dist=True, batch_size=B)
+
+    def on_before_optimizer_step(self, optimizer):
+        """
+        SOTA PERFORMANCE: Surgical Bypass for Gradient Clipping.
+        
+        Logic:
+        1. PyTorch Lightning's automatic clipping crashes with 'fused' optimizers.
+        2. We deactivated automatic clipping in Trainer (gradient_clip_val=0).
+        3. This hook manually clips gradients using the raw PyTorch engine.
+        4. In mixed precision, gradients are already unscaled by the time this is called.
+        """
+        if self.cfg.train.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), 
+                self.cfg.train.grad_clip
+            )
 
     def configure_optimizers(self):
         """SOTA Optimizer Configuration."""
@@ -366,7 +383,8 @@ def calibrate_physics(cfg: DictConfig, model: nn.Module):
 
 @hydra.main(version_base=None, config_path="../../conf", config_name="generalist")
 def main(cfg: DictConfig):
-    # 0. Hardware Detection & Optimization
+    # 0. Boot Branding & Hardware Optimization
+    print_apex_branding()
     hw_ctx = get_hardware_context()
     logger.info(f"Hardware Context: {hw_ctx}")
 
