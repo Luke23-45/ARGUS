@@ -121,6 +121,7 @@ class APEXProgressBar(RichProgressBar):
             
             # Create Short Keys (SOTA Style)
             # Example: val/clinical_auroc -> A
+
             sk = k.replace("train/", "").replace("val/", "").replace("health/", "")
             sk = sk.replace("total_loss", "L").replace("loss", "L")
             sk = sk.replace("diff_L", "D").replace("aux_L", "A").replace("value_L", "V")

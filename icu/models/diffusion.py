@@ -917,6 +917,43 @@ class PhysiologicalConsistencyLoss(nn.Module):
 # 9. UNIFIED ORCHESTRATOR
 # =============================================================================
 
+class ResidualTaskHead(nn.Module):
+    """
+    SOTA Hardened Head: Decouples Task-Specific Logic from Shared Backbone.
+    
+    Why this saves lives:
+    A shared backbone optimizes for the 'Loudest' signal (Diffusion/Reconstruction).
+    Rare signals (Sepsis/Death) get smoothed over in the latent space.
+    This Residual Block acts as a "Translator," allowing the backbone to keep
+    its smooth representation while the head extracts the sharp risk signal.
+    """
+    def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.1):
+        super().__init__()
+        
+        # 1. Capacity Injection (Maintain dimension, don't shrink yet)
+        self.block = nn.Sequential(
+            nn.Linear(input_dim, input_dim),
+            nn.LayerNorm(input_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(input_dim, input_dim)
+        )
+        
+        # 2. Output Projection
+        self.norm_out = nn.LayerNorm(input_dim)
+        self.head = nn.Linear(input_dim, output_dim)
+        
+        # 3. Initialization Safety (Start neutral)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, x):
+        # Residual Connection: x + Block(x)
+        # This is the "Gradient Highway" that prevents signal loss
+        feat = x + self.block(x)
+        return self.head(self.norm_out(feat))
+
+
 class ICUUnifiedPlanner(nn.Module):
     """
     The Safety-Critical Host.
@@ -938,22 +975,22 @@ class ICUUnifiedPlanner(nn.Module):
         self.backbone = DiffusionActionHead(cfg)
         self.scheduler = NoiseScheduler(cfg.timesteps)
         
-        # APEX Auxiliary Heads
+        # APEX Auxiliary Heads (Hardened)
         if cfg.use_auxiliary_head:
-            self.aux_head = nn.Sequential(
-                nn.Linear(cfg.d_model, cfg.d_model // 2),
-                nn.SiLU(),
-                nn.Dropout(0.1),
-                nn.Linear(cfg.d_model // 2, cfg.num_phases)
+            # Replaced simple MLP with ResidualTaskHead
+            self.aux_head = ResidualTaskHead(
+                input_dim=cfg.d_model, 
+                output_dim=cfg.num_phases,
+                dropout=0.1
             )
             
         # Dense Value Head for GAE-Lambda (AWR)
-        # Projects global context to a Value Sequence of length T_pred
-        # This provides a baseline V(s_t) for every step t in the future.
-        self.value_head = nn.Sequential(
-            nn.Linear(cfg.d_model, cfg.d_model // 2),
-            nn.SiLU(),
-            nn.Linear(cfg.d_model // 2, cfg.pred_len) 
+        # Replaced simple MLP with ResidualTaskHead
+        # Critical for accurate AWR weights in high-variance clinical data
+        self.value_head = ResidualTaskHead(
+            input_dim=cfg.d_model, 
+            output_dim=cfg.pred_len,
+            dropout=0.1
         )
         
         # [v10.0] Physics Loss for both training and PGS
@@ -1085,8 +1122,8 @@ class ICUUnifiedPlanner(nn.Module):
             if f_mask is None:
                 # Fallback: Inference from target zeros? No, risky. 
                 # Use src_mask if it matches length? 
-                # For now, if no mask, standard MSE
-                value_loss = F.mse_loss(pred_val, target_val)
+                loss_ele = F.smooth_l1_loss(pred_val, target_val, beta=1.0, reduction='none')
+                value_loss = (loss_ele * f_mask).sum() / (f_mask.sum() + 1e-8)
             else:
                 # Ensure mask matches shape
                 if f_mask.dim() == 3: f_mask = f_mask.any(dim=-1) # [B, T]

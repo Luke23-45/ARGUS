@@ -331,7 +331,6 @@ class ClinicalNormalizer(nn.Module):
             device = self.ts_physics_min.device
             t_min = torch.tensor(raw_min, dtype=torch.float32, device=device)
             t_max = torch.tensor(raw_max, dtype=torch.float32, device=device)
-``
             # =================================================================
             # 4. CLAMP STATS TO PHYSICS BOUNDS
             # =================================================================

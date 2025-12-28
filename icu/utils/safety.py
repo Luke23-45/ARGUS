@@ -175,11 +175,17 @@ class OODGuardian:
         pred_o2 = pred_vitals[..., IDX_O2]
         pred_lac = pred_vitals[..., IDX_LAC]
         
+        # [v14.1] Tolerance for Early Training Noise
+        # Diffusion models often produce micro-noise (e.g. -0.01) around zero.
+        # Strict < 0 checks flag these as "Impossible Physics", destroying valid batches.
+        # [FIX] Add tolerance for Diffusion Noise. -0.001 is clinically 0.0.
+        TOLERANCE = 1e-2
+
         is_ood_bounds = (
-            (pred_sbp < self.cfg.BOUNDS_SBP[0]) | (pred_sbp > self.cfg.BOUNDS_SBP[1]) |
-            (pred_map < self.cfg.BOUNDS_MAP[0]) | (pred_map > self.cfg.BOUNDS_MAP[1]) |
-            (pred_o2 < self.cfg.BOUNDS_O2[0])   | (pred_o2 > self.cfg.BOUNDS_O2[1])   |
-            (pred_lac < self.cfg.BOUNDS_LAC[0]) # Lactate < 0 is impossible
+            (pred_sbp < self.cfg.BOUNDS_SBP[0] - TOLERANCE) | (pred_sbp > self.cfg.BOUNDS_SBP[1] + TOLERANCE) |
+            (pred_map < self.cfg.BOUNDS_MAP[0] - TOLERANCE) | (pred_map > self.cfg.BOUNDS_MAP[1] + TOLERANCE) |
+            (pred_o2 < self.cfg.BOUNDS_O2[0] - TOLERANCE)   | (pred_o2 > self.cfg.BOUNDS_O2[1] + TOLERANCE)   |
+            (pred_lac < self.cfg.BOUNDS_LAC[0] - TOLERANCE) # Lactate < 0 often happens with noise
         ).any(dim=1) # [B]
         
         # --- 4. Sepsis-3 Specific OOD (Extreme Hyperlactatemia) ---

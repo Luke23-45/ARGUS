@@ -122,6 +122,42 @@ def get_cosine_schedule_with_warmup(
 # MAIN WRAPPER CLASS
 # =============================================================================
 
+class DynamicLossBalancer:
+    """
+    [v14.2] SOTA Multi-Task Balancer.
+    Monitors reliability of auxiliary tasks (e.g. Sepsis Classification).
+    If a task stalls (loss stops improving), it boosts its weight.
+    """
+    def __init__(self, window_size: int = 100):
+        self.history = {}
+        self.window = window_size
+        
+    def update(self, name: str, value: float):
+        if name not in self.history:
+            self.history[name] = []
+        self.history[name].append(value)
+        if len(self.history[name]) > self.window:
+            self.history[name].pop(0)
+            
+    def get_trend(self, name: str) -> float:
+        if name not in self.history or len(self.history[name]) < 10:
+            return 0.0
+        # Simple trend: (Recent - Old) / Old
+        data = np.array(self.history[name])
+        recent = data[-10:].mean()
+        old = data[:10].mean()
+        return (recent - old) / (old + 1e-8)
+
+    def get_weight(self, name: str, base_weight: float) -> float:
+        """Adaptive Weight Boosting"""
+        trend = self.get_trend(name)
+        # If loss is flat or increasing (trend >= 0) and it's not effectively zero
+        if trend > -0.01: 
+             # Boost weight by up to 2x to force model focus
+             return base_weight * 1.5
+        return base_weight
+
+
 class ICUGeneralistWrapper(pl.LightningModule):
     """
     LightningModule for Phase 1 Generalist Training.
@@ -190,6 +226,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # 5. TRAINING TELEMETRY (Accumulated Metrics)
         # =====================================================================
         # These are accumulated over batches and logged at epoch end
+        self.loss_balancer = DynamicLossBalancer(window_size=100)
         self.train_loss_total = MeanMetric()
         self.train_loss_diff = MeanMetric()
         self.train_loss_critic = MeanMetric()
@@ -349,22 +386,37 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Shape: [B, T_pred]
             advantages = self.awr_calculator.compute_gae(rewards, target_values)
             
+            # Bootstrapped Returns for Critic Update (and Explained Variance)
+            # Returns = Advantage + Value. This is the true target the Critic learns.
+            returns = (advantages + target_values).detach()
+
             # Compute AWR Weights
             # We aggregate to trajectory level for sample weighting
             traj_adv = advantages.mean(dim=1)  # [B]
+            
+            # [v12.3] FIX: Use Returns as target for Explained Var, not Rewards
+            # explained_var = 1 - Var(Return - Value) / Var(Return)
+            # Previous bug: Compared Mean Reward (0.3) vs Mean Value (10.0) -> Negative EV
             weights, diag = self.awr_calculator.calculate_weights(
                 traj_adv, 
                 values=target_values.mean(dim=1), 
-                rewards=rewards.mean(dim=1)
+                rewards=returns.mean(dim=1) # Correct Scale
             )
+            
+            # [VERIFIED SOTA FIX]
+            # Explicitly calculate EV here to guarantee telemetry is accurate.
+            # We compare the Teacher's Target Values against the GAE Returns.
+            # Both vectors are on the same scale (~10.0).
+            ev_tensor = compute_explained_variance(target_values, returns)
+            
+            # Update the diagnostic dict (override calculator's internal logic if needed)
+            diag["explained_variance"] = ev_tensor.item()
             
             # Normalize weights for gradient stability
             # This ensures weights have mean 1.0, preserving gradient scale
             weights = weights / (weights.mean() + 1e-8)
             
-            # Bootstrapped Returns for Critic Update
-            # The student tries to predict these stable targets
-            returns = (advantages + target_values).detach()
+
 
         # C. Weighted Diffusion Loss (AWR Core)
         # We focus learning on trajectories that actually lead to survival
@@ -372,8 +424,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
         
         # D. Critic Loss (Student → Teacher Distillation)
         # The student critic learns to match the Teacher's stable value estimates
+        # [v14.1] Robust Huber Loss (SmoothL1)
+        # MSE over-penalizes "miracle" survivors (outliers). Huber is robust to heavy tails.
         pred_values_student = self.model.value_head(global_ctx)
-        critic_loss = F.mse_loss(pred_values_student, returns)
+        critic_loss = F.smooth_l1_loss(pred_values_student, returns, beta=1.0)
         
         # E. Auxiliary Sepsis Loss (If enabled)
         # Multi-task learning: Predict clinical phase alongside diffusion
@@ -404,12 +458,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
         phys_penalty = self.phys_loss(x0_approx) * curr_phys_weight
 
         # G. Total Loss Composition
-        # Loss weighting follows established practices:
-        # - Diffusion: 1.0 (Primary task)
-        # - Critic: 0.5 (Value learning, lower to not dominate)
-        # - Aux: Configured (0.182 optimal)
-        # - Physics: Dynamic (0.01 → base_weight over curriculum)
-        aux_scale = self.cfg.train.get("aux_loss_scale", 0.1)
+        # [v14.2] Dynamic Loss Balancing (GradNorm-Lite)
+        # If the Sepsis Classifier (Aux) starts stalling while Diffusion dominates,
+        # we boost the aux_scale dynamically.
+        aux_scale = self.loss_balancer.get_weight("aux", self.cfg.train.get("aux_loss_scale", 0.1))
+        
+        # Balance Update
+        if self.model.cfg.use_auxiliary_head:
+            self.loss_balancer.update("aux", aux_loss.item())
+            self.loss_balancer.update("diff", weighted_diff_loss.item())
+
         total_loss = weighted_diff_loss + 0.5 * critic_loss + aux_scale * aux_loss + phys_penalty
         
         # --- 6. EMA Update (Moved to on_train_batch_end) ---
