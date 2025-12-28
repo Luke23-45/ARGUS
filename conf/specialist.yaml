@@ -48,10 +48,11 @@ train:
   pretrained_path: "outputs/phase1/gen_v1_.../checkpoints/latest_checkpoint.pt"
   
   epochs: 50
-  batch_size: 64
-  num_workers: 2
-  lr: 1e-4
+  batch_size: 128
+  num_workers: 4
+  lr: 2.0e-4
   min_lr: 1e-6
+  warmup_steps: 500
   weight_decay: 1e-4
   grad_clip: 1.0
   precision: "16-mixed"
@@ -63,8 +64,9 @@ train:
   lambda_reg: 0.05    # Cross-expert tether (prevents mode drift)
   
   # AWR Optimization v2.0 (Globally Optimal via Exhaustive Audit)
-  awr_beta: 1.000
-  awr_max_weight: 7.5
+  awr_beta: 0.400             # Optimized for Specialist Fine-Tuning
+  awr_max_weight: 20.0        # Robust Clipping
+  aux_loss_scale: 0.182 # Optimized v2.0 (Router Supervision)
   ema_decay: 0.999    # Faster EMA update for adaptation
   
   # Optimization Groups

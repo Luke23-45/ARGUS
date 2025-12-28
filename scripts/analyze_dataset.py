@@ -24,8 +24,8 @@ Output:
 - data_quality_report.html (human-readable with charts)
 
 Usage:
-    python scripts/analyze_dataset.py --dataset_dir ./sepsis_clinical_28_raw
-    python scripts/analyze_dataset.py --dataset_dir ./sepsis_clinical_28_raw --html
+    python scripts/analyze_dataset.py --dataset_dir ./sepsis_clinical_28
+    python scripts/analyze_dataset.py --dataset_dir ./sepsis_clinical_28 --html
 
 Author: APEX Research Team
 """
@@ -68,46 +68,24 @@ logger = logging.getLogger("DataAnalyzer")
 # ==============================================================================
 # PHYSIOLOGICAL BOUNDS (Clinical Expert Knowledge)
 # ==============================================================================
-
-# These are the clinically valid ranges for each vital sign
-# Values outside these ranges indicate either sensor error or critical condition
-PHYSIOLOGICAL_BOUNDS = {
-    # Hemodynamics (Group A)
-    'HR': (20, 250),        # Heart Rate (bpm)
-    'O2Sat': (50, 100),     # Oxygen Saturation (%)
-    'SBP': (40, 250),       # Systolic BP (mmHg)
-    'DBP': (20, 150),       # Diastolic BP (mmHg)
-    'MAP': (30, 180),       # Mean Arterial Pressure (mmHg)
-    'Resp': (4, 60),        # Respiratory Rate (breaths/min)
-    'Temp': (30, 42),       # Temperature (Celsius)
-    
-    # Labs (Group B)
-    'Lactate': (0, 30),     # Lactate (mmol/L)
-    'Creatinine': (0, 20),  # Creatinine (mg/dL)
-    'BUN': (0, 200),        # Blood Urea Nitrogen (mg/dL)
-    'WBC': (0, 100),        # White Blood Cells (10^9/L)
-    'Platelets': (0, 1000), # Platelets (10^9/L)
-    'Glucose': (20, 500),   # Glucose (mg/dL)
-    'Bilirubin': (0, 40),   # Bilirubin (mg/dL)
-    'FiO2': (0.21, 1.0),    # Fraction of Inspired O2
-    'pH': (6.8, 7.8),       # Blood pH
-    'PaCO2': (10, 100),     # Partial Pressure CO2 (mmHg)
-    'PaO2': (30, 600),      # Partial Pressure O2 (mmHg)
-    
-    # Electrolytes (Group C)
-    'Potassium': (2, 8),    # K+ (mEq/L)
-    'Sodium': (110, 170),   # Na+ (mEq/L)
-    'Chloride': (80, 130),  # Cl- (mEq/L)
-    'Bicarbonate': (5, 45), # HCO3- (mEq/L)
-    
-    # Static Features (Group D) - Less strict bounds
-    'Age': (0, 120),
-    'Gender': (0, 1),
-    'Unit1': (0, 1),
-    'Unit2': (0, 1),
-    'AdmissionTime': (0, 1e10),  # Unix timestamp or normalized
-    'LOS': (0, 1000),       # Length of Stay (hours)
-}
+# We now import the single source of truth from the Normalizer to prevent mismatched audits.
+try:
+    from icu.datasets.normalizer import PHYSICS_BOUNDS_TS as PHYSIOLOGICAL_BOUNDS
+except ImportError:
+    # Fallback only if normalizer is broken (should not happen in this environment)
+    logger.warning("Could not import PHYSICS_BOUNDS_TS from normalizer. Using legacy fallback.")
+    PHYSIOLOGICAL_BOUNDS = {
+        'HR': (20, 300), 'O2Sat': (20, 100), 'SBP': (30, 300), 'DBP': (10, 200),
+        'MAP': (20, 250), 'Resp': (4, 80), 'Temp': (24, 45),
+        'Lactate': (0.1, 35.0), 'Creatinine': (0.1, 25.0), 'Bilirubin': (0.1, 80.0),
+        'Glucose': (10.0, 1500.0), # DKA aware
+        'WBC': (0.1, 200.0), 'Platelets': (1.0, 2000.0),
+        'pH': (6.5, 7.8), 'HCO3': (5.0, 60.0), 'BUN': (1.0, 250.0),
+        'Potassium': (1.0, 12.0), 'Magnesium': (0.5, 10.0), 'Calcium': (2.0, 20.0),
+        'Chloride': (50.0, 150.0), 'FiO2': (0.21, 1.0), 'Hgb': (2.0, 25.0),
+        'Age': (0, 120), 'Gender': (0, 1), 'Unit1': (0, 1), 'Unit2': (0, 1),
+        'HospAdmTime': (-10000, 0), 'ICULOS': (0, 2000)
+    }
 
 # ==============================================================================
 # ANALYSIS CLASSES
@@ -743,14 +721,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python scripts/analyze_dataset.py --dataset_dir ./sepsis_clinical_28_raw
-  python scripts/analyze_dataset.py --dataset_dir ./sepsis_clinical_28_raw --html --output ./reports
+  python scripts/analyze_dataset.py --dataset_dir ./sepsis_clinical_28
+  python scripts/analyze_dataset.py --dataset_dir ./sepsis_clinical_28 --html --output ./reports
         """
     )
     parser.add_argument(
         "--dataset_dir", 
         type=str, 
-        default="./sepsis_clinical_28_raw",
+        default="./sepsis_clinical_28",
         help="Path to the generated dataset directory"
     )
     parser.add_argument(

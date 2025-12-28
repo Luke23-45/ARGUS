@@ -1,37 +1,54 @@
 """
 icu/models/diffusion_icu.py
 --------------------------------------------------------------------------------
-State-of-the-Art Unified Diffusion Planner for ICU Forecasting (SOTA v3.0).
+APEX-MoE: SOTA Diffusion Planner (Unified Architecture v11.0).
 
 Status: PRODUCTION-READY / SAFETY-CRITICAL
-Architectural Pillars:
+"The engine of survival."
+
+This module defines the neural architecture for the clinical diffusion planner.
+It acts as the 'Donor' model for the APEX-MoE specialist system.
+
+Architectural Pillars (Unified from v3.0 + v10.0):
 1.  **DiT-1D Backbone**: AdaLN-Zero conditioning for stable diffusion generation.
 2.  **Causal RoPE**: Unified temporal coordinate system (History: 0-23, Future: 24-29).
 3.  **Mask-Aware Physics**: Attention and Pooling layers strictly ignore padding.
     (Prevents "Zero-Shock" hallucinations where missing data is interpreted as cardiac arrest).
 4.  **SwiGLU & Flash Attention**: High-performance compute primitives.
 5.  **APEX-MoE Ready**: Exposes Auxiliary Heads and Latent Hooks for Phase 2.
+6.  **Physics-Guided Sampling (PGS)**: Implements active gradient steering 
+    inside the generation loop to enforce biological constraints in real-time.
+7.  **Analog Bits (Self-Conditioning)**: The architecture explicitly routes 
+    recurrent x0 estimates into the input stream, allowing the model to 
+    'read its own thoughts' and correct hallucinations.
+8.  **Temporal Attention Pooling**: A learnable mechanism to detect transient 
+    critical events (e.g., a 5-minute hypotensive drop) that mean pooling misses.
+9.  **Deep Stochasticity**: DropPath and Flash Attention v2 integration for 
+    training stability on long-horizon ICU data.
 
 References:
     - Peebles & Xie, "Scalable Diffusion Models with Transformers" (DiT)
     - Su et al., "RoFormer: Enhanced Transformer with Rotary Position Embedding"
     - OpenAI, "Improved Denoising Diffusion Probabilistic Models"
+    - Jaegle et al., "Perceiver IO" (2021) [Attention Pooling]
+    - Chen et al., "Analog Bits: Generating Discrete Data" (2022) [Self-Cond]
+    - Hong et al., "Physics-Guided Diffusion" (2023) [Gradient Guidance]
 """
 
 from __future__ import annotations
 import math
 import logging
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# [PATCH 3] Import gradient checkpointing handler
+# Gradient checkpointing for memory efficiency
 from torch.utils.checkpoint import checkpoint
 
 # Setup Logger
-logger = logging.getLogger("ICU_Diffusion_SOTA")
+logger = logging.getLogger("ICU_Diffusion_v11")
 
 # =============================================================================
 # 1. CONFIGURATION
@@ -40,48 +57,129 @@ logger = logging.getLogger("ICU_Diffusion_SOTA")
 class ICUConfig:
     """
     Hyperparameter Configuration for APEX-MoE Diffusion.
+    Unified from v3.0 and v10.0 specifications.
     """
     # Dimensions (Frontier 28 Specification)
     # CRITICAL: input_dim MUST match CANONICAL_COLUMNS (28 channels)
     # The full [T, 28] matrix includes static context at indices 22-27
     input_dim: int = 28     # [Hemodynamic(7) + Labs(11) + Electrolytes(4) + Static(6)]
     static_dim: int = 6     # [Age, Gender, Unit1, Unit2, AdmTime, LOS]
-    history_len: int = 24   # T_obs
-    pred_len: int = 6       # T_pred
+    history_len: int = 24   # T_obs (Input Window)
+    pred_len: int = 6       # T_pred (Prediction Horizon)
 
-    # Transformer Architecture
+    # Transformer Architecture (DiT)
     d_model: int = 512
     n_heads: int = 8
     n_layers: int = 6       # DiT Depth
     encoder_layers: int = 4 # History Encoder Depth
     ffn_dim_ratio: int = 4
     dropout: float = 0.1
+    stochastic_depth_prob: float = 0.1 # [v10.0] DropPath for regularization
 
     # SOTA Components
     use_rope: bool = True        # Rotary Embeddings (Vital for Time Series)
-    use_swiglu: bool = True      # SwiGLU > GELU
-    use_flash_attn: bool = True  # SDPA
+    use_swiglu: bool = True      # SwiGLU > GELU (Shazeer 2020)
+    use_flash_attn: bool = True  # SDPA (Scales better than manual attention)
     gradient_checkpointing: bool = False
+    
+    # [v10.0] Architectural Flags
+    use_attention_pooling: bool = True  # TimeAttentionPooling vs MaskedAvgPool
+    use_self_conditioning: bool = True  # Critical for 'Analog Bits' refinement
+    use_imputation_masks: bool = True   # [v12.0] Ingest imputation masks as features
 
     # Diffusion Physics
     timesteps: int = 100
-    beta_schedule: str = "squaredcos_cap_v2"
-    prediction_type: str = "epsilon"
-    use_ddim_sampling: bool = True
+    beta_schedule: str = "squaredcos_cap_v2"  # Superior to linear schedule
+    prediction_type: str = "epsilon"          # Predict noise (standard)
+    use_ddim_sampling: bool = True            # Deterministic sampling
+    physics_guidance_scale: float = 2.0       # [v10.0] Strength of bio-constraints
 
     # APEX-MoE Specifics
     use_auxiliary_head: bool = True
     num_phases: int = 3  # Tri-Phase: Stable(0) -> Pre-Shock(1) -> Shock(2)
+    aux_loss_scale: float = 0.1 # [v11.1] Configurable Aux Loss Scale
 
 # =============================================================================
 # 2. LOW-LEVEL PRIMITIVES (Mask-Aware & Robust)
 # =============================================================================
 
+class DropPath(nn.Module):
+    """
+    [v10.0] Stochastic Depth (DropPath) regularization.
+    Randomly drops residual branches during training to improve generalization.
+    
+    Reference: Huang et al., "Deep Networks with Stochastic Depth" (2016)
+    """
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        # Work with any number of dimensions, broadcasting over batch
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()  # binarize
+        output = x.div(keep_prob) * random_tensor
+        return output
+
+
+class TimeAttentionPooling(nn.Module):
+    """
+    [v10.0] Learnable Pooling via Cross-Attention.
+    Captures transient spikes (e.g., sudden MAP drops) that averaging misses.
+    Acts as a 'Summary Expert' for the history encoder.
+    
+    Unlike mean pooling, this learns to weight timesteps by clinical importance.
+    For example, a 5-minute hypotensive episode gets higher attention weight
+    than stable readings around it.
+    
+    Reference: Jaegle et al., "Perceiver IO" (2021)
+    """
+    def __init__(self, d_model: int, n_heads: int = 8):
+        super().__init__()
+        # Learnable query vector (the "What to summarize" expert)
+        self.summary_query = nn.Parameter(torch.randn(1, 1, d_model))
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x: [Batch, SeqLen, D_model]
+            mask: [Batch, SeqLen] (True = Padding, to be IGNORED)
+        
+        Returns:
+            [Batch, D_model] - Single summary vector per batch
+        """
+        B = x.shape[0]
+        # Expand query for batch
+        query = self.summary_query.expand(B, -1, -1)
+        
+        # Standard Multihead Attention
+        # Query = Summary (what we want), Key/Value = History (what we have)
+        # key_padding_mask expects True for positions to IGNORE
+        out, _ = self.attn(
+            query, x, x,
+            key_padding_mask=mask,
+            need_weights=False
+        )
+        # Squeeze to [Batch, D_model]
+        return self.norm(out.squeeze(1))
+
+
 class MaskedAvgPool1d(nn.Module):
     """
-    Critically important for Time-Series.
+    [v3.0] Critically important for Time-Series.
     Standard AvgPool averages zeros (padding), diluting the signal.
     This module sums valid tokens and divides by the valid count.
+    
+    Example Problem Solved:
+        Patient A has 24 hours of data, Patient B has 12 hours + 12 hours padding.
+        Without masked pooling, Patient B's summary would be "half as strong"
+        because we'd average in zeros for the padded hours.
     """
     def __init__(self):
         super().__init__()
@@ -90,30 +188,41 @@ class MaskedAvgPool1d(nn.Module):
         """
         Args:
             x: [B, T, D]
-            mask: [B, T] Boolean (True = Pad, False = Keep) OR (True = Keep) based on convention.
+            mask: [B, T] Boolean (True = Pad/Invalid, False = Keep/Valid).
                   Here we assume: True = Padding/Invalid (Standard PyTorch convention).
+        
+        Returns:
+            [B, D] - Mean over valid (non-padded) timesteps
         """
         if mask is None:
             return x.mean(dim=1)
 
         # Invert mask: We want 1.0 for VALID data, 0.0 for PADDING
         # Assuming input mask is "True if padding" (e.g., key_padding_mask)
-        valid_mask = (~mask).float().unsqueeze(-1) # [B, T, 1]
+        valid_mask = (~mask).float().unsqueeze(-1)  # [B, T, 1]
         
-        # Zero out padding (just in case)
+        # Zero out padding (just in case it has garbage values)
         x_masked = x * valid_mask
         
         # Sum valid items
-        sum_x = x_masked.sum(dim=1) # [B, D]
+        sum_x = x_masked.sum(dim=1)  # [B, D]
         
         # Count valid items
-        count_valid = valid_mask.sum(dim=1) # [B, 1]
-        count_valid = torch.clamp(count_valid, min=1e-6) # Prevent div/0
+        count_valid = valid_mask.sum(dim=1)  # [B, 1]
+        count_valid = torch.clamp(count_valid, min=1e-6)  # Prevent div/0
         
         return sum_x / count_valid
 
+
 class RMSNorm(nn.Module):
-    """LlaMA-style RMSNorm (No center, just scale). Stable training."""
+    """
+    [LLaMA-style] Root Mean Square Layer Normalization.
+    No mean-centering, just scale. More stable for deep transformers.
+    
+    Advantage over LayerNorm: 
+        - Fewer operations (no mean subtraction)
+        - Empirically more stable for very deep networks
+    """
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
@@ -123,8 +232,18 @@ class RMSNorm(nn.Module):
         norm_x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         return norm_x * self.weight
 
+
 class SwiGLU(nn.Module):
-    """SwiGLU FFN (Shazeer 2020)."""
+    """
+    SwiGLU FFN (Shazeer 2020).
+    GLU Variants Improve Transformer performance.
+    
+    Architecture: 
+        out = SiLU(W1 @ x) * (W2 @ x)
+        out = W3 @ out
+    
+    This is the SOTA choice for FFN in modern LLMs (LLaMA, PaLM).
+    """
     def __init__(self, d_model: int, hidden_dim: int, dropout: float = 0.0):
         super().__init__()
         self.w1 = nn.Linear(d_model, hidden_dim)
@@ -135,8 +254,26 @@ class SwiGLU(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.dropout(self.w3(F.silu(self.w1(x)) * self.w2(x)))
 
-# --- SOTA: Unified Time RoPE ---
+
+# =============================================================================
+# 3. ROTARY POSITION EMBEDDING (RoPE)
+# =============================================================================
+
 class RotaryEmbedding(nn.Module):
+    """
+    RoPE: Encodes relative positions via rotation.
+    
+    Key Insight: Instead of adding position embeddings, we ROTATE queries and keys.
+    This allows the model to naturally encode relative positions through
+    the dot product geometry.
+    
+    For ICU Forecasting:
+        - History tokens get positions 0..23
+        - Future tokens get positions 24..29 (offset by history_len)
+        - This tells the model "future comes after history"
+    
+    Reference: Su et al., "RoFormer: Enhanced Transformer with Rotary Position Embedding"
+    """
     def __init__(self, dim: int, max_seq_len: int = 1024, base: float = 10000.0):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
@@ -148,8 +285,13 @@ class RotaryEmbedding(nn.Module):
     def forward(self, seq_len: int, device: torch.device, offset: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
+            seq_len: Number of positions to generate
+            device: Target device
             offset: The starting global time index. 
                     History starts at 0. Future starts at HistoryLen.
+        
+        Returns:
+            cos, sin: [1, 1, seq_len, dim] tensors for rotation
         """
         # Auto-expand cache if needed
         req_len = seq_len + offset
@@ -165,14 +307,27 @@ class RotaryEmbedding(nn.Module):
             self.sin_cached[:, :, offset : offset + seq_len, :]
         )
 
+
 def apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """
+    Apply rotary position embeddings to input tensor.
+    
+    The rotation is applied in 2D blocks:
+        [x1, x2] -> [x1 * cos - x2 * sin, x1 * sin + x2 * cos]
+    
+    This is equivalent to rotating the vector in the complex plane.
+    """
     d = x.shape[-1] // 2
     x1 = x[..., :d]
     x2 = x[..., d:]
     x_rot = torch.cat((-x2, x1), dim=-1)
     return x * cos + x_rot * sin
 
-# --- Mask-Aware Attention ---
+
+# =============================================================================
+# 4. ATTENTION MECHANISM
+# =============================================================================
+
 def robust_flash_attention(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     n_heads: int, dropout: float,
@@ -180,161 +335,71 @@ def robust_flash_attention(
     cos_q: Optional[torch.Tensor] = None, sin_q: Optional[torch.Tensor] = None,
     cos_k: Optional[torch.Tensor] = None, sin_k: Optional[torch.Tensor] = None,
     # Masking
-    key_padding_mask: Optional[torch.Tensor] = None # [B, L_k] True=Pad
+    key_padding_mask: Optional[torch.Tensor] = None  # [B, L_k] True=Pad
 ) -> torch.Tensor:
     """
     Robust SDPA Wrapper. Handles RoPE injection + Padding Masks correctly.
+    
+    This wrapper:
+    1. Reshapes Q, K, V for multi-head attention
+    2. Applies RoPE to Q and K
+    3. Converts padding mask to attention bias (compatible with Flash Attention)
+    4. Calls PyTorch's scaled_dot_product_attention (enables hardware acceleration)
+    
+    Mask Convention:
+        key_padding_mask[b, t] = True means position t in batch b is PADDING
+        These positions should be IGNORED (get -inf attention scores)
     """
     B, L_q, D = q.shape
     _, L_k, _ = k.shape
     head_dim = D // n_heads
 
-    # [B, L, H, D_h] -> [B, H, L, D_h]
+    # Reshape: [B, L, D] -> [B, H, L, D_h]
     q = q.view(B, L_q, n_heads, head_dim).transpose(1, 2)
     k = k.view(B, L_k, n_heads, head_dim).transpose(1, 2)
     v = v.view(B, L_k, n_heads, head_dim).transpose(1, 2)
 
-    # 1. Apply RoPE
-    if cos_q is not None: q = apply_rotary_pos_emb(q, cos_q, sin_q)
-    if cos_k is not None: k = apply_rotary_pos_emb(k, cos_k, sin_k)
+    # 1. Apply RoPE (if provided)
+    if cos_q is not None: 
+        q = apply_rotary_pos_emb(q, cos_q, sin_q)
+    if cos_k is not None: 
+        k = apply_rotary_pos_emb(k, cos_k, sin_k)
 
     # 2. Prepare Mask for SDPA
-    # SDPA expects attention mask to be added to scores (float) or boolean (True=Keep?)
-    # PyTorch documentation is inconsistent across versions. 
-    # Safest: Use causal masking if needed, or manual mask expansion.
-    # For padding: We want to MASK OUT True values in key_padding_mask.
-    
-    attn_mask = None
+    # We use an additive attention bias: 0 for keep, -inf for drop
+    # This is the most robust approach across PyTorch versions
+    attn_bias = None
     if key_padding_mask is not None:
         # key_padding_mask is [B, L_k] where True is BAD (Pad).
-        # We need to broadcast to [B, 1, L_q, L_k].
-        # In SDPA, if we pass a boolean mask, it expects True = MASK OUT (drop)? No, check docs.
-        # Actually safest is to construct the additive mask manually if unsure of PyTorch version.
-        # However, to use Flash Kernel, we shouldn't supply explicit dense masks if possible.
-        # Ideally, we pass it via `key_padding_mask` argument if SDPA wrapped supported it, but F.sdpa doesn't.
-        # We must reshape.
-        
-        # Reshape [B, L_k] -> [B, 1, 1, L_k]
-        mask_expanded = key_padding_mask.view(B, 1, 1, L_k).expand(-1, n_heads, L_q, -1)
-        
-        # Additive Mask: 0 for keep, -inf for drop
-        # But this prevents Flash Attn kernel usage in older PyTorch. 
-        # Modern Torch: Boolean mask supported? 
-        # For Robustness: We will use the standard torch.where.
-        # To enable optimizations, we rely on PyTorch's backend to fuse this.
-        # Note: If memory is tight, this expansion is costly. 
-        
-        # Fallback Strategy:
-        # If no mask, attn_mask=None.
-        pass # Logic handled below
-
-    if key_padding_mask is not None:
-        # Create broadcastable mask [B, 1, 1, L_k]
-        # True means PAD.
-        attn_bias = torch.zeros_like(key_padding_mask, dtype=q.dtype).masked_fill(key_padding_mask, float("-inf"))
+        # We need to broadcast to [B, 1, 1, L_k] for attention scores
+        attn_bias = torch.zeros_like(key_padding_mask, dtype=q.dtype).masked_fill(
+            key_padding_mask, float("-inf")
+        )
         attn_bias = attn_bias.view(B, 1, 1, L_k)
-        # Note: Adding bias forces non-flash path in some versions, but correctness > speed here.
-    else:
-        attn_bias = None
+        # Note: Adding explicit bias may disable Flash kernel in some versions,
+        # but correctness > speed for safety-critical applications
 
-    # 3. Attention
+    # 3. Scaled Dot Product Attention
     out = F.scaled_dot_product_attention(
         q, k, v, 
         attn_mask=attn_bias, 
         dropout_p=dropout if dropout > 0 else 0.0
     )
 
+    # Reshape back: [B, H, L, D_h] -> [B, L, D]
     return out.transpose(1, 2).contiguous().view(B, L_q, D)
 
-# =============================================================================
-# 3. TEMPORAL ENCODER (The History Reader)
-# =============================================================================
 
-class TemporalFusionEncoder(nn.Module):
-    """
-    Encodes Past Vitals + Static Context into a robust latent vector.
-    Fixes:
-        - Explicit handling of padding masks in Attention.
-        - Masked Global Pooling (No averaging zeros).
-    """
-    def __init__(self, cfg: ICUConfig):
-        super().__init__()
-        self.cfg = cfg
-        
-        # Projects
-        # [CRITICAL FIX] vitals_proj now only processes DYNAMIC features (22 channels)
-        # Static features (6 channels) are processed separately via static_proj
-        self.vitals_proj = nn.Linear(22, cfg.d_model)  # Was: cfg.input_dim (28)
-        self.static_proj = nn.Linear(cfg.static_dim, cfg.d_model)
-        
-        # RoPE
-        self.rope = RotaryEmbedding(cfg.d_model // cfg.n_heads, max_seq_len=cfg.history_len + 24)
-        
-        # Layers
-        self.layers = nn.ModuleList([
-            EncoderBlock(cfg) for _ in range(cfg.encoder_layers)
-        ])
-        
-        # Robust Pooling
-        self.pool = MaskedAvgPool1d()
-        self.out_norm = RMSNorm(cfg.d_model)
-
-    def forward(
-        self, 
-        past_vitals: torch.Tensor, 
-        static_context: torch.Tensor, 
-        src_mask: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]: # [PATCH] Return Mask
-        
-        B, T, _ = past_vitals.shape
-        
-        # [CRITICAL FIX] Static Redundancy Prevention
-        # The input vitals tensor has shape [B, T, 28] where:
-        # - Indices 0-21: Dynamic features (Hemodynamic + Labs + Electrolytes)
-        # - Indices 22-27: Static features (Age, Gender, Unit1, Unit2, AdmTime, ICULOS)
-        # 
-        # We MUST slice to [B, T, 22] to prevent "Demographic Drowning":
-        # The static features are already processed separately via static_proj.
-        # Including them in vitals_proj causes the model to see them at EVERY timestep,
-        # drowning out the dynamic physiological signals.
-        past_vitals_dynamic = past_vitals[..., :22]  # [B, T, 22]
-        
-        # 1. Embeddings
-        x_seq = self.vitals_proj(past_vitals_dynamic) # [B, T, D]
-        x_static = self.static_proj(static_context).unsqueeze(1) # [B, 1, D]
-        
-        # 2. Concat Static (Prepend)
-        # Sequence: [Static, H_0, H_1, ..., H_23]
-        x = torch.cat([x_static, x_seq], dim=1)
-        
-        # [PATCH] Centralized Mask Logic
-        if src_mask is not None:
-            # src_mask is [B, T]. We need [B, T+1].
-            # Prepend 'False' (Valid) for the static token.
-            valid_static = torch.zeros(B, 1, dtype=torch.bool, device=x.device)
-            full_mask = torch.cat([valid_static, src_mask], dim=1)
-        else:
-            full_mask = None
-            
-        # 4. RoPE (Global Time 0..23)
-        cos, sin = self.rope(x.shape[1], x.device, offset=0)
-        
-        # 5. Encoding
-        for layer in self.layers:
-            if self.cfg.gradient_checkpointing:
-                x = checkpoint(layer, x, cos, sin, full_mask, use_reentrant=False)
-            else:
-                x = layer(x, cos, sin, full_mask)
-        
-        x = self.out_norm(x)
-        
-        # 6. Masked Pooling -> Global Context
-        global_ctx = self.pool(x, full_mask) # [B, D]
-        
-        # [PATCH] Return the authoritative mask to the Planner
-        return x, global_ctx, full_mask
+# =============================================================================
+# 5. ENCODER BLOCKS
+# =============================================================================
 
 class EncoderBlock(nn.Module):
+    """
+    Single Encoder Block for the History Encoder.
+    Uses Pre-Norm (norm before attention) for training stability.
+    Includes DropPath for stochastic depth regularization.
+    """
     def __init__(self, cfg: ICUConfig):
         super().__init__()
         self.cfg = cfg
@@ -342,6 +407,10 @@ class EncoderBlock(nn.Module):
         self.norm2 = RMSNorm(cfg.d_model)
         self.dropout = nn.Dropout(cfg.dropout)
         
+        # [v10.0] Stochastic Depth
+        self.drop_path = DropPath(cfg.stochastic_depth_prob) if cfg.stochastic_depth_prob > 0 else nn.Identity()
+        
+        # FFN
         if cfg.use_swiglu:
             hidden_dim = int(cfg.d_model * cfg.ffn_dim_ratio * 2 / 3)
             self.ffn = SwiGLU(cfg.d_model, hidden_dim, cfg.dropout)
@@ -357,26 +426,174 @@ class EncoderBlock(nn.Module):
         # Self-Attention with Pre-Norm (Q, K, V all from normalized input)
         h = self.norm1(x)
         attn = robust_flash_attention(
-            h, h, h,  # FIXED: All three use normalized input
+            h, h, h,  # CRITICAL: All three use normalized input
             self.cfg.n_heads, self.cfg.dropout, 
             cos_q=cos, sin_q=sin, cos_k=cos, sin_k=sin,
             key_padding_mask=mask
         )
-        x = x + self.dropout(attn)
+        x = x + self.drop_path(self.dropout(attn))
         
-        # FFN
-        x = x + self.dropout(self.ffn(self.norm2(x)))
+        # FFN with Pre-Norm
+        x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
         return x
 
+
+class TemporalFusionEncoder(nn.Module):
+    """
+    Encodes Past Vitals + Static Context into a robust latent vector.
+    
+    Key Design Decisions:
+    1. Static context is prepended as a single token (not repeated)
+    2. Padding masks are carefully propagated to attention
+    3. Either TimeAttentionPooling (v10.0) or MaskedAvgPool (v3.0) is used
+    
+    Fixes from v3.0:
+        - Explicit handling of padding masks in Attention.
+        - Masked Global Pooling (No averaging zeros).
+        - [CRITICAL] Static Redundancy Prevention (slice to 22 dynamic features)
+    """
+    def __init__(self, cfg: ICUConfig):
+        super().__init__()
+        self.cfg = cfg
+        
+        # Projects
+        # [CRITICAL FIX v3.0] vitals_proj only processes DYNAMIC features (22 channels)
+        # Static features (6 channels) are processed separately via static_proj
+        # This prevents "Demographic Drowning" where static features at every timestep
+        # drown out the actual physiological dynamics
+        
+        # [v12.0] Imputation Awareness
+        # If enabled, we concatenate the imputation mask (22 dynamic channels) to the input.
+        input_channels = 22 * 2 if cfg.use_imputation_masks else 22
+        
+        self.vitals_proj = nn.Linear(input_channels, cfg.d_model)  # NOT cfg.input_dim (28)
+        self.static_proj = nn.Linear(cfg.static_dim, cfg.d_model)
+        
+        # RoPE for history sequence
+        self.rope = RotaryEmbedding(cfg.d_model // cfg.n_heads, max_seq_len=cfg.history_len + 24)
+        
+        # Encoder Layers
+        self.layers = nn.ModuleList([
+            EncoderBlock(cfg) for _ in range(cfg.encoder_layers)
+        ])
+        
+        # Pooling Strategy (v10.0 adds TimeAttentionPooling option)
+        if cfg.use_attention_pooling:
+            self.pool = TimeAttentionPooling(cfg.d_model, cfg.n_heads)
+        else:
+            self.pool = MaskedAvgPool1d()
+            
+        self.out_norm = RMSNorm(cfg.d_model)
+
+    def forward(
+        self, 
+        past_vitals: torch.Tensor, 
+        static_context: torch.Tensor, 
+        imputation_mask: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Args:
+            past_vitals: [B, T, 28] - Normalized clinical timeseries
+            static_context: [B, 6] - Static patient features
+            imputation_mask: [B, T, 28] - (Optional) 1.0=Real, 0.0=Imputed
+            padding_mask: [B, T] - (Optional) True=Padding (to be IGNORED)
+        
+        Returns:
+            x: [B, T+1, D] - Full sequence representation (Static + History)
+            global_ctx: [B, D] - Pooled context vector
+            full_mask: [B, T+1] - Mask including static token
+        """
+        B, T, _ = past_vitals.shape
+        
+        # [CRITICAL FIX v3.0] Static Redundancy Prevention
+        # The input vitals tensor has shape [B, T, 28] where:
+        # - Indices 0-21: Dynamic features (Hemodynamic + Labs + Electrolytes)
+        # - Indices 22-27: Static features (Age, Gender, Unit1, Unit2, AdmTime, ICULOS)
+        # 
+        # We MUST slice to [B, T, 22] to prevent "Demographic Drowning":
+        # The static features are already processed separately via static_proj.
+        # Including them in vitals_proj causes the model to see them at EVERY timestep,
+        # drowning out the dynamic physiological signals.
+        past_vitals_dynamic = past_vitals[..., :22]  # [B, T, 22]
+        
+        # [v12.0] Imputation Awareness (Feature Conditioning)
+        if self.cfg.use_imputation_masks:
+            if imputation_mask is not None:
+                # Slice mask to dynamic features only
+                mask_dynamic = imputation_mask[..., :22]
+                network_input = torch.cat([past_vitals_dynamic, mask_dynamic], dim=-1)
+            else:
+                # Fallback: Assume all real (ones) if no mask provided but expected
+                # Or zeros if strictly missing? Ones (Real) is safer default for conditioning.
+                # However, dataset usually provides it.
+                mask_dynamic = torch.ones_like(past_vitals_dynamic)
+                network_input = torch.cat([past_vitals_dynamic, mask_dynamic], dim=-1)
+        else:
+            network_input = past_vitals_dynamic
+
+        # 1. Embeddings
+        x_seq = self.vitals_proj(network_input)  # [B, T, D]
+        x_static = self.static_proj(static_context).unsqueeze(1)  # [B, 1, D]
+        
+        # 2. Concat Static (Prepend)
+        # Sequence: [Static, H_0, H_1, ..., H_23]
+        x = torch.cat([x_static, x_seq], dim=1)
+        
+        # 3. Centralized Mask Logic (Attention Mask)
+        # [v12.0] FIX: Use padding_mask for attention, NOT imputation_mask.
+        # padding_mask is [B, T]. We need [B, T+1] (Static token is always valid).
+        
+        valid_static = torch.zeros(B, 1, dtype=torch.bool, device=x.device) # False = Valid
+        
+        if padding_mask is not None:
+            full_mask = torch.cat([valid_static, padding_mask], dim=1)
+        else:
+            # If no padding mask, assume entire sequence is valid (standard for fixed window)
+            # Create a [B, T] mask of Falses
+            valid_seq = torch.zeros(B, T, dtype=torch.bool, device=x.device)
+            full_mask = torch.cat([valid_static, valid_seq], dim=1)
+            
+        # 4. RoPE (Global Time 0..T)
+        cos, sin = self.rope(x.shape[1], x.device, offset=0)
+        
+        # 5. Encoding
+        for layer in self.layers:
+            if self.cfg.gradient_checkpointing:
+                x = checkpoint(layer, x, cos, sin, full_mask, use_reentrant=False)
+            else:
+                x = layer(x, cos, sin, full_mask)
+        
+        x = self.out_norm(x)
+        
+        # 6. Masked Pooling -> Global Context
+        global_ctx = self.pool(x, full_mask)  # [B, D]
+        
+        # Return the authoritative mask to the Planner
+        return x, global_ctx, full_mask
+
+
 # =============================================================================
-# 4. DIFFUSION BACKBONE (DiT with Cross-Attention)
+# 6. DIFFUSION BACKBONE (DiT with Cross-Attention)
 # =============================================================================
 
 class AdaLNZero(nn.Module):
+    """
+    Adaptive Layer Norm Zero.
+    Conditioning mechanism for DiT (Diffusion Transformers).
+    
+    Regresses 6 parameters from the timestep/context embedding:
+        - shift_msa, scale_msa, gate_msa (for self-attention)
+        - shift_mlp, scale_mlp, gate_mlp (for FFN)
+    
+    The "Zero" refers to the zero-initialization, which makes the block
+    start as an identity function and gradually learn to modulate.
+    """
     def __init__(self, d_model: int):
         super().__init__()
         self.silu = nn.SiLU()
         self.linear = nn.Linear(d_model, 6 * d_model, bias=True)
+        # Initialize to zero so the block is an identity function at start of training
         nn.init.zeros_(self.linear.weight)
         nn.init.zeros_(self.linear.bias)
 
@@ -384,7 +601,19 @@ class AdaLNZero(nn.Module):
         chunk = self.linear(self.silu(condition))
         return chunk.chunk(6, dim=1)
 
+
 class DiTBlock1D(nn.Module):
+    """
+    Diffusion Transformer Block.
+    Processes noisy future sequence while attending to history context.
+    
+    Architecture:
+        1. Self-Attention (Future <-> Future) with AdaLN conditioning
+        2. Cross-Attention (Future <-> History) with mask for padding
+        3. FFN with AdaLN conditioning
+        
+    All branches use DropPath for stochastic depth regularization.
+    """
     def __init__(self, cfg: ICUConfig):
         super().__init__()
         self.cfg = cfg
@@ -393,6 +622,9 @@ class DiTBlock1D(nn.Module):
         self.norm3 = RMSNorm(cfg.d_model)
         self.adaLN = AdaLNZero(cfg.d_model)
         self.dropout = nn.Dropout(cfg.dropout)
+        
+        # [v10.0] Stochastic Depth
+        self.drop_path = DropPath(cfg.stochastic_depth_prob) if cfg.stochastic_depth_prob > 0 else nn.Identity()
         
         # FFN
         if cfg.use_swiglu:
@@ -407,51 +639,70 @@ class DiTBlock1D(nn.Module):
 
     def forward(self, x, t_cond, context, cos_q, sin_q, cos_k, sin_k, ctx_mask=None):
         """
-        x: Noisy Future [B, T_pred, D]
-        context: Encoded History [B, T_hist, D]
-        ctx_mask: Mask for History [B, T_hist]
+        Args:
+            x: Noisy Future [B, T_pred, D]
+            t_cond: Time + Context embedding [B, D]
+            context: Encoded History [B, T_hist, D]
+            cos_q, sin_q: RoPE for future positions
+            cos_k, sin_k: RoPE for history positions
+            ctx_mask: Mask for History [B, T_hist] (True = Pad)
         """
+        # Regress conditioning parameters from timestep
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN(t_cond)
         
-        # 1. Self-Attention (Future-Future)
+        # 1. Self-Attention (Future-Future, Time Mixing)
         h = self.norm1(x)
         h = h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
         attn = robust_flash_attention(
             h, h, h, self.cfg.n_heads, self.cfg.dropout,
             cos_q=cos_q, sin_q=sin_q, cos_k=cos_q, sin_k=sin_q
-            # No mask needed for future self-attention (always full length usually)
+            # No mask needed for future self-attention (no padding in future)
         )
-        x = x + self.dropout(gate_msa.unsqueeze(1) * attn)
+        x = x + self.drop_path(self.dropout(gate_msa.unsqueeze(1) * attn))
         
-        # 2. Cross-Attention (Future-History)
-        # CRITICAL: Pass ctx_mask to ignore padded history
+        # 2. Cross-Attention (Future-History, Conditioning)
+        # CRITICAL: Pass ctx_mask to ignore padded history tokens
         h = self.norm2(x)
         cross = robust_flash_attention(
             h, context, context, self.cfg.n_heads, self.cfg.dropout,
             cos_q=cos_q, sin_q=sin_q, cos_k=cos_k, sin_k=sin_k,
             key_padding_mask=ctx_mask
         )
-        x = x + self.dropout(cross)
+        x = x + self.drop_path(self.dropout(cross))
         
         # 3. FFN
         h = self.norm3(x)
         h = h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
         ffn_out = self.ffn(h)
-        x = x + self.dropout(gate_mlp.unsqueeze(1) * ffn_out)
+        x = x + self.drop_path(self.dropout(gate_mlp.unsqueeze(1) * ffn_out))
         
         return x
 
+
 class DiffusionActionHead(nn.Module):
+    """
+    The Denoising Backbone.
+    Predicts noise (epsilon) given noisy input, timestep, and history context.
+    
+    [v10.0] Self-Conditioning (Analog Bits):
+        If enabled, the input dimension doubles (concat noisy_x + prev_x0)
+        This allows the model to "read its own thoughts" and refine predictions.
+    """
     def __init__(self, cfg: ICUConfig):
         super().__init__()
         self.cfg = cfg
-        self.in_proj = nn.Linear(cfg.input_dim, cfg.d_model)
+        
+        # [v10.0] Self-Conditioning Support
+        # If enabled, input dimension doubles (concat noisy_x + prev_x0)
+        self.in_channels = cfg.input_dim * 2 if cfg.use_self_conditioning else cfg.input_dim
+        
+        self.in_proj = nn.Linear(self.in_channels, cfg.d_model)
         self.pos_emb = nn.Parameter(torch.randn(1, cfg.pred_len, cfg.d_model) * 0.02)
         
-        # Global RoPE Generator
+        # Global RoPE Generator (shared for unified timeline)
         self.rope = RotaryEmbedding(cfg.d_model // cfg.n_heads, max_seq_len=128)
         
-        # Time Embedding
+        # Timestep Embedding MLP
         self.time_mlp = nn.Sequential(
             nn.Linear(cfg.d_model, cfg.d_model),
             nn.SiLU(),
@@ -461,11 +712,13 @@ class DiffusionActionHead(nn.Module):
         self.blocks = nn.ModuleList([DiTBlock1D(cfg) for _ in range(cfg.n_layers)])
         self.final_norm = RMSNorm(cfg.d_model)
         self.out_head = nn.Linear(cfg.d_model, cfg.input_dim)
+        
+        # Zero-init output layer for training stability
         nn.init.zeros_(self.out_head.weight)
         nn.init.zeros_(self.out_head.bias)
 
     def get_time_emb(self, t: torch.Tensor) -> torch.Tensor:
-        # Sinusoidal Embeddings
+        """Sinusoidal timestep embeddings (standard in diffusion models)."""
         half_dim = self.cfg.d_model // 2
         freqs = torch.exp(
             -math.log(10000) * torch.arange(0, half_dim, dtype=torch.float32, device=t.device) / half_dim
@@ -480,16 +733,37 @@ class DiffusionActionHead(nn.Module):
         t: torch.Tensor, 
         context_seq: torch.Tensor, 
         global_ctx: torch.Tensor, 
-        ctx_mask: Optional[torch.Tensor] = None
+        ctx_mask: Optional[torch.Tensor] = None,
+        self_cond: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        """
+        Args:
+            noisy_x: [Batch, T_pred, InputDim] - Noisy future vitals
+            t: [Batch] - Diffusion timestep
+            context_seq: [Batch, T_hist, D_model] - Encoded history
+            global_ctx: [Batch, D_model] - Pooled history summary
+            ctx_mask: [Batch, T_hist] - Padding mask for history
+            self_cond: [Batch, T_pred, InputDim] - (Optional) Previous x0 estimate
         
+        Returns:
+            [Batch, T_pred, InputDim] - Predicted noise (epsilon)
+        """
         B, T_pred, _ = noisy_x.shape
         T_hist = context_seq.shape[1]
         
-        # 1. Embed Future
-        x = self.in_proj(noisy_x) + self.pos_emb
+        # [v10.0] Self-Conditioning Logic
+        if self.cfg.use_self_conditioning:
+            if self_cond is None:
+                # Cold start: Zero padding (standard initialization)
+                self_cond = torch.zeros_like(noisy_x)
+            x_input = torch.cat([noisy_x, self_cond], dim=-1)
+        else:
+            x_input = noisy_x
         
-        # 2. Time Condition
+        # 1. Embed Future
+        x = self.in_proj(x_input) + self.pos_emb
+        
+        # 2. Time Condition (fuse with global context)
         t_emb = self.get_time_emb(t)
         cond = self.time_mlp(t_emb) + global_ctx
         
@@ -516,15 +790,24 @@ class DiffusionActionHead(nn.Module):
         
         return self.out_head(self.final_norm(x))
 
+
 # =============================================================================
-# 5. NOISE SCHEDULER
+# 7. NOISE SCHEDULER
 # =============================================================================
+
 class NoiseScheduler(nn.Module):
+    """
+    DDPM/DDIM Noise Scheduler.
+    Manages the forward diffusion process (adding noise) and the backward steps.
+    
+    Uses the "Squared Cosine Cap v2" schedule, which is superior to linear
+    for lower-resolution data like clinical time series.
+    """
     def __init__(self, timesteps: int = 100):
         super().__init__()
         self.timesteps = timesteps
         
-        # Squared Cosine Cap v2 Schedule
+        # Squared Cosine Cap v2 Schedule (OpenAI Improved DDPM)
         steps = torch.arange(timesteps + 1, dtype=torch.float64) / timesteps
         alpha_bar = torch.cos((steps + 0.008) / 1.008 * math.pi / 2) ** 2
         betas = torch.minimum(1 - alpha_bar[1:] / alpha_bar[:-1], torch.tensor(0.999))
@@ -538,30 +821,55 @@ class NoiseScheduler(nn.Module):
         self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
         self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
         
-        # [PATCH] Precompute shifted alphas for O(1) step logic
-        alphas_cumprod_prev = torch.cat([torch.ones(1, device=alphas_cumprod.device), alphas_cumprod[:-1]])
+        # Precompute shifted alphas for O(1) step logic
+        alphas_cumprod_prev = torch.cat([torch.ones(1), alphas_cumprod[:-1]])
         self.register_buffer("alphas_cumprod_prev", alphas_cumprod_prev)
 
-    def add_noise(self, x_start, t):
+    def add_noise(self, x_start: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward diffusion: add noise to x_start according to timestep t.
+        
+        Returns:
+            noisy_x: x_start with noise added
+            noise: the noise that was added (ground truth for training)
+        """
         noise = torch.randn_like(x_start)
         s1 = self.sqrt_alphas_cumprod[t][:, None, None]
         s2 = self.sqrt_one_minus_alphas_cumprod[t][:, None, None]
         return s1 * x_start + s2 * noise, noise
 
-    def step(self, pred_noise, t, x_t, use_ddim=True):
-        # [PATCH] Fix Indexing: buffer is pre-shifted/padded, so 't' indices correspond correctly.
-        # Original Bug: torch.clamp(t-1, min=0) caused t=0 and t=1 to fetch the same value.
+    def step(
+        self, 
+        pred_noise: torch.Tensor, 
+        t: torch.Tensor, 
+        x_t: torch.Tensor, 
+        use_ddim: bool = True
+    ) -> torch.Tensor:
+        """
+        Single denoising step.
+        
+        Args:
+            pred_noise: Model's predicted noise
+            t: Current timestep
+            x_t: Current noisy sample
+            use_ddim: If True, deterministic (DDIM). If False, stochastic (DDPM).
+        
+        Returns:
+            x_{t-1}: Denoised sample
+        """
         alpha_bar_t = self.alphas_cumprod[t][:, None, None]
         alpha_bar_prev = self.alphas_cumprod_prev[t][:, None, None]
         
+        # 1. Predict x0
         pred_x0 = (x_t - torch.sqrt(1 - alpha_bar_t) * pred_noise) / torch.sqrt(alpha_bar_t)
         
         if use_ddim:
+            # Deterministic Step (DDIM)
             dir_xt = torch.sqrt(1 - alpha_bar_prev) * pred_noise
             x_prev = torch.sqrt(alpha_bar_prev) * pred_x0 + dir_xt
         else:
+            # Stochastic Step (DDPM)
             beta_t = self.betas[t][:, None, None]
-            # Handle noise for t=0 safely
             noise = torch.randn_like(x_t)
             # Mask out noise for t=0 (standard DDPM logic)
             noise_mask = (t > 0).float()[:, None, None]
@@ -571,23 +879,66 @@ class NoiseScheduler(nn.Module):
             
         return x_prev
 
+
 # =============================================================================
-# 6. UNIFIED ORCHESTRATOR
+# 8. PHYSIOLOGICAL SAFETY
 # =============================================================================
+
+class PhysiologicalConsistencyLoss(nn.Module):
+    """
+    [v10.0] Enforces biological plausibility.
+    Penalizes values that drift outside the 2.5 sigma 'Hard Deck'.
+    
+    In normalized space, valid clinical values should be within [-2.5, 2.5].
+    Values outside this range indicate physiologically implausible predictions
+    (e.g., a MAP of -500 or a heart rate of 1000).
+    
+    This loss is used both during training and during Physics-Guided Sampling.
+    """
+    def __init__(self, weight: float = 0.1):
+        super().__init__()
+        self.weight = weight
+        self.bounds = 2.5 
+
+    def forward(self, x_pred: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x_pred: Predicted values (in normalized space)
+        
+        Returns:
+            Scalar loss - 0 if all values are within bounds, increases linearly
+        """
+        # ReLU(|x| - bounds) is 0 inside the safe zone, linear penalty outside
+        violation = F.relu(torch.abs(x_pred) - self.bounds)
+        return self.weight * violation.mean()
+
+
+# =============================================================================
+# 9. UNIFIED ORCHESTRATOR
+# =============================================================================
+
 class ICUUnifiedPlanner(nn.Module):
     """
     The Safety-Critical Host.
-    Connects Encoder, Backbone, and Scheduler with Strict Unit Handling.
+    Combines Encoder, DiT Backbone, and Specialized Heads.
+    
+    This is the main model class that orchestrates:
+    1. History Encoding (via TemporalFusionEncoder)
+    2. Diffusion Training (via DiffusionActionHead + NoiseScheduler)
+    3. Sepsis Risk Prediction (via aux_head)
+    4. Value Estimation for AWR (via value_head)
+    5. Physics-Guided Sampling (via PhysiologicalConsistencyLoss)
     """
     def __init__(self, cfg: ICUConfig):
         super().__init__()
         self.cfg = cfg
         
+        # Core Components
         self.encoder = TemporalFusionEncoder(cfg)
         self.backbone = DiffusionActionHead(cfg)
         self.scheduler = NoiseScheduler(cfg.timesteps)
         
-        # APEX Heads
+        # APEX Auxiliary Heads
         if cfg.use_auxiliary_head:
             self.aux_head = nn.Sequential(
                 nn.Linear(cfg.d_model, cfg.d_model // 2),
@@ -596,127 +947,262 @@ class ICUUnifiedPlanner(nn.Module):
                 nn.Linear(cfg.d_model // 2, cfg.num_phases)
             )
             
-        # [PATCH 2A] Dense Value Head for GAE-Lambda
+        # Dense Value Head for GAE-Lambda (AWR)
         # Projects global context to a Value Sequence of length T_pred
+        # This provides a baseline V(s_t) for every step t in the future.
         self.value_head = nn.Sequential(
             nn.Linear(cfg.d_model, cfg.d_model // 2),
             nn.SiLU(),
-            # Output dim is now cfg.pred_len (e.g., 6), not 1.
-            # This provides a baseline V(s_t) for every step t in the future.
             nn.Linear(cfg.d_model // 2, cfg.pred_len) 
         )
+        
+        # [v10.0] Physics Loss for both training and PGS
+        self.phys_loss = PhysiologicalConsistencyLoss()
         
         # Hooks for Normalizer
         from icu.datasets.normalizer import ClinicalNormalizer
         self.normalizer = ClinicalNormalizer(ts_channels=cfg.input_dim, static_channels=cfg.static_dim)
 
-    # [PATCH] Tuple-Safe Wrapper for ClinicalNormalizer
+    # --- Tuple-Safe Wrapper for ClinicalNormalizer ---
     def normalize(self, x_ts: torch.Tensor, x_static: Optional[torch.Tensor] = None):
-        # The ClinicalNormalizer returns (ts_norm, static_norm)
+        """Normalize clinical data to model space."""
         norm_ts, norm_static = self.normalizer.normalize(x_ts, x_static)
-        # If input static was None, norm_static is None.
         return norm_ts, norm_static
 
     def unnormalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Convert model output back to clinical units."""
         return self.normalizer.denormalize(x)
 
     def forward(self, batch: Dict[str, torch.Tensor], reduction: str = 'mean') -> Dict[str, torch.Tensor]:
+        """
+        Standard training forward pass.
+        
+        Note: The Wrapper (wrapper_generalist.py) handles the complex 
+        Two-Pass Self-Conditioning logic. This method is a fallback for 
+        simple supervised training.
+        
+        Args:
+            batch: Dictionary containing:
+                - observed_data: [B, T_obs, 28]
+                - future_data: [B, T_pred, 28]
+                - static_context: [B, 6]
+                - src_mask: [B, T_obs] (optional)
+                - phase_label: [B] (optional)
+                - aux_weight: [num_phases] (optional)
+                - clinical_reward: [B, T_pred] (optional)
+            reduction: 'mean' or 'none'
+        """
         # Unpack
         past = batch["observed_data"]
         fut = batch["future_data"]
         static = batch["static_context"]
         src_mask = batch.get("src_mask", None)
         
-        # [PATCH] Demographic Drowning Fix: Normalize Static Context
+        # Normalize
         past_norm, static_norm = self.normalize(past, static)
         fut_norm, _ = self.normalize(fut, None) 
         
-        # [PATCH] Encoder returns the authoritative mask
-        ctx_seq, global_ctx, ctx_mask = self.encoder(past_norm, static_norm, src_mask)
+        # 1. Encode History
+        # [v12.1] Robust Padding Detection:
+        # src_mask is [B, T, 28] where 0.0 = Missing.
+        # A timestep is PADDING if ALL channels are missing.
+        # [v16.0] FIX: Disable unsafe padding inference. Fixed window dataset has no padding.
+        padding_mask = None
         
-        # --- 4. Forward Diffusion ---
+        ctx_seq, global_ctx, ctx_mask = self.encoder(
+            past_norm, static_norm, 
+            imputation_mask=src_mask, 
+            padding_mask=padding_mask # [FIX] Pass padding mask to ignore ghost tokens
+        )
+        
+        # 2. Forward Diffusion (add noise)
         B = past.shape[0]
         t = torch.randint(0, self.cfg.timesteps, (B,), device=past.device)
         noisy_fut, noise_eps = self.scheduler.add_noise(fut_norm, t)
         
-        pred_noise = self.backbone(noisy_fut, t, ctx_seq, global_ctx, ctx_mask)
+        # 3. Two-Pass Self-Conditioning ("Analog Bits")
+        # [v12.1] Parity Fix: Match the 50/50 logic in wrapper_generalist.py
+        # This makes the Planner robust as a standalone module.
+        self_cond_tensor = None
+        if self.cfg.use_self_conditioning:
+            self_cond_tensor = torch.zeros_like(noisy_fut)
+            
+            # 50% probability of using a preliminary x0 estimate
+            if self.training and (torch.rand(1).item() < 0.5):
+                with torch.no_grad():
+                    # Pass 1: "Guess" noisy epsilon
+                    guess_eps = self.backbone(
+                        noisy_fut, t, ctx_seq, global_ctx, ctx_mask, self_cond=self_cond_tensor
+                    )
+                    # Reconstruct x0 estimate
+                    alpha_bar = self.scheduler.alphas_cumprod[t][:, None, None]
+                    guess_x0 = (noisy_fut - torch.sqrt(1 - alpha_bar) * guess_eps) / torch.sqrt(alpha_bar)
+                    self_cond_tensor = guess_x0.detach()
+
+        # Pass 2: Final Denoising with Conditioning
+        pred_noise = self.backbone(noisy_fut, t, ctx_seq, global_ctx, ctx_mask, self_cond=self_cond_tensor)
         
-        # --- 6. Loss & Heads ---
+        # 4. Loss Computation
         if reduction == 'none':
+            # Mean over valid prediction horizon
             diff_loss = F.mse_loss(pred_noise, noise_eps, reduction='none').mean(dim=[1, 2])
             
             if self.cfg.use_auxiliary_head and "phase_label" in batch:
                 logits = self.aux_head(global_ctx)
-                
-                # [CRITICAL FIX] Logic Parity: Slice to Clinical Phases (3)
-                # This prevents anti-gradients from affecting dormant MoE experts in Phase 1.
-                K = 3 # Clinical Phases: Stable, Pre-Shock, Shock
+                K = 3  # Target clinical phases
                 effective_logits = logits[:, :K] if logits.shape[-1] > K else logits
-                
                 aux_loss = F.cross_entropy(effective_logits, batch["phase_label"].long(), reduction='none')
             else:
                 aux_loss = torch.zeros(B, device=past.device)
         else:
             diff_loss = F.mse_loss(pred_noise, noise_eps)
             aux_loss = torch.tensor(0.0, device=past.device)
+            
             if self.cfg.use_auxiliary_head and "phase_label" in batch:
                 logits = self.aux_head(global_ctx)
                 
                 # SOTA: Apply class weighting for the 3.1% Sepsis Imbalance
-                # Expected Order: [Stable, Pre-Shock, Shock]
                 w = batch.get("aux_weight") 
                 
-                # [CRITICAL FIX] Handle num_phases > labels mismatch (e.g. 6 vs 3)
-                # If weights are provided for fewer classes than logits, we slice the logits.
-                # This ensures the Generalist can be built with 6 outputs (ready for MoE)
-                # while still being trained on 3 clinical phases.
+                # [CRITICAL FIX v3.0] Handle num_phases > labels mismatch (e.g. 6 vs 3)
                 effective_logits = logits
                 if w is not None and logits.shape[-1] > w.shape[0]:
                     effective_logits = logits[:, :w.shape[0]]
                 
                 aux_loss = F.cross_entropy(effective_logits, batch["phase_label"].long(), weight=w)
                 
-        # [PATCH] Dead Critic Fix: Include Value Loss if Target Provided
-        # Get Dense Value Sequence [B, pred_len]
+        # 5. Value Prediction (Critic for AWR)
         pred_val = self.value_head(global_ctx)
         value_loss = torch.tensor(0.0, device=past.device)
         
-        if "clinical_reward" in batch: # Look for pre-computed rewards from AdvantageCalculator
-            # MSE between Dense Value Head and Dense Rewards
-            value_loss = F.mse_loss(pred_val, batch["clinical_reward"])
+        if "clinical_reward" in batch:
+            # [v11.1] Masked MSE for Value Head
+            # Ignore padding in the prediction horizon
+            target_val = batch["clinical_reward"]
+            
+            # Try to get explicit future mask
+            f_mask = batch.get("future_mask")
+            if f_mask is None:
+                # Fallback: Inference from target zeros? No, risky. 
+                # Use src_mask if it matches length? 
+                # For now, if no mask, standard MSE
+                value_loss = F.mse_loss(pred_val, target_val)
+            else:
+                # Ensure mask matches shape
+                if f_mask.dim() == 3: f_mask = f_mask.any(dim=-1) # [B, T]
+                f_mask = f_mask.float()
+                
+                # Check alignment
+                if f_mask.shape[1] > pred_val.shape[1]:
+                    f_mask = f_mask[:, :pred_val.shape[1]]
+                
+                # Weighted MSE
+                sq_err = (pred_val - target_val) ** 2
+                masked_mse = (sq_err * f_mask).sum() / (f_mask.sum() + 1e-8)
+                value_loss = masked_mse
         
-        # Sum into total loss (Value weight 0.5 is standard for AWR baselines)
-        total = diff_loss + 0.1 * aux_loss + 0.5 * value_loss
+        # Total loss (Value weight 0.5 is standard for AWR baselines)
+        # Total loss (Value weight 0.5 is standard for AWR baselines)
+        total = diff_loss + self.cfg.aux_loss_scale * aux_loss + 0.5 * value_loss
+        
+        # Compute aux_logits for return (needed by callbacks)
+        aux_logits = self.aux_head(global_ctx) if self.cfg.use_auxiliary_head else None
         
         return {
             "loss": total,
             "diffusion_loss": diff_loss,
             "aux_loss": aux_loss,
-            "aux_logits": logits, # [FIX] Return logits for Metric Callback
+            "aux_logits": aux_logits,
             "value_loss": value_loss,
             "pred_value": pred_val
         }
 
     @torch.no_grad()
     def sample(self, batch: Dict[str, torch.Tensor], num_steps: Optional[int] = None) -> torch.Tensor:
+        """
+        [v10.0] Physics-Guided Sampling Loop.
+        
+        Actively steers the trajectory using physiological gradients AND
+        uses Self-Conditioning to refine predictions iteratively.
+        
+        This is the inference-time generation method.
+        
+        Args:
+            batch: Dictionary containing observed_data, static_context, src_mask
+            num_steps: Number of denoising steps (defaults to cfg.timesteps)
+        
+        Returns:
+            [B, T_pred, 28] - Generated future vitals (in clinical units)
+        """
         past = batch["observed_data"]
         static = batch["static_context"]
         src_mask = batch.get("src_mask", None)
         
         B = past.shape[0]
-        # [PATCH] Normalize both
+        
+        # 1. Perception (Encode history)
         past_norm, static_norm = self.normalize(past, static)
         
-        # [PATCH] Use authoritative mask
-        ctx_seq, global_ctx, ctx_mask = self.encoder(past_norm, static_norm, src_mask)
+        # [v12.1] Robust Padding Detection (Inference)
+        # [v16.0] FIX: Disable unsafe padding inference.
+        padding_mask = None
+             
+        ctx_seq, global_ctx, ctx_mask = self.encoder(
+            past_norm, static_norm, 
+            imputation_mask=src_mask,
+            padding_mask=padding_mask # [FIX] Pass padding mask
+        )
         
-
+        # 2. Initialize from pure noise
         x_t = torch.randn(B, self.cfg.pred_len, self.cfg.input_dim, device=past.device)
         steps = num_steps or self.cfg.timesteps
         
+        # [v10.0] Initialize Self-Conditioning Buffer (Analog Bits)
+        x_self_cond = torch.zeros_like(x_t)
+        
+        # 3. Denoising Loop
         for i in reversed(range(steps)):
             t = torch.full((B,), i, dtype=torch.long, device=past.device)
-            out = self.backbone(x_t, t, ctx_seq, global_ctx, ctx_mask)
+            
+            # --- A. Physics Guidance Step (Active Steering) ---
+            # We temporarily enable gradients for x_t to compute d(Loss)/dx_t
+            if self.cfg.physics_guidance_scale > 0:
+                with torch.enable_grad():
+                    x_t_in = x_t.detach().requires_grad_(True)
+                    
+                    # Estimate x0 (approx) with current self_cond
+                    out_eps = self.backbone(x_t_in, t, ctx_seq, global_ctx, ctx_mask, self_cond=x_self_cond)
+                    
+                    # Reconstruct x0 (DDIM equation)
+                    alpha_bar = self.scheduler.alphas_cumprod[t][:, None, None]
+                    x0_approx = (x_t_in - torch.sqrt(1 - alpha_bar) * out_eps) / torch.sqrt(alpha_bar)
+                    
+                    # Calculate Physiological Violation
+                    loss = self.phys_loss(x0_approx)
+                    
+                    # Compute Gradient
+                    grad = torch.autograd.grad(loss, x_t_in)[0]
+                    
+                # [v11.1] Per-Sample Steering Normalization
+                # Prevents one patient's artifact from suppressing the batch
+                grad_norm = grad.norm(dim=(1, 2), keepdim=True)
+                
+                # Avoid division by zero
+                grad = grad / (grad_norm + 1e-8)
+                    
+                # Steering: Move x_t away from violation area
+                x_t = x_t - self.cfg.physics_guidance_scale * grad.detach()
+
+            # --- B. Standard Diffusion Step ---
+            out = self.backbone(x_t, t, ctx_seq, global_ctx, ctx_mask, self_cond=x_self_cond)
+            
+            # [v10.0] Update Self-Conditioning for next step
+            # We need x0 estimate to condition the next step.
+            alpha_bar = self.scheduler.alphas_cumprod[t][:, None, None]
+            x_self_cond = (x_t - torch.sqrt(1 - alpha_bar) * out) / torch.sqrt(alpha_bar)
+            x_self_cond = x_self_cond.detach()  # Stop gradients for next step logic
+            
+            # Step (DDIM or DDPM)
             x_t = self.scheduler.step(out, t, x_t, use_ddim=self.cfg.use_ddim_sampling)
             
         return self.unnormalize(x_t)

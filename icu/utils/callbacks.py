@@ -25,75 +25,75 @@ import re
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+from tqdm.auto import tqdm
 
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
+from omegaconf import DictConfig, OmegaConf
+from torchmetrics.classification import (
+    BinaryAUROC, 
+    BinaryAveragePrecision, 
+    BinaryCalibrationError
+)
 from pytorch_lightning.callbacks import (
     Callback,
     RichProgressBar,
     ModelSummary,
     LearningRateMonitor,
     DeviceStatsMonitor,
-    EarlyStopping
+    EarlyStopping,
+    TQDMProgressBar
 )
 
-from rich.progress import TextColumn, BarColumn, TimeRemainingColumn
-from rich.table import Column
+from icu.utils.train_utils import (
+    get_rank, 
+    is_main_process, 
+    get_world_size,
+    RotationalSaver,
+    TieredEMA
+)
+
 # [FIX: Robust Import for RichProgressBarTheme (Colab/Older PL versions)]
 logger = logging.getLogger("icu.callbacks")
+
 try:
-    from pytorch_lightning.callbacks import RichProgressBarTheme
+    from rich.text import Text
+    from rich.progress import TextColumn, BarColumn, TimeRemainingColumn
+    from rich.table import Column
 except ImportError:
-    try:
-        from pytorch_lightning.callbacks.progress.rich_progress import RichProgressBarTheme
-    except ImportError:
-        # Fallback: Create a dummy if it literally doesn't exist (safety first)
-        logger.warning("RichProgressBarTheme not found in PL callbacks. Using default.")
-        RichProgressBarTheme = lambda **kwargs: None
-from torchmetrics.classification import BinaryAUROC, BinaryAveragePrecision, BinaryCalibrationError
-from omegaconf import DictConfig, OmegaConf
-from pytorch_lightning.callbacks import TQDMProgressBar
-
-# Project Imports
-# [FIX: Import get_rank to prevent NameError crash]
-from icu.utils.train_utils import (
-    RotationalSaver, 
-    TieredEMA, 
-    is_main_process, 
-    rank_zero_only,
-    get_rank 
-)
-
-
-
-# ==============================================================================
-# 0. UI: CLINICAL CONSOLE (Aesthetic Overhaul)
-# ==============================================================================
-
-APEX_RICH_THEME = RichProgressBarTheme(
-    description="bold sky_blue3",
-    progress_bar="bold dodger_blue1",
-    batch_progress="bold white",
-    time="grey70",
-    processing_speed="grey53",
-    metrics="bold spring_green3"
-)
-
-from rich.text import Text
+    # Fallback for environments without Rich
+    logger.warning("Rich library not found. Progress bars will be degraded.")
+    class Text:
+        def __init__(self, s, **kwargs): self.s = s
+        def __str__(self): return self.s
+    
+    class TextColumn:
+        def __init__(self, *args, **kwargs): pass
+    
+    class BarColumn:
+        pass
+        
+    class TimeRemainingColumn:
+        pass
+        
+    class Column:
+        pass
 
 class ProcessingSpeedColumn(TextColumn):
     def __init__(self, style="grey53"):
-        super().__init__("", style=style)
+        if 'TextColumn' in globals() and hasattr(TextColumn, '__init__'):
+            super().__init__("", style=style)
 
     def render(self, task) -> Text:
-        if task.speed is None:
-            return Text("", style=self.style) 
-        return Text(f"{task.speed:.2f} it/s", style=self.style)
+        if not hasattr(task, 'speed') or task.speed is None:
+            return Text("", style=getattr(self, 'style', '')) 
+        return Text(f"{task.speed:.2f} it/s", style=getattr(self, 'style', ''))
 
 class APEXMetricsColumn(TextColumn):
     def __init__(self):
-        super().__init__("") 
+        if 'TextColumn' in globals() and hasattr(TextColumn, '__init__'):
+            super().__init__("") 
 
     def render(self, task) -> Text:
         m_str = task.fields.get("metrics_str", "")
@@ -141,9 +141,21 @@ class APEXTQDMProgressBar(TQDMProgressBar):
     Stabilized TQDM Bar for ICU Research.
     Guarantees 'In-Place' updates (No Newline Spam) while keeping SOTA metric formatting.
     """
-    def __init__(self):
-        # Update every 20 steps to reduce IO overhead
-        super().__init__(refresh_rate=20)
+    def __init__(self, refresh_rate: int = 20):
+        # Update every 20 steps by default to reduce IO overhead
+        super().__init__(refresh_rate=refresh_rate)
+
+    def init_train_tqdm(self) -> tqdm:
+        """Standardizes the Training TQDM bar with APEX branding."""
+        bar = super().init_train_tqdm()
+        bar.set_description("🏥 APEX Training")
+        return bar
+
+    def init_validation_tqdm(self) -> tqdm:
+        """Standardizes the Validation TQDM bar."""
+        bar = super().init_validation_tqdm()
+        bar.set_description("🩺 APEX Validation")
+        return bar
 
     def get_metrics(self, trainer, pl_module) -> Dict[str, Union[int, str]]:
         # 1. Get standard metrics from Lightning
@@ -153,7 +165,7 @@ class APEXTQDMProgressBar(TQDMProgressBar):
         items.pop("v_num", None)
         
         # 3. Reformat Keys for 'SOTA' Compactness
-        # Output will look like: L:0.342 | A:0.891 | D:0.012
+        # Output will look like: L:0.342 | AUC:0.891 | E:0.012
         clean_metrics = {}
         for k, v in items.items():
             # Apply formatting to floats (3 decimals)
@@ -171,6 +183,7 @@ class APEXTQDMProgressBar(TQDMProgressBar):
             sk = sk.replace("generative_mse", "GMSE").replace("generative_mae", "GMAE")
             sk = sk.replace("policy_entropy", "E").replace("explained_variance", "EV")
             sk = sk.replace("preshock_L", "PS").replace("stable_L", "S").replace("crash_L", "C")
+            sk = sk.replace("router_ce_L", "RCE").replace("load_balance_L", "LB")
             sk = sk.replace("ood_rate", "OOD").replace("grad_norm_total", "GN").replace("max_weight", "MW")
             
             clean_metrics[sk] = val
@@ -251,7 +264,8 @@ class AnomalyGuardian(Callback):
                 
                 if saver:
                     logger.info("Executing Emergency Atomic Dump on Rank 0...")
-                    saver.on_train_epoch_end(trainer, pl_module) # Force dump
+                    # [FIX: Alignment] Use the new unified save method
+                    saver.trigger_emergency_save(trainer, pl_module)
                 else:
                     logger.warning("AnomalyGuardian could not find RotationalSaverCallback to dump state.")
             except Exception as e:
@@ -309,9 +323,18 @@ class ClinicalMetricCallback(Callback):
             clean_target = target[valid_mask]
             
             # CRITICAL FIX: Handle multi-class logits (Tri-Phase: [B, 3])
-            # Convert to binary probability: P(Not Stable) = 1 - P(Stable)
-            # where P(Stable) = softmax(logits)[:, 0]
-            if clean_preds.dim() == 2 and clean_preds.shape[-1] > 1:
+            # v8.1: Check if model provided explicit 'sepsis_prob' (APEX-MoE Multi-Expert)
+            if "sepsis_prob" in outputs and outputs["sepsis_prob"] is not None:
+                sepsis_prob = outputs["sepsis_prob"].detach().float()
+                # Ensure binary format
+                if sepsis_prob.dim() == 2:
+                    sepsis_prob = sepsis_prob.squeeze(-1)
+                # [FIX v14.0] Apply the same valid_mask to ensure shape alignment
+                clean_preds = sepsis_prob[valid_mask]
+
+            
+            # Legacy/Fallback Logic
+            elif clean_preds.dim() == 2 and clean_preds.shape[-1] > 1:
                 # Multi-class logits: [B, num_classes]
                 if self.inputs_are_logits:
                     probs = torch.softmax(clean_preds, dim=-1)
@@ -495,52 +518,61 @@ class RotationalSaverCallback(Callback):
             self.best_metric_val = float('inf')
         else:
             self.mode = "max"
-            self.best_metric_val = -float('inf') # Use neg inf, not -1 (metrics can be negative)
+            self.best_metric_val = -float('inf') 
+            
+    def trigger_emergency_save(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        """Standardized entry point for AnomalyGuardian dumps."""
+        return self._save_internal(trainer, pl_module, is_emergency=True)
 
-    # [FIX 3] Move logic to Validation End to ensure metrics are fresh
     def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         if not is_main_process(): return
-        if trainer.sanity_checking: return # Don't save during sanity check
+        if trainer.sanity_checking: return 
+        
+        # Standard validation save
+        return self._save_internal(trainer, pl_module, is_emergency=False)
 
+    def _save_internal(self, trainer: pl.Trainer, pl_module: pl.LightningModule, is_emergency: bool = False):
+        """Unified saving kernel for validation and emergency dumps."""
         epoch = trainer.current_epoch
         metrics = trainer.callback_metrics
         
-        # [FIX 4] Robust Fetching
         current_val = metrics.get(self.monitor)
         
-        # If metric is missing (e.g. first epoch or wrong name), skip logic but maybe save latest
-        if current_val is None:
-            return 
-
-        cv = current_val.item() if torch.is_tensor(current_val) else current_val
-        
-        # [FIX 5] Handle "Amnesia" - If best_val is default, try to read from PL's internal checkpoint state
-        # (Note: A full fix for Amnesia requires loading state_dict, but this is a quick guard)
-        # If current value is WAY off (e.g. 0.5 vs 0.9), we might be in a resume. 
-        # For now, we simply compare. 
-        
         is_best = False
-        if self.mode == "min":
-            if cv < self.best_metric_val:
-                self.best_metric_val = cv
-                is_best = True
-        else:
-            if cv > self.best_metric_val:
-                self.best_metric_val = cv
-                is_best = True
+        if not is_emergency and current_val is not None:
+            cv = current_val.item() if torch.is_tensor(current_val) else current_val
+            if self.mode == "min":
+                if cv < self.best_metric_val:
+                    self.best_metric_val = cv
+                    is_best = True
+            else:
+                if cv > self.best_metric_val:
+                    self.best_metric_val = cv
+                    is_best = True
 
         # Prepare State
         full_state = {
             'epoch': epoch,
             'global_step': trainer.global_step,
+            'is_emergency': is_emergency,
             'state_dict': pl_module.model.state_dict(),
-            'ema_state_dict': pl_module.ema.state_dict() if hasattr(pl_module, 'ema') and pl_module.ema else None,
+            # Handle potential EMA attachment
+            'ema_state_dict': (
+                pl_module.ema.state_dict() if hasattr(pl_module, 'ema') and pl_module.ema 
+                else getattr(pl_module, '_ema_state_dict', None)
+            ),
             'optimizer_states': [opt.state_dict() for opt in trainer.optimizers],
             'config': OmegaConf.to_container(pl_module.cfg, resolve=True) if hasattr(pl_module, 'cfg') else {},
             'metrics': {k: v.item() if torch.is_tensor(v) else v for k, v in metrics.items()}
         }
         
-        self.saver.save(state_dict=full_state, epoch=epoch, is_best=is_best, filename_prefix=self.filename_prefix)
+        suffix = "_emergency" if is_emergency else ""
+        self.saver.save(
+            state_dict=full_state, 
+            epoch=epoch, 
+            is_best=is_best, 
+            filename_prefix=f"{self.filename_prefix}{suffix}"
+        )
 
     # [FIX 6] Add load_state_dict to fix Amnesia properly
     def load_state_dict(self, state_dict):
@@ -575,9 +607,11 @@ def get_sota_callbacks(cfg: DictConfig) -> List[Callback]:
     callbacks.append(ClinicalMetricCallback(inputs_are_logits=True))
     callbacks.append(GradientHealthMonitor(log_every_n_steps=100))
 
-    # 3. Standard SOTA Monitoring (TQDM PATCH)
-    # [FIX] Switched to TQDM to kill newline spam in Notebooks/Colab
-    callbacks.append(APEXTQDMProgressBar())
+    # 3. Standard SOTA Monitoring (TQDM Standardized)
+    # [FIX] Primacy given to TQDM for terminal stability. 
+    # Rich is preserved above as 'APEXProgressBar' for legacy use.
+    refresh_rate = cfg.train.get("refresh_rate", 20)
+    callbacks.append(APEXTQDMProgressBar(refresh_rate=refresh_rate))
     
     callbacks.append(ModelSummary(max_depth=3))
     callbacks.append(LearningRateMonitor(logging_interval='step'))

@@ -112,6 +112,8 @@ class Clinical28Ingestor:
                     if L < 6: continue # Minimum window requirement
                     
                     data_matrix = np.zeros((L, 28), dtype=np.float32)
+                    mask_matrix = np.zeros((L, 28), dtype=np.float32) # 1=Real, 0=Imputed
+
                     
                     for i in range(28):
                         spec = CLINICAL_SPECS[i]
@@ -124,6 +126,10 @@ class Clinical28Ingestor:
                         if name in PHYSICS_BOUNDS:
                             low, high = PHYSICS_BOUNDS[name]
                             raw = np.clip(raw, low, high)
+                        
+                        # [FIX] Capture Missingness Mask BEFORE Imputation
+                        # This allows the model to know which values are real vs hallucinations
+                        mask_matrix[:, i] = (~np.isnan(raw)).astype(np.float32)
                         
                         # Sample-and-Hold Imputation
                         # Ffill (forward), then Bfill (start of stay), then Default (never measured)
@@ -157,9 +163,13 @@ class Clinical28Ingestor:
                     ep_id = f"ep_{self.ep_cnt:06d}"
                     txn.put(f"{ep_id}_vitals".encode(), data_matrix.tobytes())
                     
-                    # Static Context: First row of Group D (indices 22-27)
-                    static_context = data_matrix[0, 22:28].astype(np.float32)
+                    # [FIX v15.0] Extract static context from processed matrix (Indices 22-28)
+                    static_context = data_matrix[0, 22:28].copy()
                     txn.put(f"{ep_id}_static".encode(), static_context.tobytes())
+
+                    
+                    # [FIX] Store Masks
+                    txn.put(f"{ep_id}_masks".encode(), mask_matrix.tobytes())
                     
                     txn.put(f"{ep_id}_labels".encode(), labels.tobytes())
                     
@@ -171,6 +181,7 @@ class Clinical28Ingestor:
                         "modalities": {
                             "vitals": {"key": f"{ep_id}_vitals", "dtype": "float32", "shape": [L, 28]},
                             "static": {"key": f"{ep_id}_static", "dtype": "float32", "shape": [6]},
+                            "masks":  {"key": f"{ep_id}_masks",  "dtype": "float32", "shape": [L, 28]},
                             "labels": {"key": f"{ep_id}_labels", "dtype": "float32", "shape": [L]}
                         }
                     })

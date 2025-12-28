@@ -7,7 +7,7 @@ from .dataset import (
     COLUMN_GROUPS
 )
 from .normalizer import ClinicalNormalizer
-from .build_dataset import ICUExpertWriter, run_build_pipeline, FEATURE_ORDER
+from .build_dataset import run_build_pipeline, FEATURE_NAMES
 
 __all__ = [
     "ICUTrajectoryDataset",
@@ -15,9 +15,8 @@ __all__ = [
     "robust_collate_fn",
     "ensure_data_ready",
     "ClinicalNormalizer",
-    "ICUExpertWriter",
     "run_build_pipeline",
     "CANONICAL_COLUMNS",
     "COLUMN_GROUPS",
-    "FEATURE_ORDER"
+    "FEATURE_NAMES"
 ]

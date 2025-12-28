@@ -174,7 +174,7 @@ class NormalizedAnalyzer:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_dir", type=str, default="./sepsis_clinical_28_raw")
+    parser.add_argument("--dataset_dir", type=str, default="./sepsis_clinical_28")
     parser.add_argument("--batches", type=int, default=100)
     args = parser.parse_args()
     

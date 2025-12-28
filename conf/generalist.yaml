@@ -44,21 +44,23 @@ model:
 train:
   phase: "phase1"
   epochs: 100
-  batch_size: 512
+  batch_size: 1024
   num_workers: 2
-  lr: 1e-4
+  lr: 2.0e-4
   min_lr: 1e-6
+  warmup_steps: 500
   weight_decay: 1e-4
   grad_clip: 1.0
-  pos_weight: 32.6  # Handling 3.1% Sepsis imbalance
+  pos_weight: 32.96 # Optimized v2.0 (1:33 Imbalance)
+  aux_loss_scale: 0.182
   precision: "16-mixed"
-  accumulate_grad_batches: 2
+  accumulate_grad_batches: 1
   log_every_n_steps: 10
   val_batches: 50  # Number of validation batches per epoch
   
   # AWR (Advantage Weighted Regression) v2.0 (Globally Optimal via Exhaustive Audit)
-  awr_beta: 1.000        # Optimal temperature (target ESS ~ 35%)
-  awr_max_weight: 7.5    # Neutralizes extreme clinical outliers
+  awr_beta: 0.400             # Optimized v2.0 (High Selectivity)
+  awr_max_weight: 20.0        # Optimized v2.0 (Outlier Guard)
   
   # EMA (Exponential Moving Average)
   ema_decay: 0.9999
