@@ -410,7 +410,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             ev_tensor = compute_explained_variance(target_values, returns)
             
             # Update the diagnostic dict (override calculator's internal logic if needed)
-            diag["explained_variance"] = ev_tensor.item()
+            diag["explained_variance"] = ev_tensor
             
             # Normalize weights for gradient stability
             # This ensures weights have mean 1.0, preserving gradient scale
@@ -824,14 +824,31 @@ class ICUGeneralistWrapper(pl.LightningModule):
             logger.info("[Rank 0] Sampling Trajectories for AWR Whitening...")
             rewards_list = []
             
-            # [v15.3] SOTA Upgrade: Population-Level Statistics
-            # We scan the ENTIRE dataset to compute exact mu/sigma logic.
-            # This is "Utmost Quality" for medical safety (prevents batch jitter).
+            # [v15.4] Robusified: Calibration Mode Toggle
             num_samples = len(dataset)
-            indices = range(num_samples)
-            
-            logger.info(f"[Rank 0] Starting Population Scan (N={num_samples})... This may take a few minutes.")
-            indices = torch.arange(num_samples)
+            mode = self.cfg.train.get("awr_calibration_mode", "full")
+            max_samples = self.cfg.train.get("awr_max_samples", 5000)
+
+            if mode == "sample":
+                if max_samples >= num_samples:
+                    logger.info(f"[Rank 0] AWR Calibration: Requested samples ({max_samples}) >= population ({num_samples}). Falling back to FULL scan.")
+                    indices = torch.arange(num_samples)
+                    actual_count = num_samples
+                elif max_samples <= 0:
+                    logger.warning(f"[Rank 0] AWR Calibration: Invalid max_samples={max_samples}. Defaulting to FULL scan.")
+                    indices = torch.arange(num_samples)
+                    actual_count = num_samples
+                else:
+                    logger.info(f"[Rank 0] AWR Calibration: Sampling trajectories (N={max_samples} of {num_samples})...")
+                    # Rank-consistent deterministic sampling derived from global seed
+                    g = torch.Generator(device='cpu')
+                    g.manual_seed(self.cfg.seed + 42) 
+                    indices = torch.randperm(num_samples, generator=g)[:max_samples]
+                    actual_count = max_samples
+            else:
+                logger.info(f"[Rank 0] AWR Calibration: Starting Full Population Scan (N={num_samples})... This may take a few minutes.")
+                indices = torch.arange(num_samples)
+                actual_count = num_samples
             
             for idx in tqdm(indices, desc="AWR Calibration", disable=not self.trainer.is_global_zero):
                 sample = dataset[int(idx)]

@@ -66,6 +66,12 @@ train:
   # AWR Optimization v2.0 (Globally Optimal via Exhaustive Audit)
   awr_beta: 0.400             # Optimized for Specialist Fine-Tuning
   awr_max_weight: 20.0        # Robust Clipping
+  
+  # AWR Calibration Speed/Quality (v10.1 Upgrade)
+  awr_calibration_mode: "sample"
+  awr_max_samples: 5000
+
+  
   aux_loss_scale: 0.182 # Optimized v2.0 (Router Supervision)
   ema_decay: 0.999    # Faster EMA update for adaptation
   

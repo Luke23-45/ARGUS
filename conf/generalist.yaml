@@ -62,6 +62,12 @@ train:
   awr_beta: 0.400             # Optimized v2.0 (High Selectivity)
   awr_max_weight: 20.0        # Optimized v2.0 (Outlier Guard)
   
+  # AWR Calibration Speed/Quality (v10.1 Upgrade)
+  # - "full": Scans all trajectories (~5-10 min, best for final training)
+  # - "sample": Random subset (~10-30 sec, best for testing)
+  awr_calibration_mode: "sample" # full for whole population scan
+  awr_max_samples: 5000       # Only used if mode="sample" it will be ignored if awr_calibration_mode="full"
+  
   # EMA (Exponential Moving Average)
   ema_decay: 0.9999
   monitor: "val/clinical_auroc"

@@ -399,10 +399,31 @@ class ICUSpecialistWrapper(pl.LightningModule):
             logger.info("[AWR SYNC] Computing advantage statistics on Rank 0...")
             advantages_list = []
             
-            # [v15.3] SOTA Upgrade: Population-Level Statistics
-            # Exact population moments for the Specialist distribution.
+            # [v15.4] Robusified: Calibration Mode Toggle
             sample_count = len(dataset)
-            idxs = torch.arange(sample_count)
+            mode = self.cfg.train.get("awr_calibration_mode", "full")
+            max_samples = self.cfg.train.get("awr_max_samples", 5000)
+
+            if mode == "sample":
+                if max_samples >= sample_count:
+                    logger.info(f"[AWR SYNC] Requested samples ({max_samples}) >= population ({sample_count}). Falling back to FULL scan.")
+                    idxs = torch.arange(sample_count)
+                    actual_count = sample_count
+                elif max_samples <= 0:
+                    logger.warning(f"[AWR SYNC] Invalid awr_max_samples={max_samples}. Defaulting to FULL scan.")
+                    idxs = torch.arange(sample_count)
+                    actual_count = sample_count
+                else:
+                    logger.info(f"[AWR SYNC] Sampling trajectories (N={max_samples} of {sample_count})...")
+                    # Ensure sampling is consistent across ranks (though handled by Rank 0)
+                    g = torch.Generator(device='cpu')
+                    g.manual_seed(self.cfg.seed + 2024)
+                    idxs = torch.randperm(sample_count, generator=g)[:max_samples]
+                    actual_count = max_samples
+            else:
+                logger.info(f"[AWR SYNC] Starting Full Population Scan (N={sample_count})...")
+                idxs = torch.arange(sample_count)
+                actual_count = sample_count
             
             valid_samples = 0
             skipped_samples = 0
