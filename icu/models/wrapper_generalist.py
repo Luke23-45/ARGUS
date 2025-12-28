@@ -258,6 +258,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
         Returns:
             Scalar loss tensor for backpropagation
         """
+        if not batch or "observed_data" not in batch:
+            return None
+        
         gt_label = batch.get("outcome_label", None)
         
         # --- 1. Unpack & Normalize (Shared) ---
@@ -409,13 +412,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
         aux_scale = self.cfg.train.get("aux_loss_scale", 0.1)
         total_loss = weighted_diff_loss + 0.5 * critic_loss + aux_scale * aux_loss + phys_penalty
         
-        # --- 6. EMA Update (Student -> Teacher) ---
-        # [v12.1] Accumulation-Aware Update:
-        # Only update EMA when the weights are actually updated by the optimizer.
-        # This prevents the Teacher from drifting too fast during accumulation steps.
-        accum = self.trainer.accumulate_grad_batches
-        if (batch_idx + 1) % accum == 0:
-            self.ema.update(self.model)
+        # --- 6. EMA Update (Moved to on_train_batch_end) ---
+        # [v12.2] FIX: EMA update must happen AFTER optimizer step to prevent lag.
+        # Logic handled in on_train_batch_end hook.
         
         # --- 7. Policy Entropy Diagnostic ---
         # Monitors mode collapse in the router (if aux head is used)
@@ -437,7 +436,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
         
         # Step-level logging (for live monitoring)
         self.log_dict({
-            "train/loss_step": total_loss,
+            "train/total_loss": total_loss,  # [FIX] Aligned for AnomalyGuardian
+            "train/loss": total_loss,        # [FIX] Redundant key for standard callbacks
             "train/diff_loss": weighted_diff_loss,
             "train/critic_loss": critic_loss,
             "train/awr_ess": diag["ess"],              # Effective Sample Size (RL health)
@@ -450,6 +450,30 @@ class ICUGeneralistWrapper(pl.LightningModule):
         }, on_step=True, on_epoch=False, prog_bar=True)
         
         return total_loss
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """
+        [v12.2] SOTA EMA Update Logic.
+        Executed AFTER the optimizer step (which happens in training_step or between hooks).
+        
+        This ensures the Teacher tracks the NEW student weights, avoiding 1-step lag.
+        """
+        # Accumulation Awareness
+        accum = self.trainer.accumulate_grad_batches
+        
+        # Calculate if this was an optimizer step
+        try:
+            total_batches = self.trainer.num_training_batches
+        except:
+            total_batches = len(self.trainer.train_dataloader)
+
+        is_accum_step = (batch_idx + 1) % accum == 0
+        is_last_batch = (batch_idx + 1) == total_batches
+        
+        if is_accum_step or is_last_batch:
+            # Update Teacher with Student's new weights
+            if hasattr(self, 'ema') and self.ema is not None:
+                self.ema.update(self.model)
 
     def on_train_epoch_end(self):
         """Log accumulated metrics for the epoch and reset."""
@@ -488,6 +512,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
         
         Returns predictions and targets for external callbacks.
         """
+        # 0. Robustness Guard
+        if not batch or "observed_data" not in batch:
+            return {}
+
         # 1. Standard Loss Monitoring
         out = self.model(batch, reduction='mean')
         self.log("val/diff_loss", out["diffusion_loss"], on_epoch=True, sync_dist=True)
@@ -506,15 +534,23 @@ class ICUGeneralistWrapper(pl.LightningModule):
                     risk_prob = torch.sigmoid(logits.squeeze())
                 
                 # Binary label for AUROC (0 = Stable, 1 = Sepsis/Shock)
-                binary_label = (batch["outcome_label"] > 0).long()
-                
+                # [FIX] Use phase_label > 0 (Stable=0, Pre=1, Shock=2) for robust binary target
+                # outcome_label is float probability, casting to long makes it 0 (Bug Fix)
+                if "phase_label" in batch:
+                    binary_label = (batch["phase_label"] > 0).long()
+                    target_class = batch["phase_label"].long()
+                else:
+                    # Fallback if phase_label missing (should not happen with SotaDataset)
+                    binary_label = (batch["outcome_label"] > 0.5).long()
+                    target_class = (batch["outcome_label"] > 0.5).long()
+
                 # ECE and Overconfidence Error
                 ece = compute_ece(risk_prob, binary_label)
                 oe = compute_overconfidence_error(risk_prob, binary_label)
                 
                 self.val_ece.update(ece)
                 self.val_oe.update(oe)
-                self.val_acc_sepsis.update(logits, batch["outcome_label"].long())
+                self.val_acc_sepsis.update(logits, target_class)
                 self.val_auroc_sepsis.update(risk_prob, binary_label)
 
         # 3. Clinical Trajectory Sampling (Every 5th batch to save compute)
@@ -557,16 +593,17 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # This helps identify which subsystem the model struggles with
         
         # Hemodynamic (indices 0-6): HR, MAP, Temp, SpO2, SBP, DBP, RespRate
+        # [FIX] Enforce contiguous memory layout for slices to prevent View/Stride errors in torchmetrics
         if pred.shape[-1] > 6:
-            self.val_mse_hemo.update(pred[..., :7], gt[..., :7])
+            self.val_mse_hemo.update(pred[..., :7].contiguous(), gt[..., :7].contiguous())
         
         # Labs (indices 7-17): Metabolic panel
         if pred.shape[-1] > 17:
-            self.val_mse_labs.update(pred[..., 7:18], gt[..., 7:18])
+            self.val_mse_labs.update(pred[..., 7:18].contiguous(), gt[..., 7:18].contiguous())
         
         # Electrolytes (indices 18-21): Na, K, Ca, Mg
         if pred.shape[-1] > 21:
-            self.val_mse_electrolytes.update(pred[..., 18:22], gt[..., 18:22])
+            self.val_mse_electrolytes.update(pred[..., 18:22].contiguous(), gt[..., 18:22].contiguous())
         
         # C. Safety Check (The "Hard Deck")
         # OOD Guardian checks if generated trajectories are biologically plausible

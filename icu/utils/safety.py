@@ -198,6 +198,7 @@ class OODGuardian:
         return {
             "ood_mask": ood_mask,                       # [B] Boolean
             "ood_rate": ood_mask.float().mean(),        # Scalar
+            "safe_count": (1.0 - ood_mask.float()).sum(), # [FIX] Scalar for metrics
             "stitching_error": stitch_diff.mean(),      # Scalar (Average discontinuity)
             "sbp_delta_mean": max_delta_sbp.mean(),     # Scalar
             "lac_max_mean": max_lac.mean(),             # Scalar

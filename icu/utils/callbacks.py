@@ -470,8 +470,31 @@ class EMACallback(Callback):
             self.ema.apply_shadow(pl_module.model)
 
     def on_train_batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, *args, **kwargs):
+        """
+        [v3.7 FIX] Accumulation-Aware Updates.
+        Only update EMA when the optimizer actually steps.
+        """
         if self.ema:
-            self.ema.update(pl_module.model)
+            # Check for Gradient Accumulation
+            # Logic: (batch_idx + 1) % accumulate_grad_batches == 0
+            # OR it's the last batch of the epoch.
+            accum = trainer.accumulate_grad_batches
+            batch_idx = kwargs.get("batch_idx", 0) # robust get
+            
+            # Robust total batches retrieval
+            try:
+                total_batches = trainer.num_training_batches
+            except:
+                try:
+                    total_batches = len(trainer.train_dataloader)
+                except:
+                    total_batches = float('inf') # Fallback
+
+            is_accum_step = (batch_idx + 1) % accum == 0
+            is_last_batch = (batch_idx + 1) == total_batches
+            
+            if is_accum_step or is_last_batch:
+                self.ema.update(pl_module.model)
 
     def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         if self.ema:

@@ -865,10 +865,9 @@ class ICUSpecialistWrapper(pl.LightningModule):
             out_payload = self.model.sample(batch, hard_gating=False, use_physics_guidance=True)
             
             # ================================================================
-            # 2. CLINICAL VITALS VALIDATION (First batch only for speed)
+            # 2. CLINICAL VITALS VALIDATION (Full Dataset - Quality First)
             # ================================================================
-            if batch_idx == 0:
-                self._validate_clinical_sampling(batch, out_payload["vitals"])
+            self._validate_clinical_sampling(batch, out_payload["vitals"])
             
             # ================================================================
             # 3. ROUTING METRICS (Sepsis Classification)

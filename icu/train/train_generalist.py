@@ -303,7 +303,9 @@ def main(cfg: DictConfig):
     
     strategy = hw_ctx["strategy"]
     if strategy == "ddp":
-        strategy = DDPStrategy(find_unused_parameters=False)
+        # [ROBUSTNESS] find_unused_parameters=True required for AuxHead handling
+        # independent of loss weighting. Prevents DDP crash on unused subgraphs.
+        strategy = DDPStrategy(find_unused_parameters=True)
     
     # Configure Callbacks (SOTA)
     # [FIX] Filter out EMACallback because ICUGeneralistWrapper manages EMA manually
