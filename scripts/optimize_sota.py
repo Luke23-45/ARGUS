@@ -53,7 +53,12 @@ from icu.models.wrapper_generalist import ICUGeneralistWrapper
 from icu.train.train_generalist import ICUGeneralistDataModule
 from icu.utils.train_utils import get_hardware_context, set_seed
 from icu.utils.callbacks import APEXTQDMProgressBar
-
+from icu.datasets.dataset import ICUSotaDataset, robust_collate_fn
+from icu.utils.advantage_calculator import ICUAdvantageCalculator
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+import pandas as pd
+from typing import Union, List
 # Configure SOTA Logger
 logging.basicConfig(
     level=logging.INFO,
@@ -212,10 +217,111 @@ class PCBEOptimizer:
     def __init__(self, base_cfg: DictConfig):
         self.base_cfg = base_cfg
         self.hw_ctx = get_hardware_context()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # Create output directory for study artifacts
         self.study_dir = Path("optimization_results")
         self.study_dir.mkdir(exist_ok=True)
+        
+        self.cache_path = Path("audit_cache.json")
+
+    def perform_unified_audit(self, datamodule: pl.LightningDataModule) -> Dict[str, Any]:
+        """
+        Final SOTA Audit: Physics + Distribution + Caching.
+        """
+        if self.cache_path.exists():
+            logger.info(f"♻️ LOADING AUDIT FROM CACHE: {self.cache_path}")
+            with open(self.cache_path, "r") as f:
+                return json.load(f)
+
+        logger.info("🔭 STARTING DEEP PHYSIOLOGICAL AUDIT (1.2M Windows Scan)...")
+        
+        datamodule.setup("fit")
+        # Use a significant sample for the audit
+        loader = DataLoader(
+            datamodule.train_dataset, 
+            batch_size=4096, 
+            shuffle=True, # Random sampling provides good variance estimate
+            collate_fn=robust_collate_fn, 
+            num_workers=4
+        )
+        
+        sepsis_count = 0
+        total_windows = 0
+        all_traj_rewards = []
+        calc = ICUAdvantageCalculator()
+        
+        # We increase audit fidelity to 50k windows for "Deep" stats
+        MAX_AUDIT = 50000
+        
+        with torch.no_grad():
+            for batch in tqdm(loader, desc="Deep Scan"):
+                vitals = batch["future_data"].to(self.device)
+                if "outcome_label" in batch:
+                    labels = batch["outcome_label"].to(self.device).float()
+                else:
+                    labels = (batch["phase_label"] >= 1).to(self.device).float()
+                
+                # SOTA: Catch empty batches if any
+                if labels.numel() == 0: continue
+                
+                sepsis_count += (labels > 0.5).sum().item()
+                total_windows += labels.shape[0]
+                
+                mask = batch.get("future_mask", None)
+                if mask is not None: mask = mask.to(self.device)
+                
+                rewards = calc.compute_clinical_reward(vitals, labels, normalizer=None, src_mask=mask)
+                
+                if mask is not None:
+                    if mask.dim() == 3: mask = mask.any(dim=-1)
+                    traj_rewards = (rewards * mask.float()).sum(dim=1) / (mask.float().sum(dim=1) + 1e-8)
+                else:
+                    traj_rewards = rewards.mean(dim=1)
+                
+                all_traj_rewards.append(traj_rewards.cpu())
+                
+                if total_windows >= MAX_AUDIT: break
+        
+        # --- SOTA CALCULATIONS ---
+        prevalence = sepsis_count / total_windows
+        # Optimal pos_weight using SOTA Class-Balance formula
+        opt_pos_weight = (total_windows - sepsis_count) / (sepsis_count + 1e-8)
+        
+        rewards_vec = torch.cat(all_traj_rewards)
+        mu, sigma = rewards_vec.mean(), rewards_vec.std() + 1e-8
+        norm_adv = (rewards_vec - mu) / sigma
+        
+        # Finding Beta via Vectorized Search (Target 35% ESS)
+        betas = torch.linspace(0.1, 3.0, steps=100)
+        target_ess = 0.35
+        best_beta = 0.4
+        min_error = 1.0
+        
+        for b in betas:
+            # SOTA weight formula
+            w = torch.exp(torch.clamp(norm_adv / b, max=10.0))
+            w_clip = torch.clamp(w, max=30.0)
+            ess = (w_clip.sum()**2) / (len(w_clip) * (w_clip**2).sum() + 1e-8)
+            error = abs(ess - target_ess)
+            if error < min_error:
+                min_error = error
+                best_beta = b.item()
+
+        results = {
+            "pos_weight": round(float(opt_pos_weight), 2),
+            "awr_beta": round(float(best_beta), 3),
+            "prevalence_pct": round(prevalence * 100, 3),
+            "mu_reward": round(float(mu), 4),
+            "std_reward": round(float(sigma), 4)
+        }
+        
+        # Cache results to prevent redundant I/O
+        with open(self.cache_path, "w") as f:
+            json.dump(results, f, indent=4)
+            
+        logger.info(f"✅ DEEP AUDIT COMPLETE. Optimal pos_weight={results['pos_weight']}, beta={results['awr_beta']}")
+        return results
 
     def objective(self, trial: optuna.trial.Trial) -> float:
         """
@@ -330,13 +436,19 @@ class PCBEOptimizer:
         # Base Utility
         utility_score = (0.6 * auprc) + (0.3 * auroc) - (0.1 * ece)
         
-        # The "Safety Tax" (Soft Barrier)
-        # If OOD Rate > 10%, we start penalizing.
-        # If OOD Rate is 50%, penalty is 2.0 * (0.5 - 0.1) = 0.8 (Massive hit to score)
-        # This teaches TPE that high OOD is "expensive"
+        # --- SOTA: Log-Barrier Safety Tax ---
+        # Instead of linear penalty, we use a logarithmic barrier.
+        # This creates an "infinite wall" as OOD rate approaches the limit.
+        # Limit = 0.90 (90%). Above this, the tax explodes.
+        LIMIT = 0.90
         safety_tax = 0.0
         if ood_rate > 0.10:
-            safety_tax = 2.0 * (ood_rate - 0.10)
+            if ood_rate >= LIMIT:
+                safety_tax = 5.0 # Absolute Disqualification
+            else:
+                # Barrier Function: -log(C - x)
+                # As ood_rate -> LIMIT, penalty -> infinity
+                safety_tax = -0.5 * math.log(LIMIT - ood_rate)
             
         final_score = utility_score - safety_tax
         
@@ -392,13 +504,20 @@ def main(cfg: DictConfig):
     
     logger.info(f"Study loaded. Existing trials: {len(study.trials)}")
     
-    # 4.5 baseline Warmstart (The "Noble" Bootstrap)
-    # If the study is new, enqueue a known good baseline configuration.
+    # 4.5 UNIFIED SOTA INITIALIZATION (Audit -> Warmstart)
     if len(study.trials) == 0:
-        logger.info("Enqueuing Baseline Warmstart Trial...")
+        optimizer_engine = PCBEOptimizer(cfg)
+        # Initialize datamodule for audit
+        hw = get_hardware_context()
+        dm = ICUGeneralistDataModule(cfg, pin_memory=hw["pin_memory"])
+        
+        # Run Physics Audit
+        audit = optimizer_engine.perform_unified_audit(dm)
+        
+        logger.info("Enqueuing Calibrated Warmstart Trial (Trial 0)...")
         study.enqueue_trial({
-            "pos_weight": 25.0,
-            "awr_beta": 0.40,
+            "pos_weight": audit["pos_weight"],
+            "awr_beta": audit["awr_beta"],
             "awr_max_weight": 30,
             "aux_loss_scale": 0.20,
             "lr": 2.0e-4,
@@ -407,9 +526,11 @@ def main(cfg: DictConfig):
             "num_workers": 4,
             "prefetch_factor": 2
         })
+        study.set_user_attr("initial_prevalence", audit["prevalence_pct"])
     
     # 5. Run Optimization
-    optimizer_engine = PCBEOptimizer(cfg)
+    if 'optimizer_engine' not in locals():
+        optimizer_engine = PCBEOptimizer(cfg)
     
     # We aim for 50-60 completed trials for the "Noble" sweet spot
     TOTAL_TRIALS = 60

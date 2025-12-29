@@ -250,6 +250,16 @@ def main(cfg: DictConfig):
     hw_ctx = get_hardware_context()
     logger.info(f"Hardware Context: {hw_ctx}")
 
+    # --- Path Resolution & Creation ---
+    # Ensure all distinct directories exist
+    if cfg.get("checkpoint_dir"):
+        os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+    if cfg.get("log_dir"):
+        os.makedirs(cfg.log_dir, exist_ok=True)
+    if cfg.get("backup_dir"):
+        os.makedirs(cfg.backup_dir, exist_ok=True)
+
+
     # Determinism
     set_seed(cfg.seed)
     
@@ -279,7 +289,9 @@ def main(cfg: DictConfig):
     # =========================================================================
     # 3. TELEMETRY (LOGGERS)
     # =========================================================================
-    loggers = [CSVLogger(save_dir=cfg.output_dir, name="csv_logs")]
+    # [FIX] Respect configured log_dir instead of generic output_dir
+    log_save_dir = cfg.get("log_dir", cfg.output_dir)
+    loggers = [CSVLogger(save_dir=log_save_dir, name="csv_logs")]
     
     if cfg.logging.use_wandb:
         # Handle offline mode override
@@ -290,7 +302,7 @@ def main(cfg: DictConfig):
             project=cfg.logging.wandb_project,
             name=cfg.run_name,
             config=OmegaConf.to_container(cfg, resolve=True),
-            save_dir=cfg.output_dir,
+            save_dir=log_save_dir,
             log_model=False  # We use our own checkpointing
         ))
         
@@ -308,10 +320,21 @@ def main(cfg: DictConfig):
         strategy = DDPStrategy(find_unused_parameters=True)
     
     # Configure Callbacks (SOTA)
+    # Configure Callbacks (SOTA)
     # [FIX] Filter out EMACallback because ICUGeneralistWrapper manages EMA manually
     # for Teacher-Student distillation logic. Double-update avoidance.
+    # [FIX] Inject explicit ModelCheckpoint path
     raw_callbacks = get_sota_callbacks(cfg)
     callbacks = [cb for cb in raw_callbacks if not isinstance(cb, EMACallback)]
+    
+    # Ensure ModelCheckpoint callback uses the correct dirpath if present
+    for cb in callbacks:
+        if isinstance(cb, ModelCheckpoint):
+            # If checkpoint_dir is set in config, override likely defaults from get_sota_callbacks
+            if cfg.get("checkpoint_dir"):
+                cb.dirpath = cfg.checkpoint_dir
+                logger.info(f"[CONFIG] Checkpoint Dir overridden to: {cb.dirpath}")
+
         
     trainer = pl.Trainer(
         default_root_dir=cfg.output_dir,
@@ -366,6 +389,18 @@ def main(cfg: DictConfig):
             logger.info("[SUCCESS] Phase 1 Training Complete!")
             logger.info(f"[BEST MODEL] {trainer.checkpoint_callback.best_model_path}")
             logger.info(f"[BEST SCORE] val/sepsis_auroc = {trainer.checkpoint_callback.best_model_score:.4f}")
+            
+            # [BACKUP] Copy best model to backup_dir if configured
+            if cfg.get("backup_dir") and trainer.checkpoint_callback.best_model_path:
+                import shutil
+                best_path = Path(trainer.checkpoint_callback.best_model_path)
+                backup_path = Path(cfg.backup_dir) / best_path.name
+                try:
+                    shutil.copy2(best_path, backup_path)
+                    logger.info(f"[BACKUP] Successfully backed up best model to: {backup_path}")
+                except Exception as e:
+                    logger.error(f"[BACKUP] Failed to backup model: {e}")
+
             logger.info("="*80)
         
     except KeyboardInterrupt:

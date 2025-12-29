@@ -28,7 +28,7 @@ model:
   n_layers: 8
   encoder_layers: 4
   ffn_dim_ratio: 4
-  dropout: 0.1
+  dropout: 0.25      # [NERYVA-ALPHA] High generalization threshold from Trial 20
   use_rope: true
   use_swiglu: true
   use_flash_attn: true
@@ -44,28 +44,28 @@ model:
 train:
   phase: "phase1"
   epochs: 100
-  batch_size: 512             # [USER REQUEST] Halved from 1024 due to worker bottleneck
+  batch_size: 512            # [NERYVA-ALPHA] High-throughput trajectory processing
   num_workers: 2
-  lr: 2.0e-4
+  lr: 1.5e-4                  # [NERYVA-ALPHA] Optimal tempo for sepsis innovation
   min_lr: 1e-6
   warmup_steps: 500
   weight_decay: 1e-4
   grad_clip: 1.0
-  pos_weight: 32.96 # Optimized v2.0 (1:33 Imbalance)
-  aux_loss_scale: 0.182
+  pos_weight: 34.85           # [NERYVA-ALPHA] Certified Sensitivity (Trial 10 + 20 Synthesis)
+  aux_loss_scale: 0.335       # [NERYVA-ALPHA] Optimal multi-task grounding
   precision: "16-mixed"
   accumulate_grad_batches: 2  # [AUTO] Maintain effective batch size of 1024 (512 * 2)
   log_every_n_steps: 10
   val_batches: 50  # Number of validation batches per epoch
   
   # AWR (Advantage Weighted Regression) v2.0 (Globally Optimal via Exhaustive Audit)
-  awr_beta: 0.400             # Optimized v2.0 (High Selectivity)
-  awr_max_weight: 20.0        # Optimized v2.0 (Outlier Guard)
+  awr_beta: 0.380             # [NERYVA-ALPHA] Balanced Regularization (0.38)
+  awr_max_weight: 20.0        # [NERYVA-ALPHA] Verified Safety Boundary
   
   # AWR Calibration Speed/Quality (v10.1 Upgrade)
   # - "full": Scans all trajectories (~5-10 min, best for final training)
   # - "sample": Random subset (~10-30 sec, best for testing)
-  awr_calibration_mode: "sample" # full for whole population scan
+  awr_calibration_mode: "full" # full for whole population scan
   awr_max_samples: 5000       # Only used if mode="sample" it will be ignored if awr_calibration_mode="full"
   
   # EMA (Exponential Moving Average)

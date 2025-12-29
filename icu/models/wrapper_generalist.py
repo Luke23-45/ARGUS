@@ -818,6 +818,20 @@ class ICUGeneralistWrapper(pl.LightningModule):
         This is critical for DDP consistency - different random samples on
         different ranks would cause divergence.
         """
+        # [v20.1] PERFORMANCE PATCH: AWR Dependency Injection
+        # If stats are pre-computed (e.g., from deep audit), use them directly.
+        # This bypasses the 1500-sample calibration loop for HPO speed.
+        injected_mean = self.cfg.train.get("awr_stats_mean", None)
+        injected_std = self.cfg.train.get("awr_stats_std", None)
+        
+        if injected_mean is not None and injected_std is not None:
+            if self.trainer.is_global_zero:
+               logger.info(f"⚡ [AWR] Fast-Path Active: Using Injected Stats (mu={injected_mean:.4f}, sigma={injected_std:.4f})")
+            
+            self.awr_calculator.set_stats(mean=injected_mean, std=injected_std)
+            self._awr_stats_initialized = True
+            return
+
         stats_tensor = torch.zeros(2, device=self.device)
         
         if self.trainer.is_global_zero:

@@ -246,6 +246,16 @@ def main(cfg: DictConfig):
     hw_ctx = get_hardware_context()
     logger.info(f"Specialist Hardware Context: {hw_ctx}")
 
+    # --- Path Resolution & Creation ---
+    # Ensure all distinct directories exist
+    if cfg.get("checkpoint_dir"):
+        os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+    if cfg.get("log_dir"):
+        os.makedirs(cfg.log_dir, exist_ok=True)
+    if cfg.get("backup_dir"):
+        os.makedirs(cfg.backup_dir, exist_ok=True)
+
+
     # Determinism
     set_seed(cfg.seed)
     
@@ -301,7 +311,9 @@ def main(cfg: DictConfig):
     # =========================================================================
     # 4. TELEMETRY (LOGGERS)
     # =========================================================================
-    loggers = [CSVLogger(save_dir=cfg.output_dir, name="specialist_logs")]
+    # [FIX] Respect configured log_dir instead of generic output_dir
+    log_save_dir = cfg.get("log_dir", cfg.output_dir)
+    loggers = [CSVLogger(save_dir=log_save_dir, name="specialist_logs")]
     
     if cfg.logging.use_wandb:
         # Handle offline mode override
@@ -312,7 +324,7 @@ def main(cfg: DictConfig):
             project=cfg.logging.wandb_project,
             name=cfg.run_name,
             config=OmegaConf.to_container(cfg, resolve=True),
-            save_dir=cfg.output_dir,
+            save_dir=log_save_dir,
             group="Phase2_Specialist",
             log_model=False  # We use our own checkpointing
         ))
@@ -353,6 +365,14 @@ def main(cfg: DictConfig):
         # [DDP] Sync batch norm for distributed MoE
         sync_batchnorm=True if hw_ctx["devices"] > 1 else False
     )
+
+    # [FIX] Inject explicit ModelCheckpoint path into callbacks if they were created via get_sota_callbacks
+    for cb in trainer.callbacks:
+        if isinstance(cb, ModelCheckpoint):
+            if cfg.get("checkpoint_dir"):
+                cb.dirpath = cfg.checkpoint_dir
+                logger.info(f"[CONFIG] Checkpoint Dir overridden to: {cb.dirpath}")
+
     
     # =========================================================================
     # 6. LAUNCH TRAINING
@@ -401,6 +421,18 @@ def main(cfg: DictConfig):
                         f"[BEST SCORE] val/loss = {trainer.checkpoint_callback.best_model_score:.4f}"
                     )
             logger.info("="*80)
+
+            # [BACKUP] Copy best model to backup_dir if configured
+            if cfg.get("backup_dir") and trainer.checkpoint_callback and trainer.checkpoint_callback.best_model_path:
+                import shutil
+                best_path = Path(trainer.checkpoint_callback.best_model_path)
+                backup_path = Path(cfg.backup_dir) / best_path.name
+                try:
+                    shutil.copy2(best_path, backup_path)
+                    logger.info(f"[BACKUP] Successfully backed up best model to: {backup_path}")
+                except Exception as e:
+                    logger.error(f"[BACKUP] Failed to backup model: {e}")
+
         
     except KeyboardInterrupt:
         logger.warning("[STOP] Training interrupted by user. Saving state...")
