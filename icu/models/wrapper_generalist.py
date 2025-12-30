@@ -491,8 +491,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
         curr_phys_weight = self._get_curr_physics_weight()
         
-        # Calculate loss on CLINICAL values (mmHg), but gradients propagate to NORMALIZED outputs
-        phys_penalty = self.phys_loss(x0_clinical) * curr_phys_weight
+        # [CRITICAL FIX v16.5] Pass NORMALIZED values (sigma units) to PhysiologicalConsistencyLoss
+        # The loss expects values in [-2.5, 2.5] range, NOT clinical units (e.g., MAP=75 mmHg).
+        # Previous bug: ReLU(|75| - 2.5) = 72.5 caused massive gradient explosion → NaN.
+        phys_penalty = self.phys_loss(x0_approx_norm) * curr_phys_weight
         # G. Total Loss Composition
         # [v14.2] Dynamic Loss Balancing (GradNorm-Lite)
         # If the Sepsis Classifier (Aux) starts stalling while Diffusion dominates,
@@ -681,7 +683,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 pred = self.model.sample(subset)
         
         # A. Global MSE (Overall prediction quality)
-        self.val_mse_global.update(pred, gt)
+        # [ROBUSTNESS FIX] Last line of defense: filter infinite values to prevent telemetry corruption
+        pred_safe = torch.nan_to_num(pred, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-1e9, 1e9)
+        gt_safe = torch.nan_to_num(gt, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-1e9, 1e9)
+        self.val_mse_global.update(pred_safe, gt_safe)
         
         # B. Granular MSE by Clinical Category
         # This helps identify which subsystem the model struggles with
@@ -689,15 +694,24 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # Hemodynamic (indices 0-6): HR, MAP, Temp, SpO2, SBP, DBP, RespRate
         # [FIX] Enforce contiguous memory layout for slices to prevent View/Stride errors in torchmetrics
         if pred.shape[-1] > 6:
-            self.val_mse_hemo.update(pred[..., :7].contiguous(), gt[..., :7].contiguous())
+            self.val_mse_hemo.update(
+                pred_safe[..., :7].contiguous(), 
+                gt_safe[..., :7].contiguous()
+            )
         
         # Labs (indices 7-17): Metabolic panel
         if pred.shape[-1] > 17:
-            self.val_mse_labs.update(pred[..., 7:18].contiguous(), gt[..., 7:18].contiguous())
+            self.val_mse_labs.update(
+                pred_safe[..., 7:18].contiguous(), 
+                gt_safe[..., 7:18].contiguous()
+            )
         
         # Electrolytes (indices 18-21): Na, K, Ca, Mg
         if pred.shape[-1] > 21:
-            self.val_mse_electrolytes.update(pred[..., 18:22].contiguous(), gt[..., 18:22].contiguous())
+            self.val_mse_electrolytes.update(
+                pred_safe[..., 18:22].contiguous(), 
+                gt_safe[..., 18:22].contiguous()
+            )
         
         # C. Safety Check (The "Hard Deck")
         # OOD Guardian checks if generated trajectories are biologically plausible

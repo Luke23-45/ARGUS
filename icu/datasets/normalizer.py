@@ -477,9 +477,9 @@ class ClinicalNormalizer(nn.Module):
         # 0. INPUT SAFETY: NaN Recovery
         # =====================================================================
         # This is the last line of defense. Imputation should happen upstream.
-        if torch.isnan(x_ts).any():
-            logger.warning("[NORMALIZER] NaN detected in input! Replacing with 0.")
-            x_ts = torch.nan_to_num(x_ts, nan=0.0)
+        if torch.isnan(x_ts).any() or torch.isinf(x_ts).any():
+            logger.warning("[NORMALIZER] NaN/Inf detected in input! Applying robust recovery.")
+            x_ts = torch.nan_to_num(x_ts, nan=0.0, posinf=1.0, neginf=-1.0)
 
         # =====================================================================
         # 1. PREPARE BROADCASTING
@@ -621,7 +621,15 @@ class ClinicalNormalizer(nn.Module):
         x_scaled = x_01 * (s_max - s_min) + s_min
         
         # 2. Inverse log transform (expm1 for channels with log_mask)
-        x_exp = torch.expm1(x_scaled)
+        # [SOTA FIX] Soft-Saturating Tanh-Guard
+        # Prevents exp overflow from wild predictions (+1000 sigma).
+        # We scale input so it saturates smoothly around 10.0 (e^10 ~ 22,000).
+        x_log_input = torch.where(
+            l_mask, 
+            10.0 * torch.tanh(x_scaled / 10.0), 
+            x_scaled
+        )
+        x_exp = torch.expm1(x_log_input)
         
         # 3. Select log vs linear based on mask
         x_final = torch.where(l_mask, x_exp, x_scaled)

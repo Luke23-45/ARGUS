@@ -1258,4 +1258,25 @@ class ICUUnifiedPlanner(nn.Module):
             # Step (DDIM or DDPM)
             x_t = self.scheduler.step(out, t, x_t, use_ddim=self.cfg.use_ddim_sampling)
             
-        return self.unnormalize(x_t)
+            # --- C. SOTA Stability Patches ---
+            # [v18.0] Dynamic Thresholding (Google Imagen)
+            # This prevents sampling drift by scaling the vector if extreme values are predicted.
+            # Unlike hard clamping, it preserves the relative "shape" of the prediction.
+            if self.cfg.get("use_dynamic_thresholding", True):
+                # 1. Calculate per-sample s-th percentile of absolute values
+                # We use 99.5th percentile as recommended in Saharia et al.
+                abs_x0 = torch.abs(x_self_cond)
+                s = torch.quantile(abs_x0.view(B, -1), 0.995, dim=1).view(B, 1, 1)
+                
+                # 2. Scale factor: If s > threshold, scale x0 back to threshold range
+                # Our "Threshold" is the 3-sigma clinical boundary
+                threshold = 3.0
+                s = torch.clamp(s, min=threshold)
+                x_self_cond = x_self_cond * (threshold / s)
+            
+            # [SAFETY] Iterative Manifold Clamp
+            # Last defense to prevent infinite recursion
+            x_t = x_t.clamp(-5.0, 5.0)
+
+        # Final denormalization with one last safety check
+        return self.unnormalize(x_t.clamp(-5.0, 5.0))

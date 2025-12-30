@@ -101,6 +101,28 @@ class APEXMetricsColumn(TextColumn):
 
 
 
+def format_metric_sota(v: Any) -> str:
+    """
+    SOTA Metric Formatter.
+    
+    Logic:
+    - Decimal (.3f) for values >= 0.001
+    - Scientific (.2e) for values < 0.001 (and non-zero)
+    - Clean '0.000' for zero
+    - Standard string for non-numerics
+    """
+    if not isinstance(v, (float, int)):
+        return str(v)
+    
+    abs_v = abs(float(v))
+    if abs_v == 0:
+        return "0.000"
+    elif abs_v < 0.001:
+        return f"{v:.2e}"
+    else:
+        return f"{v:.3f}"
+
+
 class APEXProgressBar(RichProgressBar):
     """
     Standard PL RichProgressBar with 'SOTA' metric formatting.
@@ -116,8 +138,8 @@ class APEXProgressBar(RichProgressBar):
         # 3. Format the remaining metrics tightly
         clean_metrics = {}
         for k, v in items.items():
-            # Format numbers to 3 decimals
-            val = f"{v:.3f}" if isinstance(v, (float, int)) else str(v)
+            # [v16.6] Adaptive Scientific Formatting
+            val = format_metric_sota(v)
             
             # Create Short Keys (SOTA Style)
             # Example: val/clinical_auroc -> A
@@ -169,11 +191,8 @@ class APEXTQDMProgressBar(TQDMProgressBar):
         # Output will look like: L:0.342 | AUC:0.891 | E:0.012
         clean_metrics = {}
         for k, v in items.items():
-            # Apply formatting to floats (3 decimals)
-            if isinstance(v, (float, int)):
-                val = f"{v:.3f}"
-            else:
-                val = str(v)
+            # [v16.6] Adaptive Scientific Formatting
+            val = format_metric_sota(v)
             
             # Shorten Keys
             # train/loss -> L, val/clinical_auroc -> A, diff_L -> D
