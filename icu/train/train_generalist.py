@@ -79,7 +79,8 @@ from icu.utils.train_utils import (
     get_rank,
     is_main_process,
     count_parameters,
-    format_parameters
+    format_parameters,
+    SurgicalCheckpointLoader
 )
 
 # Initialize Script-Level Logger
@@ -87,7 +88,68 @@ logger = logging.getLogger("APEX_Phase1_Engine")
 
 
 # =============================================================================
-# 1. ROBUST DATAMODULE
+# 1. ROBUST CHECKPOINT LOADER
+# =============================================================================
+
+def load_checkpoint_robust(
+    system: pl.LightningModule,
+    ckpt_path: str,
+    trainer: pl.Trainer
+) -> Optional[str]:
+    """
+    Surgically inspects and loads a checkpoint, bypassing PL's faulty migration
+    if the 'pytorch-lightning_version' key is missing.
+    """
+    if not ckpt_path:
+        return None
+        
+    logger.info(f"[RESUME] Inspecting checkpoint: {ckpt_path}")
+    
+    try:
+        # Load metadata only to check keys
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        
+        # Check for PyTorch Lightning metadata
+        if "pytorch-lightning_version" not in checkpoint:
+            logger.warning("[RESUME] Detected Incomplete/SOTA Checkpoint. Transitioning to Manual Restoration Suite...")
+            
+            # 1. Restore Model Weights
+            # SurgicalCheckpointLoader handles prefix stripping and shape validation
+            SurgicalCheckpointLoader.load_model(system.model, ckpt_path)
+            logger.info("[RESUME] Model weights restored manually.")
+            
+            # 2. Restore EMA state if callback exists
+            ema_cb = None
+            for cb in trainer.callbacks:
+                if isinstance(cb, EMACallback):
+                    ema_cb = cb
+                    break
+            
+            if ema_cb and "ema_state_dict" in checkpoint:
+                # Force-load EMA state dict
+                ema_cb.on_load_checkpoint(trainer, system, checkpoint)
+                logger.info("[RESUME] EMA weights restored manually.")
+            elif hasattr(system, 'ema') and system.ema is not None:
+                # [CRITICAL FIX] "Random Teacher" Prevention
+                # If we loaded the model but have no EMA state, the Teacher is still random.
+                # We must force-sync it to the Student to start with valid targets.
+                logger.warning("[RESUME] EMA state missing from checkpoint. Force-syncing Teacher (EMA) to Student (Model)...")
+                system.ema._register(system.model)
+                logger.info("[RESUME] EMA shadow weights re-initialized from loaded model.")
+                
+            # 3. Return None to trainer.fit to prevent it from trying to migrate
+            # The weights are already in 'system', so a "fresh" PL run will use them.
+            return None
+            
+        return ckpt_path
+        
+    except Exception as e:
+        logger.error(f"[RESUME] Checkpoint inspection failed: {e}. Falling back to default loader.")
+        return ckpt_path
+
+
+# =============================================================================
+# 2. ROBUST DATAMODULE
 # =============================================================================
 
 class ICUGeneralistDataModule(pl.LightningDataModule):
@@ -397,12 +459,17 @@ def main(cfg: DictConfig):
     
     try:
         # Check for resume checkpoint
-        ckpt_path = cfg.train.get("resume_from_checkpoint", None)
+        ckpt_path = cfg.get("resume_from", None)
         if ckpt_path and not os.path.exists(ckpt_path):
             logger.warning(f"Checkpoint {ckpt_path} not found. Starting fresh.")
             ckpt_path = None
         elif ckpt_path:
-            logger.info(f"[RESUME] Resuming from checkpoint: {ckpt_path}")
+            # [FIX: Robust Resumption] Use surgical loader for SOTA/Legacy checkpoints
+            ckpt_path = load_checkpoint_robust(system, ckpt_path, trainer)
+            if ckpt_path:
+                logger.info(f"[RESUME] Resuming from checkpoint via Lightning: {ckpt_path}")
+            else:
+                logger.info("[RESUME] Resuming via Manual Restoration Suite (Weights Only).")
             
         trainer.fit(system, datamodule=datamodule, ckpt_path=ckpt_path)
         

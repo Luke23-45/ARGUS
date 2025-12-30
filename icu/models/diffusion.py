@@ -99,6 +99,9 @@ class ICUConfig:
     num_phases: int = 3  # Tri-Phase: Stable(0) -> Pre-Shock(1) -> Shock(2)
     aux_loss_scale: float = 0.1 # [v11.1] Configurable Aux Loss Scale
 
+    # Stable Sampling [v18.0]
+    use_dynamic_thresholding: bool = True
+
 # =============================================================================
 # 2. LOW-LEVEL PRIMITIVES (Mask-Aware & Robust)
 # =============================================================================
@@ -1262,7 +1265,7 @@ class ICUUnifiedPlanner(nn.Module):
             # [v18.0] Dynamic Thresholding (Google Imagen)
             # This prevents sampling drift by scaling the vector if extreme values are predicted.
             # Unlike hard clamping, it preserves the relative "shape" of the prediction.
-            if self.cfg.get("use_dynamic_thresholding", True):
+            if getattr(self.cfg, "use_dynamic_thresholding", True):
                 # 1. Calculate per-sample s-th percentile of absolute values
                 # We use 99.5th percentile as recommended in Saharia et al.
                 abs_x0 = torch.abs(x_self_cond)

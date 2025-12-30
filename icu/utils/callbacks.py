@@ -43,7 +43,8 @@ from pytorch_lightning.callbacks import (
     LearningRateMonitor,
     DeviceStatsMonitor,
     EarlyStopping,
-    TQDMProgressBar
+    TQDMProgressBar,
+    ModelCheckpoint
 )
 
 from icu.utils.train_utils import (
@@ -287,7 +288,11 @@ class AnomalyGuardian(Callback):
                     # [FIX: Alignment] Use the new unified save method
                     saver.trigger_emergency_save(trainer, pl_module)
                 else:
-                    logger.warning("AnomalyGuardian could not find RotationalSaverCallback to dump state.")
+                    logger.warning("AnomalyGuardian: RotationalSaverCallback not found. Attempting standard emergency dump...")
+                    # Fallback to standard Trainer save
+                    dump_path = os.path.join(trainer.default_root_dir, "emergency_dump_anomaly.ckpt")
+                    trainer.save_checkpoint(dump_path)
+                    logger.info(f"Emergency Checkpoint saved to: {dump_path}")
             except Exception as e:
                 # Swallowing save error to preserve the original Anomaly traceback
                 logger.error(f"FATAL: Emergency Dump Failed: {e}. Original Anomaly Persists.")
@@ -535,9 +540,12 @@ class EMACallback(Callback):
         Intercept checkpoint loading with Device Safety.
         """
         if "ema_state_dict" in checkpoint:
-            # [FIX: Device Mismatch] Force all tensors to CPU immediately
-            # This prevents TieredEMA (CPU-bound) from crashing against GPU checkpoint tensors
-            safe_state = {k: v.cpu() for k, v in checkpoint["ema_state_dict"].items()}
+            # [FIX: Device Mismatch \u0026 Key Naming] Force to CPU and strip 'model.' prefix
+            # This ensures keys match between Lightning-wrapped saves and TieredEMA
+            safe_state = {}
+            for k, v in checkpoint["ema_state_dict"].items():
+                k_norm = k[6:] if k.startswith("model.") else k
+                safe_state[k_norm] = v.cpu()
 
             if self.ema:
                 self.ema.load_state_dict(safe_state)
@@ -608,7 +616,8 @@ class RotationalSaverCallback(Callback):
             ),
             'optimizer_states': [opt.state_dict() for opt in trainer.optimizers],
             'config': OmegaConf.to_container(pl_module.cfg, resolve=True) if hasattr(pl_module, 'cfg') else {},
-            'metrics': {k: v.item() if torch.is_tensor(v) else v for k, v in metrics.items()}
+            'metrics': {k: v.item() if torch.is_tensor(v) else v for k, v in metrics.items()},
+            'pytorch-lightning_version': pl.__version__
         }
         
         suffix = "_emergency" if is_emergency else ""
@@ -634,14 +643,41 @@ def get_sota_callbacks(cfg: DictConfig) -> List[Callback]:
     callbacks = []
 
     # 1. Core Engines (Saver, EMA) - Keep as is
+    # 1. Core Engines (Saver, EMA)
     save_dir = f"{cfg.output_dir}/{cfg.run_name}/checkpoints"
-    saver_cb = RotationalSaverCallback(
-        save_dir=save_dir,
-        remote_dir=cfg.get("remote_dir", None),
-        monitor=cfg.train.get("monitor", "val/clinical_auroc"), 
-        filename_prefix="icu_model"
+    
+    # [FIX] Use Standard PL ModelCheckpoint for Full Resume Compatibility
+    # The custom RotationalSaver caused KeyErrors during resume. We leverage PL's native atomic saver.
+    monitor = cfg.train.get("monitor", "val/clinical_auroc")
+    mode = "max" if "auroc" in monitor or "acc" in monitor else "min"
+    
+    saver_cb = ModelCheckpoint(
+        dirpath=save_dir,
+        filename="icu_model-{epoch:02d}-{val/clinical_auroc:.3f}" if "auroc" in monitor else "icu_model-{epoch:02d}-{val_loss:.3f}",
+        monitor=monitor,
+        mode=mode,
+        save_top_k=cfg.train.get("save_top_k", 3),
+        save_last=True, # Critical for auto-resume
+        save_weights_only=False, # We need optimizer state for resume
+        every_n_epochs=1
     )
     callbacks.append(saver_cb)
+    
+    # [BACKUP] Optional Remote Mirroring (Simple Copy)
+    remote_dir = cfg.get("remote_dir", None)
+    if remote_dir:
+        class RemoteMirror(Callback):
+            def on_train_epoch_end(self, trainer, pl_module):
+                if is_main_process() and trainer.checkpoint_callback.best_model_path:
+                    try:
+                        import shutil
+                        src = trainer.checkpoint_callback.best_model_path
+                        dst = os.path.join(remote_dir, os.path.basename(src))
+                        os.makedirs(remote_dir, exist_ok=True)
+                        shutil.copy2(src, dst)
+                    except Exception as e:
+                        logger.warning(f"[BACKUP] Failed to mirror checkpoint: {e}")
+        callbacks.append(RemoteMirror())
     
     ema_decay = cfg.train.get("ema_decay", 0.9999)
     if ema_decay > 0:

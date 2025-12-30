@@ -828,34 +828,33 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # --- 1. Normalizer Calibration (Run on ALL Ranks) ---
         # Check if already calibrated (e.g. from checkpoint) to avoid jitter
         if self.model.normalizer.is_calibrated > 0:
-            logger.info(f"[Rank {self.global_rank}] Normalizer already calibrated. Skipping.")
-            return
-
-        logger.info(f"[Rank {self.global_rank}] Calibrating Normalizer...")
-        try:
-            index_path = getattr(dataset, "index_path", None)
-            metadata = getattr(dataset, "metadata", {})
-            ts_cols = metadata.get("ts_columns", [])
-            
-            if index_path and ts_cols:
-                self.model.normalizer.calibrate_from_stats(index_path, ts_cols)
+            logger.info(f"[Rank {self.global_rank}] Normalizer already calibrated. Skipping Calibration.")
+        else:
+            logger.info(f"[Rank {self.global_rank}] Calibrating Normalizer...")
+            try:
+                index_path = getattr(dataset, "index_path", None)
+                metadata = getattr(dataset, "metadata", {})
+                ts_cols = metadata.get("ts_columns", [])
                 
-                # [CRITICAL] EMA Shadow Sync
-                # The EMA was initialized BEFORE normalizer calibration.
-                # We must force-update the shadow's normalizer buffers.
-                if hasattr(self, 'ema') and self.ema is not None:
-                    logger.info(f"[Rank {self.global_rank}] Syncing EMA shadow with calibrated normalizer...")
-                    for name, buffer in self.model.normalizer.named_buffers():
-                        full_name = f"normalizer.{name}"
-                        if full_name in self.ema.shadow:
-                            self.ema.shadow[full_name] = buffer.data.detach().cpu().clone()
-                    logger.info(f"[Rank {self.global_rank}] EMA shadow sync complete.")
-            else:
-                logger.warning("Dataset missing 'index_path' or 'metadata.ts_columns'. Using identity normalization.")
-                
-        except Exception as e:
-            logger.error(f"[CRITICAL] Normalizer Calibration Failed: {e}")
-            logger.warning("SYSTEM SAFETY: Proceeding with Uncalibrated Normalizer. Check data paths!")
+                if index_path and ts_cols:
+                    self.model.normalizer.calibrate_from_stats(index_path, ts_cols)
+                    
+                    # [CRITICAL] EMA Shadow Sync
+                    # The EMA was initialized BEFORE normalizer calibration.
+                    # We must force-update the shadow's normalizer buffers.
+                    if hasattr(self, 'ema') and self.ema is not None:
+                        logger.info(f"[Rank {self.global_rank}] Syncing EMA shadow with calibrated normalizer...")
+                        for name, buffer in self.model.normalizer.named_buffers():
+                            full_name = f"normalizer.{name}"
+                            if full_name in self.ema.shadow:
+                                self.ema.shadow[full_name] = buffer.data.detach().cpu().clone()
+                        logger.info(f"[Rank {self.global_rank}] EMA shadow sync complete.")
+                else:
+                    logger.warning("Dataset missing 'index_path' or 'metadata.ts_columns'. Using identity normalization.")
+                    
+            except Exception as e:
+                logger.error(f"[CRITICAL] Normalizer Calibration Failed: {e}")
+                logger.warning("SYSTEM SAFETY: Proceeding with Uncalibrated Normalizer. Check data paths!")
 
         # --- 2. AWR Stats Fitting (Rank 0 Compute + Broadcast) ---
         self._fit_awr_stats_ddp(dataset)
