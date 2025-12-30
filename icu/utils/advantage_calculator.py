@@ -311,7 +311,13 @@ class ICUAdvantageCalculator:
             # Validate units (Strict Mode)
             units_ok = self._validate_units(vitals_phys, feature_indices)
             if not units_ok:
-                logger.error("[CRITICAL] Units appear NORMALIZED but no 'normalizer' provided. Dense rewards disabled to protect policy!")
+                error_msg = (
+                    "[CRITICAL SAFETY FAILURE] Advantage Calculator detected NORMALIZED vitals "
+                    "without a 'normalizer'. Dense clinical rewards cannot be computed safely. "
+                    "Training must halt to prevent reward signal collapse."
+                )
+                logger.critical(error_msg)
+                raise ValueError(error_msg) 
 
         B, T, C = vitals.shape
         device = vitals.device

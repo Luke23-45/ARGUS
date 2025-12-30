@@ -285,7 +285,7 @@ class ICUTrajectoryDataset(Dataset):
                 raise KeyError(f"LMDB Key failure: {key}. Index desynchronization detected.")
             return data
 
-    @functools.lru_cache(maxsize=128)
+    @functools.lru_cache(maxsize=8192)
     def _fetch_numpy(self, key: str, dtype_str: str, shape: Tuple[int, ...]) -> np.ndarray:
         """
         Fetches and deserializes a numpy array from LMDB.

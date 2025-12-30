@@ -32,7 +32,7 @@ model:
   use_rope: true
   use_swiglu: true
   use_flash_attn: true
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   timesteps: 100
   beta_schedule: "cosine"
   prediction_type: "epsilon"
@@ -44,8 +44,8 @@ model:
 train:
   phase: "phase1"
   epochs: 100
-  batch_size: 512            # [NERYVA-ALPHA] High-throughput trajectory processing
-  num_workers: 2
+  batch_size: 128            # [NERYVA-ALPHA] High-throughput trajectory processing
+  num_workers: 4
   lr: 1.5e-4                  # [NERYVA-ALPHA] Optimal tempo for sepsis innovation
   min_lr: 1e-6
   warmup_steps: 500
@@ -54,7 +54,7 @@ train:
   pos_weight: 34.85           # [NERYVA-ALPHA] Certified Sensitivity (Trial 10 + 20 Synthesis)
   aux_loss_scale: 0.335       # [NERYVA-ALPHA] Optimal multi-task grounding
   precision: "16-mixed"
-  accumulate_grad_batches: 2  # [AUTO] Maintain effective batch size of 1024 (512 * 2)
+  accumulate_grad_batches: 1  # [MANUAL] Preserved per user request (High noise tolerant)
   log_every_n_steps: 10
   val_batches: 50  # Number of validation batches per epoch
   
@@ -65,13 +65,14 @@ train:
   # AWR Calibration Speed/Quality (v10.1 Upgrade)
   # - "full": Scans all trajectories (~5-10 min, best for final training)
   # - "sample": Random subset (~10-30 sec, best for testing)
-  awr_calibration_mode: "full" # full for whole population scan
+  awr_calibration_mode: "sample" # full for whole population scan
   awr_max_samples: 5000       # Only used if mode="sample" it will be ignored if awr_calibration_mode="full"
   
   # EMA (Exponential Moving Average)
   ema_decay: 0.9999
   monitor: "val/clinical_auroc"
   patience: 10
+  limit_val_batches: 1.0
   
   # Optimization Groups
   backbone_lr_ratio: 1.0

@@ -173,18 +173,31 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
 
     def train_dataloader(self) -> DataLoader:
         """Returns the training DataLoader."""
+        from icu.utils.samplers import EpisodeAwareSampler
+
         num_workers = self.cfg.train.num_workers
+        
+        # [SOTA] Use EpisodeAwareSampler to prevent LRU Cache Thrashing
+        # This keeps 'shuffle' behavior (random episodes) but sequential frames.
+        sampler = EpisodeAwareSampler(
+            self.train_ds, 
+            shuffle=True, 
+            seed=self.cfg.seed,
+            drop_last=True
+        )
+        
         return DataLoader(
             self.train_ds,
             batch_size=self.cfg.train.batch_size,
-            shuffle=True,
+            sampler=sampler,
+            shuffle=False, # Sampler takes control
             num_workers=num_workers,
             collate_fn=robust_collate_fn,
             pin_memory=self.pin_memory,
             persistent_workers=True if num_workers > 0 else False,
             # [PERF] Prefetch only if workers exist to avoid PyTorch warning
             prefetch_factor=2 if num_workers > 0 else None,
-            drop_last=True  # Ensures consistent batch sizes for training
+            drop_last=False # Sampler handles dropping logic if needed, but usually redundant with sampler
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -197,6 +210,7 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
             num_workers=num_workers,
             collate_fn=robust_collate_fn,
             pin_memory=self.pin_memory,
+            persistent_workers=True if num_workers > 0 else False,
             prefetch_factor=2 if num_workers > 0 else None
         )
 
@@ -335,7 +349,16 @@ def main(cfg: DictConfig):
                 cb.dirpath = cfg.checkpoint_dir
                 logger.info(f"[CONFIG] Checkpoint Dir overridden to: {cb.dirpath}")
 
-        
+    class EMARestoration(pl.Callback):
+        def on_load_checkpoint(self, trainer, pl_module, checkpoint):
+            if "ema_state_dict" in checkpoint and hasattr(pl_module, 'ema'):
+                logger.info(f"[RESUME] Found EMA state in checkpoint. Restoring to {pl_module.ema.decay} decay...")
+                # Force CPU load to ensure TieredEMA doesn't spike VRAM
+                safe_state = {k: v.cpu() for k, v in checkpoint["ema_state_dict"].items()}
+                pl_module.ema.load_state_dict(safe_state)
+                
+    callbacks.append(EMARestoration())
+            
     trainer = pl.Trainer(
         default_root_dir=cfg.output_dir,
         max_epochs=cfg.train.epochs,

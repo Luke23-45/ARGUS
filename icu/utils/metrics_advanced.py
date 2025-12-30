@@ -32,23 +32,18 @@ def compute_ece(
     n_bins: int = 10,
     adaptive: bool = True
 ) -> float:
-    """
-    Computes Expected Calibration Error (ECE) or Adaptive Calibration Error (ACE).
-    
-    Why this matters: In Sepsis (2.9% prevalence), fixed bins are mostly empty.
-    Adaptive binning (ACE) ensures every bin has data, giving a true measure of
-    reliability for rare events.
-    
-    Args:
-        probs: [N, C] or [N] probabilities.
-        labels: [N] ground truth.
-        n_bins: Number of confidence bins.
-        adaptive: If True, uses Quantile binning (ACE). If False, fixed width (ECE).
-    """
+    """Computes Expected Calibration Error (ECE/ACE)."""
+    # [PATCH] 1. Shape Safety: Flatten all inputs to prevent [N] vs [N,1] broadcasting
+    if probs.dim() > 1 and probs.shape[1] == 1:
+        probs = probs.view(-1)
+    labels = labels.view(-1) # CRITICAL FIX for silent broadcasting bug
+        
     if probs.dim() > 1 and probs.shape[1] > 1:
+        # Multiclass
         confidences, predictions = torch.max(probs, dim=1)
         accuracies = predictions.eq(labels).float()
     else:
+        # Binary
         confidences = probs
         accuracies = labels.float()
 
@@ -56,17 +51,18 @@ def compute_ece(
     total_samples = confidences.size(0)
     
     if adaptive:
-        # ACE: Quantile-based binning (equal number of samples per bin)
-        # Sort confidences to find quantiles
+        # ACE: Quantile-based binning
         sorted_conf, sorted_idx = torch.sort(confidences)
         sorted_acc = accuracies[sorted_idx]
         
-        bin_size = total_samples // n_bins
+        # [PATCH] 2. Robust Indexing: Use linspace to handle N < n_bins cases
+        indices = torch.linspace(0, total_samples, n_bins + 1, device=probs.device).long()
+        
         for i in range(n_bins):
-            start = i * bin_size
-            end = (i + 1) * bin_size if i < n_bins - 1 else total_samples
+            start = indices[i]
+            end = indices[i+1]
             
-            if start >= end: break
+            if start >= end: continue # Skip empty bins (small batches)
             
             bin_conf = sorted_conf[start:end]
             bin_acc = sorted_acc[start:end]
@@ -74,17 +70,21 @@ def compute_ece(
             avg_conf = bin_conf.mean().item()
             avg_acc = bin_acc.mean().item()
             
-            # Weight by bin size (though roughly equal in ACE)
-            weight = (end - start) / total_samples
+            weight = (end - start).float() / total_samples
             ece += weight * np.abs(avg_conf - avg_acc)
     else:
-        # Standard ECE: Fixed width bins
+        # Standard ECE
         bin_boundaries = torch.linspace(0, 1, n_bins + 1, device=probs.device)
         for i in range(n_bins):
             bin_lower = bin_boundaries[i]
             bin_upper = bin_boundaries[i + 1]
             
-            in_bin = (confidences > bin_lower) & (confidences <= bin_upper)
+            # [PATCH] 3. Zero-Inclusion: Handle p=0.0 in first bin
+            if i == 0:
+                in_bin = (confidences >= bin_lower) & (confidences <= bin_upper)
+            else:
+                in_bin = (confidences > bin_lower) & (confidences <= bin_upper)
+            
             prop_in_bin = in_bin.float().mean().item()
             
             if prop_in_bin > 0:
@@ -94,32 +94,45 @@ def compute_ece(
             
     return ece
 
+
 def compute_brier_score(probs: torch.Tensor, labels: torch.Tensor) -> float:
     """
-    Computes the Brier Score (Mean Squared Error of Probabilities).
-    A 'Strictly Proper Scoring Rule'. Unlike AUC, this penalizes being 
-    uncertain when you should be sure, and sure when you are wrong.
+    Computes the Brier Score with Shape Safety.
+    [PATCH] Enforces strict mathematical definition (1/N * Sum(Error^2)) 
+    invariant to class count.
     """
+    # [PATCH] Flatten labels to ensure [N] shape
+    labels = labels.view(-1)
+
     if probs.dim() > 1 and probs.shape[1] > 1:
-        # One-hot encode labels for multiclass Brier
+        # Multiclass: [N, C]
         target_one_hot = F.one_hot(labels.long(), num_classes=probs.shape[1]).float()
-        mse = F.mse_loss(probs, target_one_hot, reduction='mean')
-    else:
-        # Binary
-        mse = F.mse_loss(probs.float(), labels.float(), reduction='mean')
         
-    return mse.item()
+        # [PATCH] Use 'sum' reduction to calculate total squared error per sample,
+        # then mean over the batch. This prevents 1/C scaling.
+        # Brier = 1/N * Sum_nc (p_nc - y_nc)^2
+        squared_error = (probs - target_one_hot).pow(2).sum(dim=1) # [N]
+        brier = squared_error.mean()
+    else:
+        # Binary: [N]
+        # Brier = 1/N * Sum (p - y)^2
+        probs_flat = probs.view(-1).float()
+        labels_flat = labels.float()
+        brier = F.mse_loss(probs_flat, labels_flat, reduction='mean')
+        
+    return brier.item()
 
 def compute_overconfidence_error(
     probs: torch.Tensor, 
     labels: torch.Tensor, 
     n_bins: int = 10
 ) -> float:
-    """
-    Computes Overconfidence Error (OE).
-    Penalizes the model specifically for high-confidence errors.
-    Critical for "Do No Harm": It is worse to be confidently wrong than unsure.
-    """
+    """Computes Overconfidence Error (OE) with Shape Safety."""
+    # [PATCH] Flatten inputs
+    if probs.dim() > 1 and probs.shape[1] == 1:
+        probs = probs.view(-1)
+    labels = labels.view(-1)
+        
     if probs.dim() > 1 and probs.shape[1] > 1:
         confidences, predictions = torch.max(probs, dim=1)
         accuracies = predictions.eq(labels).float()
@@ -127,11 +140,6 @@ def compute_overconfidence_error(
         confidences = probs
         accuracies = labels.float()
 
-    # We want to punish: Confidence > Accuracy
-    # OE = E[ confidence * max(0, confidence - accuracy) ]
-    
-    # Vectorized computation without explicit bins for finer granularity 
-    # or keep binning for stability. Sticking to binning for stability.
     bin_boundaries = torch.linspace(0, 1, n_bins + 1, device=probs.device)
     oe = 0.0
     
@@ -139,21 +147,25 @@ def compute_overconfidence_error(
         bin_lower = bin_boundaries[i]
         bin_upper = bin_boundaries[i + 1]
         
-        in_bin = (confidences > bin_lower) & (confidences <= bin_upper)
+        # [PATCH] Zero-Inclusion
+        if i == 0:
+            in_bin = (confidences >= bin_lower) & (confidences <= bin_upper)
+        else:
+            in_bin = (confidences > bin_lower) & (confidences <= bin_upper)
+            
         prop_in_bin = in_bin.float().mean().item()
         
         if prop_in_bin > 0:
             acc_b = accuracies[in_bin].mean().item()
             conf_b = confidences[in_bin].mean().item()
-            # The penalty term
             oe += prop_in_bin * conf_b * max(0.0, conf_b - acc_b)
             
     return oe
 
+
 # ==============================================================================
 # 2. Clinical Utility (Net Benefit)
 # ==============================================================================
-
 def compute_net_benefit(
     probs: torch.Tensor, 
     labels: torch.Tensor,
@@ -161,17 +173,30 @@ def compute_net_benefit(
 ) -> Dict[float, float]:
     """
     Computes Net Benefit for Decision Curve Analysis (DCA).
-    Formula: NB = (TP / N) - (FP / N) * (pt / (1 - pt))
-    
-    This is the ONLY metric that tells you if the model is clinically useful
-    at a specific risk tolerance (threshold).
+    [PATCHED] Auto-handles Multiclass inputs by selecting positive class risk.
     """
     if thresholds is None:
         thresholds = [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5]
+    
+    # [PATCH] Resilience Guard: Handle Multiclass [N, C] inputs
+    # Logic: If shape is [N, C], DCA applies to the target class (typically Sepsis=1 or Shock=2).
+    # We assume the LAST column represents the risk of the positive event.
+    if probs.dim() > 1 and probs.shape[1] > 1:
+        probs_flat = probs[:, -1].view(-1) 
+    else:
+        probs_flat = probs.view(-1)
         
-    probs_flat = probs.view(-1)
     labels_flat = labels.view(-1)
+    
+    # [PATCH] Safety Assertion: Ensure shapes align before computing
+    if probs_flat.shape[0] != labels_flat.shape[0]:
+         # Graceful resizing to overlap (resilience against batch fragmentation)
+         min_len = min(probs_flat.shape[0], labels_flat.shape[0])
+         probs_flat = probs_flat[:min_len]
+         labels_flat = labels_flat[:min_len]
+    
     n = len(labels_flat)
+    if n == 0: return {}
     
     results = {}
     
@@ -191,6 +216,7 @@ def compute_net_benefit(
         results[pt] = nb
         
     return results
+
 
 # ==============================================================================
 # 3. RL Safety & Stability

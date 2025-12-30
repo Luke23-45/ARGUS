@@ -861,7 +861,8 @@ class NoiseScheduler(nn.Module):
         alpha_bar_prev = self.alphas_cumprod_prev[t][:, None, None]
         
         # 1. Predict x0
-        pred_x0 = (x_t - torch.sqrt(1 - alpha_bar_t) * pred_noise) / torch.sqrt(alpha_bar_t)
+        sqrt_alpha_t = torch.sqrt(alpha_bar_t).clamp(min=1e-3)
+        pred_x0 = (x_t - torch.sqrt(1 - alpha_bar_t) * pred_noise) / sqrt_alpha_t
         
         if use_ddim:
             # Deterministic Step (DDIM)
@@ -1073,7 +1074,13 @@ class ICUUnifiedPlanner(nn.Module):
                     )
                     # Reconstruct x0 estimate
                     alpha_bar = self.scheduler.alphas_cumprod[t][:, None, None]
-                    guess_x0 = (noisy_fut - torch.sqrt(1 - alpha_bar) * guess_eps) / torch.sqrt(alpha_bar)
+                    sqrt_alpha_clamped = torch.sqrt(alpha_bar).clamp(min=1e-3)
+
+                    # 2. Calculate
+                    guess_x0 = (noisy_fut - torch.sqrt(1 - alpha_bar) * guess_eps) / sqrt_alpha_clamped
+
+                    # 3. Manifold Constraint (Keep it within valid normalized bounds)
+                    guess_x0 = guess_x0.clamp(-3.0, 3.0)
                     self_cond_tensor = guess_x0.detach()
 
         # Pass 2: Final Denoising with Conditioning
@@ -1122,6 +1129,8 @@ class ICUUnifiedPlanner(nn.Module):
             if f_mask is None:
                 # Fallback: Inference from target zeros? No, risky. 
                 # Use src_mask if it matches length? 
+                f_mask = torch.ones_like(target_val, dtype=torch.float32)
+                
                 loss_ele = F.smooth_l1_loss(pred_val, target_val, beta=1.0, reduction='none')
                 value_loss = (loss_ele * f_mask).sum() / (f_mask.sum() + 1e-8)
             else:
@@ -1212,9 +1221,13 @@ class ICUUnifiedPlanner(nn.Module):
                     
                     # Reconstruct x0 (DDIM equation)
                     alpha_bar = self.scheduler.alphas_cumprod[t][:, None, None]
-                    x0_approx = (x_t_in - torch.sqrt(1 - alpha_bar) * out_eps) / torch.sqrt(alpha_bar)
-                    
-                    # Calculate Physiological Violation
+
+                    sqrt_alpha = torch.sqrt(alpha_bar).clamp(min=1e-3)
+                    x0_approx = (x_t_in - torch.sqrt(1 - alpha_bar) * out_eps) / sqrt_alpha
+
+                    # 2. DO NOT DENORMALIZE. 
+                    # The PhysLoss (Bounds=2.5) expects Normalized (Sigma) units.
+                    # If you feed it Clinical Units (e.g. 120), it will crush the values to 2.5.
                     loss = self.phys_loss(x0_approx)
                     
                     # Compute Gradient
@@ -1236,8 +1249,11 @@ class ICUUnifiedPlanner(nn.Module):
             # [v10.0] Update Self-Conditioning for next step
             # We need x0 estimate to condition the next step.
             alpha_bar = self.scheduler.alphas_cumprod[t][:, None, None]
-            x_self_cond = (x_t - torch.sqrt(1 - alpha_bar) * out) / torch.sqrt(alpha_bar)
-            x_self_cond = x_self_cond.detach()  # Stop gradients for next step logic
+            sqrt_alpha = torch.sqrt(alpha_bar).clamp(min=1e-3)
+            x_self_cond = (x_t - torch.sqrt(1 - alpha_bar) * out) / sqrt_alpha
+            x_self_cond = x_self_cond.clamp(-3.0, 3.0) # Manifold Constraint
+            x_self_cond = x_self_cond.detach()
+
             
             # Step (DDIM or DDPM)
             x_t = self.scheduler.step(out, t, x_t, use_ddim=self.cfg.use_ddim_sampling)

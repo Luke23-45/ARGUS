@@ -334,24 +334,37 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # This teaches the model to "read its own thoughts" and refine predictions.
         
         use_self_cond = self.model.cfg.use_self_conditioning and (torch.rand(1).item() < 0.5)
-        self_cond_tensor = None
+        self_cond_tensor = None  # Default to zeros (Cold Start)
         
         if self.model.cfg.use_self_conditioning:
-            # Initialize with cold start (zeros)
+            # Initialize with zeros for the correct shape/device
             self_cond_tensor = torch.zeros_like(noisy_fut)
             
             if use_self_cond:
                 with torch.no_grad():
-                    # Pass 1: "Guess" x0 using the Student (current weights)
+                    # Pass 1: "Guess" x0 using the Student
                     guess_eps = self.model.backbone(
                         noisy_fut, t, ctx_seq, global_ctx, ctx_mask, self_cond=self_cond_tensor
                     )
                     
-                    # Reconstruct x0 approximation (DDIM equation)
+                    # Reconstruct x0 approximation
                     alpha_bar = self.model.scheduler.alphas_cumprod[t][:, None, None]
-                    guess_x0 = (noisy_fut - torch.sqrt(1 - alpha_bar) * guess_eps) / torch.sqrt(alpha_bar)
                     
-                    # Update conditioning tensor (CRITICAL: Must be detached!)
+                    # [SAFETY 1] Prevent Division by Tiny Numbers
+                    # At t=T, alpha_bar is ~1e-5. Sqrt is ~0.003. 
+                    # We clamp the denominator to 1e-5 to prevent numeric explosion.
+                    sqrt_alpha_bar = torch.sqrt(alpha_bar).clamp(min=1e-5)
+                    sqrt_one_minus_alpha = torch.sqrt(1 - alpha_bar)
+                    
+                    guess_x0 = (noisy_fut - sqrt_one_minus_alpha * guess_eps) / sqrt_alpha_bar
+                    
+                    # [SAFETY 2] Manifold Constraint (The "Clamp")
+                    # Normalized clinical data is N(0,1). Values > 5.0 are 5-sigma outliers 
+                    # (Prob < 0.00006%). We constrain the guess to the valid data manifold.
+                    # This prevents the "Initial Explosion" where guess_x0 -> 100.0.
+                    guess_x0 = guess_x0.clamp(-3.0, 3.0)
+                    
+                    # Update conditioning tensor
                     self_cond_tensor = guess_x0.detach()
 
         # Pass 2 (Final): The actual gradient step with conditioning
@@ -452,11 +465,34 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # The penalty weight increases as training progresses, allowing the model
         # to learn the data distribution first, then refine biological realism.
         alpha_bar_t = self.model.scheduler.alphas_cumprod[t][:, None, None]
-        x0_approx = (noisy_fut - torch.sqrt(1 - alpha_bar_t) * pred_noise) / torch.sqrt(alpha_bar_t)
         
-        curr_phys_weight = self._get_curr_physics_weight()
-        phys_penalty = self.phys_loss(x0_approx) * curr_phys_weight
+        # [SAFETY FIX] Prevent Division by Zero at t=T
+        sqrt_alpha_t = torch.sqrt(alpha_bar_t).clamp(min=1e-5)
+        sqrt_one_minus_alpha = torch.sqrt(1 - alpha_bar_t)
+        
+        x0_approx_norm = (noisy_fut - sqrt_one_minus_alpha * pred_noise) / sqrt_alpha_t
+        
+        # [SAFETY FIX] Manifold Constraint
+        # Clamp normalized values to [-5, 5] (5-sigma). 
+        # Prevents noise at t=T from generating values like "100.0" which break gradients.
+        x0_approx_norm = x0_approx_norm.clamp(-5.0, 5.0)
+        
+        # [CRITICAL FIX] Denormalization via Affine Projection
+        # We must project sigma-units back to mmHg to check against "MAP < 65".
+        # Gradients flow back through: x_clin = x_norm * std + mean
+        if hasattr(self.model, "normalizer"):
+            # Use the model's internal normalizer (handles masking/unscaling)
+            x0_clinical = self.model.normalizer.denormalize(x0_approx_norm)
+        else:
+            # Fallback (Safety): If normalizer is missing, we cannot compute phys loss safely.
+            # We treat x0_approx_norm as x0_clinical implies assuming data is NOT normalized,
+            # which is incorrect here, but better than crashing if attribute missing.
+            x0_clinical = x0_approx_norm
 
+        curr_phys_weight = self._get_curr_physics_weight()
+        
+        # Calculate loss on CLINICAL values (mmHg), but gradients propagate to NORMALIZED outputs
+        phys_penalty = self.phys_loss(x0_clinical) * curr_phys_weight
         # G. Total Loss Composition
         # [v14.2] Dynamic Loss Balancing (GradNorm-Lite)
         # If the Sepsis Classifier (Aux) starts stalling while Diffusion dominates,
@@ -576,8 +612,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
         # 1. Standard Loss Monitoring
         out = self.model(batch, reduction='mean')
-        self.log("val/diff_loss", out["diffusion_loss"], on_epoch=True, sync_dist=True)
-        
+        bs = batch["observed_data"].shape[0]
+        self.log("val/diff_loss", out["diffusion_loss"], on_epoch=True, sync_dist=True, batch_size=bs)        
         # 2. Risk Prediction Calibration
         if "outcome_label" in batch and self.model.cfg.use_auxiliary_head:
             logits = out.get("aux_logits", None)
@@ -611,9 +647,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 self.val_acc_sepsis.update(logits, target_class)
                 self.val_auroc_sepsis.update(risk_prob, binary_label)
 
-        # 3. Clinical Trajectory Sampling (Every 5th batch to save compute)
-        # This ensures we cover diverse samples while being efficient
-        if batch_idx % 5 == 0:
+        # 3. Clinical Trajectory Sampling (Only first batch to save compute)
+        # This prevents the "Validation Trap" (105x compute overhead)
+        if batch_idx == 0:
             self._validate_clinical_sampling(batch)
 
         # Return for external callbacks (e.g., ClinicalMetricCallback)

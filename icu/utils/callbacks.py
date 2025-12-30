@@ -354,15 +354,17 @@ class ClinicalMetricCallback(Callback):
             clean_target = (clean_target > 0).long()
             
             if clean_target.numel() > 0:
-                # [FIX] Guard against batches with no positive samples
-                # TorchMetrics warns "No positive samples in targets" when update() receives
-                # a batch with all zeros. With 3.1% sepsis prevalence and batch_size=64,
-                # ~12% of batches have no positives by chance. Skip these to avoid warning spam.
-                # Epoch-level aggregation is still valid since we aggregate across many batches.
-                if clean_target.sum() > 0:
-                    self.val_auroc.update(clean_preds, clean_target)
-                    self.val_auprc.update(clean_preds, clean_target)
-                    self.val_ece.update(clean_preds, clean_target)
+                # [PATCH] CRITICAL: Do NOT check "clean_target.sum() > 0".
+                # Updates must occur even for all-negative batches to correctly 
+                # accumulate True Negatives and False Positives for global AUROC.
+                
+                # Ensure targets are binary integers for AUROC
+                clean_target = clean_target.long() 
+                
+                # Update metrics globally
+                self.val_auroc.update(clean_preds, clean_target)
+                self.val_auprc.update(clean_preds, clean_target)
+                self.val_ece.update(clean_preds, clean_target)
 
     def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         if self.val_auroc is None: return 

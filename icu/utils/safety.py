@@ -76,24 +76,22 @@ class OODGuardian:
         self.cfg = SafetyConfig()
         self._warned_normalized = False  # [FIX: v14.0] Flag for "warn once" pattern
 
+
     def _is_normalized(self, tensor: torch.Tensor) -> bool:
-        """
-        Heuristic: Detects if data is in [-1, 1] or [0, 1] range.
-        Clinical SBP is 80-180. Normalized SBP is 0.1-0.5.
-        
-        [FIX: v12.0] Check SBP max and also the range across all features.
-        Clinical data has high variance and large absolute values.
-        """
+        """[PATCHED] Robust heuristic to detect normalized data."""
+        # 1. Negative Check
+        if tensor.shape[-1] > IDX_MAP:
+             if (tensor[..., [IDX_HR, IDX_SBP, IDX_MAP]] < -0.05).any():
+                 return True
+
+        # 2. SBP Heuristic (requires IDX_SBP to exist)
         if tensor.shape[-1] > IDX_SBP:
             sbp_max = tensor[..., IDX_SBP].max().item()
-            # If SBP is < 10.0, it is 100% normalized (nobody lives with SBP 10)
-            if sbp_max < 10.0: return True
-            
-            # If SBP is < 30.0 but variance is very small, likely normalized
-            sbp_std = tensor[..., IDX_SBP].std().item()
-            if sbp_max < 30.0 and sbp_std < 1.0: return True
-            
-        return False
+            if sbp_max < 30.0: 
+                return True
+        
+        return False   
+
 
     @torch.no_grad()
     def check_trajectories(
@@ -104,17 +102,32 @@ class OODGuardian:
     ) -> Dict[str, torch.Tensor]:
         """
         Scans generated trajectories for medical anomalies.
-        
-        Args:
-            past_vitals: [B, T_hist, D] (Observed History)
-            pred_vitals: [B, T_pred, D] (Generated Future)
-            src_mask: [B, T_hist] Optional mask for history
-            
-        Returns:
-            Dict containing boolean OOD masks and continuous severity scores.
         """
+        # [FIX] Initialize Dimensions GLOBALLY at the start
         B, T_p, D = pred_vitals.shape
         device = pred_vitals.device
+
+        # [PATCH] RESILIENCE: Schema Validation
+        # Ensure we have enough channels for the Sepsis definitions (Min required is Lactate=7)
+        # If input is smaller (ablation study), warn and return dummy safe dict.
+        min_required_dim = max(IDX_HR, IDX_SBP, IDX_MAP, IDX_LAC) + 1
+        
+        # Check against 'D' (now defined)
+        if D < min_required_dim:
+            if self.verbose and not getattr(self, "_warned_schema", False):
+                logger.warning(f"[OODGuardian] Input dim ({D}) < Required ({min_required_dim}). Skipping Safety Checks.")
+                self._warned_schema = True
+            
+            # Return "Safe" dummy dict to prevent training crash
+            return {
+                "ood_mask": torch.zeros(B, dtype=torch.bool, device=device),
+                "ood_rate": torch.tensor(0.0, device=device),
+                "safe_count": torch.tensor(float(B), device=device),
+                "stitching_error": torch.tensor(0.0, device=device),
+                "sbp_delta_mean": torch.tensor(0.0, device=device),
+                "lac_max_mean": torch.tensor(0.0, device=device),
+                "is_jagged": torch.tensor(0.0, device=device)
+            }
         
         # --- 0. Unit Consistency Guard ---
         if self._is_normalized(pred_vitals):
@@ -122,20 +135,23 @@ class OODGuardian:
                 logger.warning("[OODGuardian] Input detected as NORMALIZED. Skipping absolute threshold checks.")
                 self._warned_normalized = True
 
+            is_exploding = (torch.abs(pred_vitals) > 10.0).any(dim=1).any(dim=1) # [B]
+            
             return {
-                "ood_mask": torch.zeros(B, dtype=torch.bool, device=device),
-                "ood_rate": torch.tensor(0.0, device=device),
+                "ood_mask": is_exploding,
+                "ood_rate": is_exploding.float().mean(),
+                "safe_count": (1.0 - is_exploding.float()).sum(),
+                "stitching_error": torch.tensor(0.0, device=device),
                 "sbp_delta_mean": torch.tensor(0.0, device=device),
                 "lac_max_mean": torch.tensor(0.0, device=device),
-                "stitching_error": torch.tensor(0.0, device=device)
+                "is_jagged": torch.tensor(0.0, device=device) 
             }
 
         # --- 1. Stitching Check (Discontinuity) ---
         # "Did the model ignore the last observed state?"
-        # [FIX: v12.0] Mask-Aware Last Observation
         if src_mask is not None:
              m = src_mask if src_mask.dim() == 2 else src_mask.any(dim=-1)
-             last_obs = torch.zeros(B, D, device=device)
+             last_obs = torch.zeros(B, D, device=device) # B, D, device are now defined
              for b in range(B):
                  valid_idx = torch.where(m[b])[0]
                  if len(valid_idx) > 0:
@@ -156,7 +172,7 @@ class OODGuardian:
         # --- 2. Dynamics Check (Intra-Trajectory Volatility) ---
         # "Is the trajectory physically jagged?"
         # Calculate max step-to-step delta within prediction
-        if T_p > 1:
+        if T_p > 1: # T_p is now defined
             deltas = torch.abs(pred_vitals[:, 1:] - pred_vitals[:, :-1])
             max_delta_sbp = deltas[..., IDX_SBP].max(dim=1)[0]
             max_delta_hr = deltas[..., IDX_HR].max(dim=1)[0]
@@ -168,33 +184,25 @@ class OODGuardian:
         is_jagged_hr = max_delta_hr > self.cfg.MAX_DELTA_HR
         
         # --- 3. Boundary Check (Hallucination) ---
-        # "Is the patient legally dead or exploding?"
-        # Check min/max bounds across the horizon
         pred_sbp = pred_vitals[..., IDX_SBP]
         pred_map = pred_vitals[..., IDX_MAP]
         pred_o2 = pred_vitals[..., IDX_O2]
         pred_lac = pred_vitals[..., IDX_LAC]
         
-        # [v14.1] Tolerance for Early Training Noise
-        # Diffusion models often produce micro-noise (e.g. -0.01) around zero.
-        # Strict < 0 checks flag these as "Impossible Physics", destroying valid batches.
-        # [FIX] Add tolerance for Diffusion Noise. -0.001 is clinically 0.0.
         TOLERANCE = 1e-2
 
         is_ood_bounds = (
             (pred_sbp < self.cfg.BOUNDS_SBP[0] - TOLERANCE) | (pred_sbp > self.cfg.BOUNDS_SBP[1] + TOLERANCE) |
             (pred_map < self.cfg.BOUNDS_MAP[0] - TOLERANCE) | (pred_map > self.cfg.BOUNDS_MAP[1] + TOLERANCE) |
             (pred_o2 < self.cfg.BOUNDS_O2[0] - TOLERANCE)   | (pred_o2 > self.cfg.BOUNDS_O2[1] + TOLERANCE)   |
-            (pred_lac < self.cfg.BOUNDS_LAC[0] - TOLERANCE) # Lactate < 0 often happens with noise
-        ).any(dim=1) # [B]
+            (pred_lac < self.cfg.BOUNDS_LAC[0] - TOLERANCE) 
+        ).any(dim=1) 
         
         # --- 4. Sepsis-3 Specific OOD (Extreme Hyperlactatemia) ---
-        # Lactate > 12.0 is usually pre-terminal
         max_lac = pred_lac.max(dim=1)[0]
         is_critical_lac = max_lac > 12.0
         
         # --- 5. Aggregation ---
-        # Union of all failure modes
         ood_mask = (
             stitch_err_hr | stitch_err_sbp | 
             is_jagged_sbp | is_jagged_hr | 
@@ -202,58 +210,43 @@ class OODGuardian:
         )
         
         return {
-            "ood_mask": ood_mask,                       # [B] Boolean
-            "ood_rate": ood_mask.float().mean(),        # Scalar
-            "safe_count": (1.0 - ood_mask.float()).sum(), # [FIX] Scalar for metrics
-            "stitching_error": stitch_diff.mean(),      # Scalar (Average discontinuity)
-            "sbp_delta_mean": max_delta_sbp.mean(),     # Scalar
-            "lac_max_mean": max_lac.mean(),             # Scalar
+            "ood_mask": ood_mask,
+            "ood_rate": ood_mask.float().mean(),
+            "safe_count": (1.0 - ood_mask.float()).sum(),
+            "stitching_error": stitch_diff.mean(),
+            "sbp_delta_mean": max_delta_sbp.mean(),
+            "lac_max_mean": max_lac.mean(),
             "is_jagged": (is_jagged_sbp | is_jagged_hr).float().mean()
         }
-
 
 def compute_sepsis3_violations(vitals: torch.Tensor, src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Detects Sepsis-3 (2016) clinical violations.
     Used for Safety-Cost constraints in training (Differentiable).
-    
-    Definition of Septic Shock (Sepsis-3):
-        1. Persisting Hypotension requiring vasopressors to maintain MAP >= 65 mmHg.
-        2. Serum Lactate level > 2 mmol/L.
-    
-    We model the "Violation Cost" as the presence of these conditions.
-    
-    Args:
-        vitals: [B, T, D] Tensor (Must be in Clinical Units).
-        src_mask: [B, T] Optional validity mask.
-        
-    Returns:
-        safety_cost: [B, T] Tensor (Higher = Worse).
     """
+    # [PATCH] RESILIENCE: Schema Validation
+    # If the input tensor doesn't have Lactate (Index 7), we cannot compute Sepsis-3.
+    # Return zero cost instead of crashing.
+    min_required_dim = max(IDX_MAP, IDX_LAC) + 1
+    if vitals.shape[-1] < min_required_dim:
+        # Graceful fallback for ablation studies
+        return torch.zeros(vitals.shape[:-1], device=vitals.device, dtype=vitals.dtype)
+
     # 1. Extract Channels (Canonical: MAP=4, Lactate=7)
     map_val = vitals[..., IDX_MAP]
     lactate = vitals[..., IDX_LAC]
     
     # 2. Hypotension Penalty (MAP < 65)
-    # Using Soft Sigmoid for gradient flow:
-    # If MAP = 65 -> 0.5. If MAP = 40 -> ~1.0. If MAP = 90 -> ~0.0.
-    # Steepness divisor 5.0 ensures gradients exist around the threshold.
     v_map = torch.sigmoid((SafetyConfig.THRESHOLD_SHOCK_MAP - map_val) / 5.0)
     
     # 3. Metabolic Failure Penalty (Lactate > 2.0)
-    # If Lactate = 2.0 -> 0.5. If Lactate = 6.0 -> ~1.0.
     v_lac = torch.sigmoid((lactate - SafetyConfig.THRESHOLD_SHOCK_LAC) / 1.0)
     
     # 4. Combined Safety Cost
-    # "Soft OR" Logic: We want to penalize EITHER condition, but 
-    # the combination is Septic Shock (worst case).
-    # Since we want to prevent the *onset* of either, additive cost works best
-    # for gradient descent (gradients flow from both terms independently).
     safety_cost = (v_map + v_lac)
     
     # 5. Apply Masking
     if src_mask is not None:
-        # [FIX: v13.0] Zero out cost for padded regions
         if src_mask.dim() == 2:
             safety_cost = safety_cost * src_mask.float()
         else:

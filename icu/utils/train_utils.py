@@ -867,7 +867,7 @@ class TieredEMA:
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
                 # Async transfer GPU -> CPU
-                model_val = param.data.detach().to(device="cpu", non_blocking=True).float()
+                model_val = param.data.detach().to(device="cpu", non_blocking=False).float()
                 model_params.append(model_val)
                 shadow_params.append(self.shadow[name])
 
@@ -877,9 +877,9 @@ class TieredEMA:
                 target_dtype = self.shadow[name].dtype
                 
                 if torch.is_floating_point(buffer):
-                    new_data = buffer.data.detach().to(device="cpu", non_blocking=True).float()
+                    new_data = buffer.data.detach().to(device="cpu", non_blocking=False).float()
                 else:
-                    new_data = buffer.data.detach().to(device="cpu", non_blocking=True)
+                    new_data = buffer.data.detach().to(device="cpu", non_blocking=False)
                 
                 # Integer buffers (steps) copy directly
                 if target_dtype in (torch.int64, torch.int32, torch.bool):
@@ -911,7 +911,10 @@ class TieredEMA:
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
                 self.backup[name] = param.data.detach().cpu().clone()
-                param.data.copy_(self.shadow[name].to(param.device, non_blocking=True))
+                # param.data.copy_(self.shadow[name].to(param.device, non_blocking=True))
+                param.data.copy_(self.shadow[name].to(param.device, non_blocking=False))
+
+                
         
         # Buffers
         for name, buffer in model.named_buffers():
