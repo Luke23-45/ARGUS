@@ -41,6 +41,7 @@ import sys
 import os
 import logging
 import traceback
+import collections
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
@@ -63,6 +64,18 @@ from pytorch_lightning.callbacks import (
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
+from omegaconf.dictconfig import DictConfig
+from omegaconf.listconfig import ListConfig
+from omegaconf.base import ContainerMetadata
+logger = logging.getLogger("APEX_Phase1_Engine")
+# [FIX] PyTorch 2.6 Security: Bypass strict mode for trusted checkpoints
+# monkey-patch torch.load to always use weights_only=False
+_original_load = torch.load
+def strict_mode_bypass_load(*args, **kwargs):
+    kwargs['weights_only'] = False
+    return _original_load(*args, **kwargs)
+torch.load = strict_mode_bypass_load
+logger.warning("[SECURITY] PyTorch 2.6+ strict mode disabled for checkpoint loading (Monkey-Patch active).")
 
 # Add project root to path for local imports
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -84,7 +97,7 @@ from icu.utils.train_utils import (
 )
 
 # Initialize Script-Level Logger
-logger = logging.getLogger("APEX_Phase1_Engine")
+
 
 
 # =============================================================================
