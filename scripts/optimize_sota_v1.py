@@ -52,6 +52,8 @@ from typing import Dict, Any, Optional, Union, List, Tuple
 import torch
 import hydra
 import optuna
+from optuna.pruners import HyperbandPruner, SuccessiveHalvingPruner
+from optuna.exceptions import TrialPruned
 import numpy as np
 import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
@@ -178,8 +180,39 @@ class ClinicalMetricInjector(pl.Callback):
             pl_module.log("val/sepsis_auprc", 0.0, prog_bar=True)
 
 # ==============================================================================
-# 2. MOAR OPTIMIZER ENGINE (The Core)
+# 1.1 SOTA PRUNING CALLBACK (ASHA Integration)
 # ==============================================================================
+class OptunaPruningCallback(pl.Callback):
+    """
+    Reports intermediate metrics to Optuna for ASHA/Hyperband pruning.
+    Monitors 'val/utility_proxy' (calculated from Validation metrics).
+    """
+    def __init__(self, trial: optuna.trial.Trial, monitor: str = "val/utility_proxy"):
+        super().__init__()
+        self.trial = trial
+        self.monitor = monitor
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        # 1. Calculate Proxy Utility
+        metrics = trainer.callback_metrics
+        auprc = metrics.get("val/sepsis_auprc", 0.0).item()
+        auroc = metrics.get("val/sepsis_auroc", 0.5).item()
+        
+        # Simple Utility Proxy for Pruning (matches final calculation)
+        utility = (0.6 * auprc) + (0.3 * auroc)
+        
+        # 2. Report to Optuna
+        # Use simple Step count (global_step)
+        step = trainer.global_step
+        self.trial.report(utility, step=step)
+        
+        # 3. Prune if necessary
+        if self.trial.should_prune():
+            # [JOURNAL] Log the prune event before dying
+            message = f"Trial {self.trial.number} pruned at step {step} with Utility={utility:.4f}"
+            print(f" {message}")
+            raise TrialPruned(message)
+
 class MOAROptimizer:
     def __init__(self, base_cfg: DictConfig):
         self.base_cfg = base_cfg
@@ -203,7 +236,7 @@ class MOAROptimizer:
             with open(self.cache_path, "r") as f:
                 return json.load(f)
 
-        logger.info("🔭 STARTING DEEP PHYSICS AUDIT (Scanning 50k Samples)...")
+        logger.info("[AUDIT] STARTING DEEP PHYSICS AUDIT (Scanning 50k Samples)...")
         datamodule.setup("fit")
         loader = DataLoader(
             datamodule.train_ds, 
@@ -305,12 +338,18 @@ class MOAROptimizer:
             accelerator=self.hw_ctx["accelerator"],
             devices=1,
             precision=self.hw_ctx["precision"],
-            callbacks=[ClinicalMetricInjector(), PreciseTQDMProgressBar(refresh_rate=cfg.train.get("log_every_n_steps", 10))],
+            callbacks=[
+                ClinicalMetricInjector(), 
+                PreciseTQDMProgressBar(refresh_rate=cfg.train.get("log_every_n_steps", 10)),
+                OptunaPruningCallback(trial) # [ASHA] enable step-wise pruning
+            ],
             enable_checkpointing=False,
             logger=False,
             num_sanity_val_steps=0,
-            limit_train_batches=40, # [EXTREME PROXY] 40 Steps is enough for a signal
-            limit_val_batches=10,  # [EXTREME PROXY] Speed up validation
+
+            limit_train_batches=100, # [EXTENDED PROXY] 100 Steps for steady-state signal
+            limit_val_batches=20,  # [EXTENDED PROXY] Better validation signal
+            val_check_interval=20, # [ASHA] Validate 5 times per "epoch"
             enable_model_summary=False
         )
         
@@ -320,6 +359,10 @@ class MOAROptimizer:
             # [FIX] Capture metrics while trainer is still in scope
             metrics_raw = {k: v.cpu().item() if torch.is_tensor(v) else v 
                            for k, v in trainer.callback_metrics.items()}
+        except TrialPruned as e:
+            # [ASHA] Handle pruning gracefully
+            journal.log(trial.number, "PRUNED", {"seed": seed, "step": trainer.global_step})
+            raise e # Propagate to Objective
         except Exception as e:
             journal.log(trial.number, "SEED_CRASH", {"seed": seed, "error": str(e)})
             return {"utility": -1.0, "safety": -1.0} # Panic code
@@ -363,25 +406,23 @@ class MOAROptimizer:
         # 1. Physics-Anchored Prior Sampling
         audit = self.perform_deep_audit(ICUGeneralistDataModule(self.base_cfg, pin_memory=False))
         
-        # [NERYVA-ALPHA LOCK] Freezing discovery zone to certified champion values
-        pos_weight = 34.85
-        awr_beta   = 0.380
-        aux_scale  = 0.335
+        # [SOTA TUNABLES] Re-enabled Search Space
+        pos_weight = trial.suggest_float("pos_weight", 5.0, 60.0)
+        awr_beta   = trial.suggest_float("awr_beta", 0.1, 1.0)
+        aux_scale  = trial.suggest_float("aux_loss_scale", 0.1, 1.0)
+        dropout    = trial.suggest_float("dropout", 0.1, 0.6)
         
-        # [STRESS TEST] Only optimizing AWR Max Weight
+        # [STRESS TEST] Optimized Search Space (SOTA Tunables)
         awr_max_weight = trial.suggest_float("awr_max_weight", 5.0, 100.0)
+        cagrad_c = trial.suggest_float("cagrad_c", 0.1, 0.9) # [SOTA] Conflict Aversion
+        gradnorm_alpha = trial.suggest_float("gradnorm_alpha", 0.5, 3.0) # [SOTA] Loss Balancing
         
-        # [HARD-LOCK] Noise Parameters frozen to Trial 20 Champion values
-        dropout    = 0.25
-        lr         = 1.5e-4
-        batch_size = 2048
-        accum      = 4
+        # [HARD-LOCK] Foundation Parameters
+        lr         = 1.5e-4 # Base LR (Scaled dynamically below)
+        batch_size = 256    # [USER REQUEST] Reduced from 2048 for granular updates
+        accum      = 1      
         
-        # Log active search parameters
-        trial.set_user_attr("locked_pos_weight", pos_weight)
-        trial.set_user_attr("locked_awr_beta", awr_beta)
-        trial.set_user_attr("locked_aux_scale", aux_scale)
-        trial.set_user_attr("locked_dropout", dropout)
+        # Log Locked parameters
         trial.set_user_attr("locked_lr", lr)
         trial.set_user_attr("locked_batch_size", batch_size)
         trial.set_user_attr("locked_accum", accum)
@@ -397,7 +438,8 @@ class MOAROptimizer:
         cfg.train.accumulate_grad_batches = accum
         cfg.train.lr = lr * (batch_size * accum / 1024.0) # Linear Scaling Rule
         cfg.train.lr = lr * (batch_size * accum / 1024.0) # Linear Scaling Rule
-        cfg.train.warmup_steps = 40
+        cfg.train.warmup_steps = 10 # [FIX] Fast Warmup to reach steady-state early
+
         
         # [v20.1] PERFORMANCE PATCH: Inject AWR Params
         # This triggers the Fast-Path in wrapper_generalist.py
@@ -411,6 +453,8 @@ class MOAROptimizer:
         cfg.train.num_workers = 0 
         
         cfg.train.awr_max_weight = awr_max_weight
+        cfg.train.cagrad_c = cagrad_c
+        cfg.train.gradnorm_alpha = gradnorm_alpha
         
         # [SPEED] Reduce AWR calibration overhead for HPO proxy
         cfg.train.awr_max_samples = 1500
@@ -511,7 +555,9 @@ def main(cfg: DictConfig):
         ))
     
     # 1. Robust Storage (SQLite with Wal Mode implicit)
-    storage_url = "sqlite:///apex_moar_v20.db"
+    # [FIX] Use absolute path to ensure resume works despite Hydra changing CWD
+    db_path = os.path.join(hydra.utils.get_original_cwd(), "apex_moar_v20.db")
+    storage_url = f"sqlite:///{db_path}"
     
     # 2. Multi-Objective Sampler (MOTPE)
     # Optimizes the Pareto Frontier of (Utility, Safety)
@@ -522,11 +568,21 @@ def main(cfg: DictConfig):
         warn_independent_sampling=False
     )
     
+    # 2.2 SOTA Pruner (ASHA / Hyperband)
+    # Promotes partial training efficiency.
+    # min_resource=10 steps, reduction_factor=3
+    pruner = HyperbandPruner(
+        min_resource=10, 
+        max_resource=100,
+        reduction_factor=3
+    )
+
     study = optuna.create_study(
         directions=["maximize", "maximize"], # Obj1: Utility, Obj2: Safety
         storage=storage_url,
         study_name="apex_moar_v20",
         sampler=sampler,
+        pruner=pruner, # [ASHA] Activate Pruner
         load_if_exists=True
     )
     

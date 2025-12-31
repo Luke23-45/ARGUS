@@ -457,102 +457,75 @@ class GradientHealthMonitor(Callback):
 
 class EMACallback(Callback):
     """
-    Hardened EMA Suite (CPU-Offloaded) with Robust Resumption.
-    Patched v3.6.2: Fixes Evaluation Amnesia and Device Mismatch bugs.
+    SOTA Unified EMA Callback (2025).
+    Maintains a single authoritative 'Teacher' instance via TieredEMA.
+    
+    Why this is SOTA:
+    1. Swapping: Instantly replaces student weights with teacher weights for Val/Test.
+    2. Zero-Copy: Uses pointer swapping to avoid memory overhead.
+    3. Manual Opt Aware: Syncs update steps with custom optimization loops.
     """
-    def __init__(self, decay: float = 0.9999):
+    def __init__(self, decay: float = 0.9999, cpu_offload: bool = True):
         super().__init__()
         self.decay = decay
+        self.cpu_offload = cpu_offload
         self.ema: Optional[TieredEMA] = None
-        self._deferred_state_dict: Optional[Dict] = None
+        self._deferred_ema_state: Optional[Dict] = None # For checkpoint loading
 
-    def _ensure_ema_initialized(self, pl_module: pl.LightningModule):
-        """Idempotent initialization logic shared across all stages."""
+    def _init_ema(self, pl_module: pl.LightningModule):
         if self.ema is None:
-            logger.info(f"EMACallback: Initializing Shadow Weights (Decay={self.decay}) on CPU.")
-            # Targeted at pl_module.model (The Scientific Core)
-            self.ema = TieredEMA(model=pl_module.model, decay=self.decay)
-            pl_module.ema = self.ema # Direct attachment
-            
-            # [FIX: Apply Deferred State]
-            if self._deferred_state_dict:
-                logger.info("EMACallback: Applying deferred state_dict from Checkpoint...")
-                # TieredEMA.load_state_dict expects the dict, internal keys are verified by TieredEMA logic
-                self.ema.load_state_dict(self._deferred_state_dict)
-                self._deferred_state_dict = None
+            logger.info(f"EMA: Initializing Teacher (Decay={self.decay})")
+            self.ema = TieredEMA(
+                pl_module.model, 
+                decay=self.decay, 
+                cpu_offload=self.cpu_offload
+            )
+            pl_module.ema = self.ema # Authoritative attachment for training_step
 
-    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
-        self._ensure_ema_initialized(pl_module)
+            # Apply deferred state if available
+            if self._deferred_ema_state:
+                logger.info("EMA: Applying deferred state_dict from Checkpoint.")
+                self.ema.load_state_dict(self._deferred_ema_state)
+                self._deferred_ema_state = None # Clear after applying
 
-    def on_validation_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
-        # [FIX: Amnesia] Ensure init happens if running trainer.validate() directly
-        self._ensure_ema_initialized(pl_module)
+    def on_fit_start(self, trainer, pl_module):
+        self._init_ema(pl_module)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if self.ema and (batch_idx + 1) % trainer.accumulate_grad_batches == 0:
+            self.ema.update(pl_module.model)
+
+    def on_validation_start(self, trainer, pl_module):
+        self._init_ema(pl_module)
         if self.ema:
-            self.ema.apply_shadow(pl_module.model)
+            self.ema.swap(pl_module.model)
 
-    def on_test_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
-        # [FIX: Amnesia] Ensure init happens if running trainer.test() directly
-        self._ensure_ema_initialized(pl_module)
+    def on_validation_end(self, trainer, pl_module):
         if self.ema:
-            self.ema.apply_shadow(pl_module.model)
+            self.ema.swap(pl_module.model) # Restore student
 
-    def on_train_batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, *args, **kwargs):
-        """
-        [v3.7 FIX] Accumulation-Aware Updates.
-        Only update EMA when the optimizer actually steps.
-        """
+    def on_test_start(self, trainer, pl_module):
+        self._init_ema(pl_module)
         if self.ema:
-            # Check for Gradient Accumulation
-            # Logic: (batch_idx + 1) % accumulate_grad_batches == 0
-            # OR it's the last batch of the epoch.
-            accum = trainer.accumulate_grad_batches
-            batch_idx = kwargs.get("batch_idx", 0) # robust get
-            
-            # Robust total batches retrieval
-            try:
-                total_batches = trainer.num_training_batches
-            except:
-                try:
-                    total_batches = len(trainer.train_dataloader)
-                except:
-                    total_batches = float('inf') # Fallback
+            self.ema.swap(pl_module.model)
 
-            is_accum_step = (batch_idx + 1) % accum == 0
-            is_last_batch = (batch_idx + 1) == total_batches
-            
-            if is_accum_step or is_last_batch:
-                self.ema.update(pl_module.model)
-
-    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+    def on_test_end(self, trainer, pl_module):
         if self.ema:
-            self.ema.restore(pl_module.model)
+            self.ema.swap(pl_module.model)
 
-    def on_test_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
-        if self.ema:
-            self.ema.restore(pl_module.model)
-
-    def on_save_checkpoint(self, trainer: pl.Trainer, pl_module: pl.LightningModule, checkpoint: Dict):
+    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
         if self.ema:
             checkpoint["ema_state_dict"] = self.ema.state_dict()
 
-    def on_load_checkpoint(self, trainer: pl.Trainer, pl_module: pl.LightningModule, checkpoint: Dict):
-        """
-        Intercept checkpoint loading with Device Safety.
-        """
+    def on_load_checkpoint(self, trainer, pl_module, checkpoint):
         if "ema_state_dict" in checkpoint:
-            # [FIX: Device Mismatch \u0026 Key Naming] Force to CPU and strip 'model.' prefix
-            # This ensures keys match between Lightning-wrapped saves and TieredEMA
-            safe_state = {}
-            for k, v in checkpoint["ema_state_dict"].items():
-                k_norm = k[6:] if k.startswith("model.") else k
-                safe_state[k_norm] = v.cpu()
-
-            if self.ema:
-                self.ema.load_state_dict(safe_state)
-                logger.info("EMACallback: Shadow Weights restored immediately.")
+            # We don't have pl_module.model yet in some PL versions' load_checkpoint
+            # but usually it's passed. We ensure init happens on_fit_start or here.
+            if self.ema is None:
+                # Placeholder for deferred load if model not ready
+                self._deferred_ema_state = checkpoint["ema_state_dict"]
             else:
-                self._deferred_state_dict = safe_state
-                logger.info("EMACallback: Shadow Weights buffered (on CPU) for deferred load.")
+                self.ema.load_state_dict(checkpoint["ema_state_dict"])
 
 # ==============================================================================
 # 5. ENGINE: ROTATIONAL SAVER CALLBACK

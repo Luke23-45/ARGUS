@@ -15,8 +15,8 @@ output_dir: "outputs/phase1"           # Main output directory
 checkpoint_dir: "/content/drive/MyDrive/icu/checkpoints"  # Where checkpoints are saved
 log_dir: "/content/drive/MyDrive/icu/logs/icu"         # Training logs directory
 backup_dir: null                        # Remote/backup directory
-resume_from: "/content/drive/MyDrive/pda/models/clinical_auroc=0.753.ckpt"                       # Explicit checkpoint to resume from (optional)
-
+resume_from: null             # Explicit checkpoint to resume from (optional)
+# "/content/drive/MyDrive/pda/models/checkpoints/icu_model-epoch=05-val/clinical_auroc=0.747.ckpt"          
 # --- Model Architecture (ICUUnifiedPlanner) ---
 model:
   input_dim: 28
