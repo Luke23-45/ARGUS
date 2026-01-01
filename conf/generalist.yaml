@@ -8,7 +8,7 @@ defaults:
 # --- Experiment Metadata ---
 run_name: "gen_v1_${now:%Y-%m-%d_%H-%M-%S}"
 seed: 42
-compile_model: false
+compile_model: true
 
 # --- Directory Paths ---
 output_dir: "outputs/phase1"           # Main output directory
@@ -32,7 +32,7 @@ model:
   use_rope: true
   use_swiglu: true
   use_flash_attn: true
-  gradient_checkpointing: true
+  gradient_checkpointing: false # [FIX] Conflict with torch.compile on T4/old drivers
   timesteps: 100
   beta_schedule: "cosine"
   prediction_type: "epsilon"
@@ -44,7 +44,7 @@ model:
 train:
   phase: "phase1"
   epochs: 100
-  batch_size: 256            # [NERYVA-ALPHA] High-throughput trajectory processing
+  batch_size: 128           # [v20.6] Increased update frequency for classification signal
   num_workers: 2
   lr: 1.5e-4                  # [NERYVA-ALPHA] Optimal tempo for sepsis innovation
   min_lr: 1e-6
@@ -57,6 +57,10 @@ train:
   precision: "16-mixed"
   accumulate_grad_batches: 1  # [AUTO] Maintain effective batch size of 1024 (512 * 2)
   log_every_n_steps: 10
+  
+  # SOTA 2025 Balancing ("legacy_surgical" or "sota_2025")
+  balancing_mode: "sota_2025" 
+  uw_lr: 0.025                # Learning rate for uncertainty weights
 
   
   # AWR (Advantage Weighted Regression) v2.0 (Globally Optimal via Exhaustive Audit)
@@ -67,7 +71,7 @@ train:
   # - "full": Scans all trajectories (~5-10 min, best for final training)
   # - "sample": Random subset (~10-30 sec, best for testing)
   awr_calibration_mode: "sample" # full for whole population scan
-  awr_max_samples: 5000       # Only used if mode="sample" it will be ignored if awr_calibration_mode="full"
+  awr_max_samples: 20000      # [STABILITY] Increased for Batch 2048
   
   # EMA (Exponential Moving Average)
   ema_decay: 0.999

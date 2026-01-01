@@ -98,7 +98,8 @@ class OODGuardian:
         self, 
         past_vitals: torch.Tensor, 
         pred_vitals: torch.Tensor,
-        src_mask: Optional[torch.Tensor] = None
+        src_mask: Optional[torch.Tensor] = None,
+        force_clinical: bool = False
     ) -> Dict[str, torch.Tensor]:
         """
         Scans generated trajectories for medical anomalies.
@@ -130,7 +131,10 @@ class OODGuardian:
             }
         
         # --- 0. Unit Consistency Guard ---
-        if self._is_normalized(pred_vitals):
+        # [v5.3.6 FIX] Explicitly trust the caller if force_clinical is set
+        is_actually_normalized = self._is_normalized(pred_vitals) if not force_clinical else False
+        
+        if is_actually_normalized:
             if self.verbose and not self._warned_normalized:
                 logger.warning("[OODGuardian] Input detected as NORMALIZED. Skipping absolute threshold checks.")
                 self._warned_normalized = True

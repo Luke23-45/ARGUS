@@ -8,7 +8,7 @@ defaults:
 # --- Experiment Metadata ---
 run_name: "apex_v1_${now:%Y-%m-%d_%H-%M-%S}"
 seed: 42
-compile_model: false
+compile_model: true
 
 # --- Directory Paths ---
 output_dir: "outputs/phase2"
@@ -49,7 +49,7 @@ train:
   
   epochs: 50
   batch_size: 128
-  num_workers: 4
+  num_workers: 16
   lr: 2.0e-4
   min_lr: 1e-6
   warmup_steps: 500
@@ -59,7 +59,11 @@ train:
   accumulate_grad_batches: 1
   log_every_n_steps: 10
   
-  # APEX-MoE Specifics
+  log_every_n_steps: 10
+  
+  # SOTA 2025 Balancing ("legacy_surgical" or "sota_2025")
+  balancing_mode: "sota_2025" 
+  uw_lr: 0.025                # Learning rate for uncertainty weights
   crash_weight: 5.0   # Up-weight Sepsis gradients
   lambda_reg: 0.05    # Cross-expert tether (prevents mode drift)
   

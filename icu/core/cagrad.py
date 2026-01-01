@@ -31,7 +31,7 @@ class CAGrad(torch.optim.Optimizer):
     def zero_grad(self):
         self.optimizer.zero_grad()
 
-    def step(self):
+    def step(self, closure=None):
         self.optimizer.step()
 
     def state_dict(self):

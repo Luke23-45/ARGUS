@@ -125,16 +125,18 @@ class StudyJournal:
 
     def log(self, trial_id: int, event_type: str, data: Dict[str, Any]):
         entry = {
-            "trial_id": trial_id,
+            "trial_id": int(trial_id),
             "timestamp": time.time(),
             "event": event_type,
             "data": data
         }
         try:
-            with open(self.filepath, "a") as f:
+            # [v5.2] Force flush and atomic-like append
+            with open(self.filepath, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry) + "\n")
+                f.flush()
         except Exception as e:
-            logger.error(f"Journal Write Failed: {e}")
+            logger.error(f"Journal Write Failed (Path: {self.filepath}): {e}")
 
 journal = StudyJournal()
 
@@ -179,52 +181,177 @@ class ClinicalMetricInjector(pl.Callback):
         except:
             pl_module.log("val/sepsis_auprc", 0.0, prog_bar=True)
 
+def safe_get_metric(metrics, key, default):
+    """[v4.1] Bulletproof metric extraction from PL callback_metrics."""
+    v = metrics.get(key, default)
+    if torch.is_tensor(v):
+        return v.cpu().item()
+    return v
+
+def fuzzy_get_metric(metrics, substring, default):
+    """[v4.2] Resilient metric retrieval using substring matching."""
+    for k, v in metrics.items():
+        if substring in k:
+            if torch.is_tensor(v):
+                return v.cpu().item()
+            return v
+    return default
+
 # ==============================================================================
-# 1.1 SOTA PRUNING CALLBACK (ASHA Integration)
+# 1.1 APEX SENTINEL v5.0 (Grandmaster Pruning Protocol)
 # ==============================================================================
-class OptunaPruningCallback(pl.Callback):
+class APEXSentinelV5(pl.Callback):
     """
-    Reports intermediate metrics to Optuna for ASHA/Hyperband pruning.
-    Monitors 'val/utility_proxy' (calculated from Validation metrics).
+    SOTA Pruning Engine (v5.0).
+    Combines Adaptive Quantiles, Velocity Sentinels, and Pareto-Safety Grace.
     """
-    def __init__(self, trial: optuna.trial.Trial, monitor: str = "val/utility_proxy"):
+    def __init__(self, trial: optuna.trial.Trial, monitor: str = "val/sepsis_auroc"):
         super().__init__()
         self.trial = trial
         self.monitor = monitor
+        self.auc_history = []
+        self.is_champion = False # [v5.3] Local flag for persistence
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        # 1. Calculate Proxy Utility
-        metrics = trainer.callback_metrics
-        auprc = metrics.get("val/sepsis_auprc", 0.0).item()
-        auroc = metrics.get("val/sepsis_auroc", 0.5).item()
-        
-        # Simple Utility Proxy for Pruning (matches final calculation)
-        utility = (0.6 * auprc) + (0.3 * auroc)
-        
-        # 2. Report to Optuna
-        # Use simple Step count (global_step)
         step = trainer.global_step
-        self.trial.report(utility, step=step)
+        metrics = trainer.callback_metrics
         
-        # 3. Prune if necessary
-        if self.trial.should_prune():
-            # [JOURNAL] Log the prune event before dying
-            message = f"Trial {self.trial.number} pruned at step {step} with Utility={utility:.4f}"
-            print(f" {message}")
-            raise TrialPruned(message)
+        # 1. Bulletproof Metric Retrieval
+        auc = fuzzy_get_metric(metrics, self.monitor, 0.5)
+        ece = fuzzy_get_metric(metrics, "val/ece", 0.0)
+        ood = fuzzy_get_metric(metrics, "val/ood_rate_avg", 1.0)
+        ev  = fuzzy_get_metric(metrics, "val/explained_var", 0.0)
+        
+        # [v5.3] Handle NaN Explained Variance (No Value Head)
+        if math.isnan(ev): ev = 0.0
+        
+        self.auc_history.append(auc)
+        
+        # --- GATE A: Calibration Sentinel (Immediate Kill) ---
+        if ece > 0.85:
+            msg = f"🛑 SENTINEL KILL: Extreme Calibration Alert (ECE={ece:.3f})"
+            self.trial.set_user_attr("prune_reason", "calibration_failure")
+            journal.log(self.trial.number, "PRUNED_SENTINEL", {"reason": "bad_calibration", "ece": ece, "step": step})
+            raise TrialPruned(msg)
+
+        # --- GATE B: Brain Dead Sentinel (Divergence Check) ---
+        if step >= 60 and ev < -0.5 and ev != -1.0:
+            msg = f"🛑 SENTINEL KILL: Brain Dead Critic (EV={ev:.3f})"
+            self.trial.set_user_attr("prune_reason", "brain_dead")
+            journal.log(self.trial.number, "PRUNED_SENTINEL", {"reason": "brain_dead", "ev": ev, "step": step})
+            raise TrialPruned(msg)
+
+        # --- GATE C: Elite Safety Grace (Immunity) ---
+        is_elite_safe = (ood < 0.05)
+        if is_elite_safe and step >= 20:
+            logger.info(f"🛡️ SENTINEL GRACE: OOD={ood:.2%} (Pareto Safety Protected)")
+            self.trial.set_user_attr("noble_grace", True)
+            return
+
+        # --- GATE C: Adaptive Quantile Floor (Intelligence) ---
+        if step >= 60:
+            try:
+                # [v5.1] FORCE DB FETCH: bypass local cache to see other parallel workers
+                study = self.trial.study
+                completed_trials = study.get_trials(
+                    states=[optuna.trial.TrialState.COMPLETE], 
+                    deepcopy=False
+                )
+                
+                completed_aurocs = [
+                    t.user_attrs.get("mean_auroc", 0.5) 
+                    for t in completed_trials 
+                ]
+                
+                # [v5.3] Champion's Grace: If we are CURRENTLY the best, Grant Immunity
+                global_best = max(completed_aurocs) if completed_aurocs else 0.5
+                if auc >= global_best and step >= 60:
+                    if not self.is_champion:
+                        logger.info(f"🏆 CHAMPION'S GRACE: AUC {auc:.4f} >= Best {global_best:.4f}. Immunity Granted.")
+                    self.is_champion = True
+                    self.trial.set_user_attr("champion_grace", True)
+                    return # Exit: No pruning for the leader.
+
+                if len(completed_aurocs) >= 10:
+                    floor = np.percentile(completed_aurocs, 25)
+                    if auc < (floor - 0.02):
+                        msg = f"✂️ SENTINEL KILL: AUC {auc:.4f} < Adaptive Floor {floor:.4f}"
+                        self.trial.set_user_attr("prune_reason", "floor_violation")
+                        journal.log(self.trial.number, "PRUNED_SENTINEL", {"reason": "floor_breach", "auc": auc, "floor": floor})
+                        raise TrialPruned(msg)
+            except TrialPruned:
+                raise # Re-raise pruning signal
+            except Exception as e:
+                logger.warning(f"Sentinel v5.0 Floor Check Error: {e}")
+
+        # --- GATE D: Velocity Sentinel (Efficiency) v5.2 ---
+        # Note: If Champion's Grace logic reached here, it means auc was NOT >= global_best
+        if len(self.auc_history) >= 4 and step >= 100:
+            last_3 = self.auc_history[-3:]
+            slope = (last_3[-1] - last_3[0]) / 2.0
+            # [v5.2] Relaxed stagnation: slope < -0.001 (allowing minor noise) and floor 0.55
+            if slope < -0.001 and auc < 0.55:
+                # [v5.3] Double Check Grace before kill
+                is_champion = self.trial.user_attrs.get("champion_grace", False)
+                if not is_champion:
+                    msg = f"✂️ SENTINEL KILL: Significant Stagnation (Velocity={slope:.4e})"
+                    self.trial.set_user_attr("prune_reason", "stagnation")
+                    journal.log(self.trial.number, "PRUNED_SENTINEL", {"reason": "stagnation", "slope": slope, "step": step})
+                    raise TrialPruned(msg)
 
 class MOAROptimizer:
     def __init__(self, base_cfg: DictConfig):
         self.base_cfg = base_cfg
         self.hw_ctx = get_hardware_context()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.cache_path = Path("audit_physics_v20.json")
         
-        # Best Global LCB (For Pruning)
+        # [v5.2] Anchor Cache to Original CWD
+        original_cwd = hydra.utils.get_original_cwd()
+        self.cache_path = Path(original_cwd) / "audit_physics_v20.json"
+        
+        # Best Global LCBs (For Dual-Metric Gating)
         self.best_utility_lcb = -1.0
+        self.best_auroc_lcb   = -1.0
+        self.best_auprc_lcb   = -1.0
         
         # Ensure output directory exists
         Path("optimization_results").mkdir(exist_ok=True)
+
+    def reconcile_best_lcb(self, study: optuna.study.Study):
+        """
+        Synchronizes the pruner with the Database.
+        Calculates LCB from already finished trials to resume pruning correctly.
+        """
+        logger.info("📡 SYNCING SENTINEL WITH DATABASE...")
+        max_util = -1.0
+        max_auroc = -1.0
+        max_auprc = -1.0
+        
+        # [v5.1] FORCE DB FETCH: bypass local cache
+        completed_trials = study.get_trials(
+            states=[optuna.trial.TrialState.COMPLETE], 
+            deepcopy=False
+        )
+        
+        for trial in completed_trials:
+            # 1. Robust Utility
+            u_lcb = trial.user_attrs.get("robust_utility_captured", -1.0)
+            if u_lcb > max_util: max_util = u_lcb
+            
+            # 2. AUROC & AUPRC (Mean anchors)
+            auc = trial.user_attrs.get("mean_auroc", -1.0)
+            if auc > max_auroc: max_auroc = auc
+            
+            prc = trial.user_attrs.get("mean_auprc", -1.0)
+            if prc > max_auprc: max_auprc = prc
+        
+        if max_util > -1.0:
+            self.best_utility_lcb = max_util
+            self.best_auroc_lcb = max_auroc
+            self.best_auprc_lcb = max_auprc
+            logger.info(f"✅ SYNC COMPLETE: Best Utility={max_util:.4f} | AUC={max_auroc:.4f} | PRC={max_auprc:.4f}")
+        else:
+            logger.info("🆕 NEW STUDY: Starting Sentinel from scratch.")
 
     def perform_deep_audit(self, datamodule: pl.LightningDataModule) -> Dict[str, Any]:
         """
@@ -341,7 +468,7 @@ class MOAROptimizer:
             callbacks=[
                 ClinicalMetricInjector(), 
                 PreciseTQDMProgressBar(refresh_rate=cfg.train.get("log_every_n_steps", 10)),
-                OptunaPruningCallback(trial) # [ASHA] enable step-wise pruning
+                APEXSentinelV5(trial) # [v5.0] Grandmaster Pruner
             ],
             enable_checkpointing=False,
             logger=False,
@@ -403,6 +530,9 @@ class MOAROptimizer:
         MOAR OBJECTIVE FUNCTION.
         Returns Tuple(Robust_Utility, Robust_Safety).
         """
+        # 0. Real-time Database Sync (v5.0)
+        self.reconcile_best_lcb(trial.study)
+        
         # 1. Physics-Anchored Prior Sampling
         audit = self.perform_deep_audit(ICUGeneralistDataModule(self.base_cfg, pin_memory=False))
         
@@ -414,17 +544,15 @@ class MOAROptimizer:
         
         # [STRESS TEST] Optimized Search Space (SOTA Tunables)
         awr_max_weight = trial.suggest_float("awr_max_weight", 5.0, 100.0)
-        cagrad_c = trial.suggest_float("cagrad_c", 0.1, 0.9) # [SOTA] Conflict Aversion
-        gradnorm_alpha = trial.suggest_float("gradnorm_alpha", 0.5, 3.0) # [SOTA] Loss Balancing
         
-        # [HARD-LOCK] Foundation Parameters
+        # [FOUNDATION] Parameters
         lr         = 1.5e-4 # Base LR (Scaled dynamically below)
-        batch_size = 256    # [USER REQUEST] Reduced from 2048 for granular updates
+        batch_size = trial.suggest_categorical("bs_search", [128, 256])
         accum      = 1      
         
-        # Log Locked parameters
+        # Log parameters
         trial.set_user_attr("locked_lr", lr)
-        trial.set_user_attr("locked_batch_size", batch_size)
+        trial.set_user_attr("batch_size", batch_size)
         trial.set_user_attr("locked_accum", accum)
         
         # 2. Config Injection
@@ -436,7 +564,6 @@ class MOAROptimizer:
         cfg.train.pos_weight = pos_weight
         cfg.train.batch_size = batch_size
         cfg.train.accumulate_grad_batches = accum
-        cfg.train.lr = lr * (batch_size * accum / 1024.0) # Linear Scaling Rule
         cfg.train.lr = lr * (batch_size * accum / 1024.0) # Linear Scaling Rule
         cfg.train.warmup_steps = 10 # [FIX] Fast Warmup to reach steady-state early
 
@@ -453,15 +580,14 @@ class MOAROptimizer:
         cfg.train.num_workers = 0 
         
         cfg.train.awr_max_weight = awr_max_weight
-        cfg.train.cagrad_c = cagrad_c
-        cfg.train.gradnorm_alpha = gradnorm_alpha
         
         # [SPEED] Reduce AWR calibration overhead for HPO proxy
         cfg.train.awr_max_samples = 1500
         
-        # [TURBO] Bypass Self-Conditioning for HPO Speed
-        # This saves 33% compute by removing the redundant backbone pass.
+        # [TURBO] Bypass Self-Conditioning & Compilation for HPO Speed/Stability
+        # This saves 33% compute and prevents 'tracer' crashes on 2-core systems.
         cfg.model.use_self_conditioning = False 
+        cfg.compile_model = False
         
         # 3. ADAPTIVE ROBUSTNESS LOOP (The Filter)
         utilities = []
@@ -490,17 +616,22 @@ class MOAROptimizer:
             
             logger.info(f"  SEED {seed}: Utility={res['utility']:.4f} | Safety={res['safety']:.4f} | AUPRC={res['auprc']:.4f} | AUROC={res['auroc']:.4f}")
             
-            # --- ADAPTIVE PRUNING (Sequential Halving Logic) ---
-            # If Run 1 is significantly worse than global best LCB, stop.
+            # --- ADAPTIVE PRUNING (Sequential Halving Logic v5.0) ---
+            # If Seed 1 is significantly worse than global bests, stop.
             if i == 0 and self.best_utility_lcb > 0:
-                # Heuristic: If pilot run is > 5% worse than the *Lower Bound* of best trial
-                # It is statistically unlikely to recover.
-                if res["utility"] < (self.best_utility_lcb - PRUNING_TOLERANCE):
-                    logger.info(f"  ✂️ PRUNED: Pilot ({res['utility']:.4f}) < Best LCB ({self.best_utility_lcb:.4f})")
-                    # Penalty for early stopping: Assume variance is high
-                    # We report the single run result but with a high virtual variance penalty implicitly
-                    # Actually, for MOTPE, we just return the current values.
-                    # To be rigorous, we return the single run values but penalized.
+                # 1. Utility Margin (Combined performance)
+                util_bad = res["utility"] < (self.best_utility_lcb - 0.15)
+                
+                # 2. AUROC Margin (Clinical Separation)
+                auroc_bad = res["auroc"] < (self.best_auroc_lcb - 0.10)
+                
+                # 3. AUPRC Margin (Precision)
+                auprc_bad = res["auprc"] < (self.best_auprc_lcb - 0.15)
+                
+                # [v5.0 Gating] Only survive if it's promising in ANY core metric category
+                if util_bad and auroc_bad and auprc_bad:
+                    logger.info(f"  ✂️ SENTINEL PILOT KILL: Seed 1 ({res['utility']:.3f}/{res['auroc']:.3f}) < Global Best. Aborting.")
+                    # Return result with a persistence penalty (90%) to discourage the sampler
                     return res["utility"] * 0.9, res["safety"] * 0.9
 
         # 4. ROBUSTNESS CALCULATION (Lower Confidence Bound)
@@ -518,6 +649,9 @@ class MOAROptimizer:
         # Update Global Best LCB (for future pruning)
         if robust_utility > self.best_utility_lcb:
             self.best_utility_lcb = robust_utility
+            
+        # [v20.2] PERSISTENCE: Store LCB in trial attributes for restart-sync
+        trial.set_user_attr("robust_utility_captured", robust_utility)
             
         logger.info(f"  🏁 RESULT: Robust Utility={robust_utility:.4f} (Vol={u_std:.4f})")
         
@@ -549,6 +683,10 @@ def main(cfg: DictConfig):
     logger.info("="*80)
     
     # 0. Path Resolution (Hydra Compatibility)
+    original_cwd = hydra.utils.get_original_cwd()
+    journal.filepath = os.path.join(original_cwd, "apex_study_journal.jsonl")
+    logger.info(f"📓 Forensic Journal anchored to: {journal.filepath}")
+
     if not os.path.isabs(cfg.dataset.dataset_dir):
         cfg.dataset.dataset_dir = os.path.abspath(os.path.join(
             hydra.utils.get_original_cwd(), cfg.dataset.dataset_dir
@@ -587,6 +725,7 @@ def main(cfg: DictConfig):
     )
     
     engine = MOAROptimizer(cfg)
+    engine.reconcile_best_lcb(study) # [v20.2] Persistence Patch
     
     # 3. Warmstart from Audit
     if len(study.trials) == 0:
@@ -597,13 +736,12 @@ def main(cfg: DictConfig):
             "awr_beta": audit["awr_beta"],
             "aux_loss_scale": 0.5,
             "dropout": 0.1,
-            "lr": 2e-4,
-            "batch_size": 1024,
-            "accumulate_grad_batches": 1
+            "awr_max_weight": 20.0,
+            "bs_search": 128
         })
 
     # 4. Optimization Loop
-    TOTAL_TRIALS = 60
+    TOTAL_TRIALS = 160
     remaining = max(0, TOTAL_TRIALS - len(study.trials))
     
     if remaining > 0:

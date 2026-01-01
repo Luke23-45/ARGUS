@@ -51,7 +51,7 @@ class GradNormBalancer(nn.Module):
             grad = torch.autograd.grad(
                 loss, 
                 self.shared_params, 
-                retain_graph=not is_last, 
+                retain_graph=True, 
                 allow_unused=True
             )
             

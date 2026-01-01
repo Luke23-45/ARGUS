@@ -152,6 +152,18 @@ class ICUSpecialistWrapper(pl.LightningModule):
         # Required for CAGrad's multiple backward passes and GradNorm's dynamic weighting.
         self.automatic_optimization = False
         
+        # [v25.3] Flexible Multi-Task Balancing
+        # modes: "sota_2025" (Hooks + UW) or "legacy_surgical" (CAGrad + GradNorm)
+        self.balancing_mode = cfg.train.get("balancing_mode", "legacy_surgical")
+        logger.info(f"Using balancing mode: {self.balancing_mode}")
+
+        if self.balancing_mode == "sota_2025":
+            # Learnable log-variances for Uncertainty Weighting
+            # Specialist mode balances [Diffusion, Router] - Critic is detached.
+            self.log_var_diff = nn.Parameter(torch.tensor(0.0))
+            self.log_var_router = nn.Parameter(torch.tensor(0.0))
+            logger.info("Initializing Uncertainty Weighting Parameters (Specialist)...")
+        
         # =====================================================================
         # 1. SCAFFOLDING (The Generalist Foundation)
         # =====================================================================
@@ -211,6 +223,11 @@ class ICUSpecialistWrapper(pl.LightningModule):
             use_loss_free_balancing=use_loss_free_balancing,
             aux_loss_scale=cfg.train.get("aux_loss_scale", 0.1)
         )
+
+        # [H100 OPTIMIZATION] Torch Compile (PT 2.0+)
+        if cfg.get("compile_model", False):
+            logger.info("[H100] Compiling Specialist Model with mode='max-autotune'...")
+            self.model = torch.compile(self.model, mode="max-autotune")
         
         logger.info(f"[MODEL] Created {self.model.cfg.num_phases}-Expert APEX-MoE Specialist")
         
@@ -250,14 +267,15 @@ class ICUSpecialistWrapper(pl.LightningModule):
         # =====================================================================
         # 7. SOTA GRADIENT & LOSS BALANCING
         # =====================================================================
-        # GradNorm dynamically weights [Diffusion, Router]
-        # We target the Router as the primary balancing anchor (Encoder is Frozen).
-        # Critic is disjoint (shares no params with Router), so we exclude it from GradNorm.
-        self.gradnorm = GradNormBalancer(
-            num_tasks=2, 
-            shared_params=self.model.router.parameters(),
-            alpha=cfg.train.get("gradnorm_alpha", 1.5)
-        ).to(self.device) # [v20.1] Immediate device alignment
+        self.gradnorm = None
+        if self.balancing_mode == "legacy_surgical":
+            # GradNorm dynamically weights [Diffusion, Router]
+            # We target the Router as the primary balancing anchor (Encoder is Frozen).
+            self.gradnorm = GradNormBalancer(
+                num_tasks=2, 
+                shared_params=self.model.router.parameters(),
+                alpha=cfg.train.get("gradnorm_alpha", 1.5)
+            ).to(self.device) # [v20.1] Immediate device alignment
         
         # =====================================================================
         # 7. DYNAMIC CURRICULUM PARAMETERS
@@ -806,53 +824,67 @@ class ICUSpecialistWrapper(pl.LightningModule):
         # =====================================================================
         # G. SOTA BALANCING & SURGERY (Manual Backprop)
         # =====================================================================
-        # 1. Reconstruct Tasks for GradNorm
-        # Group components into: [Expert(Diff+Reg), Router] for auto-balancing.
-        # Critic is kept static (0.5) as it has no shared gradients with Router.
+        # 1. Reconstruct Tasks for Balancing
+        # Expert(Diff+Reg) and Router are the primary competing components.
         task_expert = out["diffusion_loss"] + out.get("reg_loss", 0.0) + out.get("diversity_loss", 0.0)
         task_router = out.get("router_ce_loss", 0.0) + out.get("load_balance_loss", 0.0)
         task_critic = critic_loss
         
-        # 2. Dynamic Loss Weighting via GradNorm (Only for competing tasks)
-        primary_losses = torch.stack([task_expert, task_router])
-        gn_loss, task_weights = self.gradnorm.update(primary_losses)
-        
-        # 3. Weighted losses for CAGrad surgery
-        # Expert -> Weights[0], Critic -> 0.5 (Static), Router -> Weights[1]
-        weighted_tasks = [
-            task_expert * task_weights[0], 
-            task_critic * 0.5, 
-            task_router * task_weights[1]
-        ]
-        
-        # 4. Conflict-Averse Surgery (Backward Pass)
         opt = self.optimizers()
-        
         is_start_of_accum = (batch_idx % self.trainer.accumulate_grad_batches == 0)
-        
-        # CAGrad Adjustment
-        opt.pc_backward(
-            weighted_tasks, 
-            backward_fn=self.manual_backward, 
-            accumulate=not is_start_of_accum
-        )
-        
-        # --- Post-Surgery Constraint Optimization ---
-        # Physics Safety (Added as a residual step to ensure strict bounds)
-        phys_weight = self._get_curriculum_physics_weight()
-        phys_loss = out.get("phys_loss", torch.tensor(0.0, device=self.device))
-        
-        if phys_loss > 0:
-             # Additive penalty on top of surgical gradients
-             self.manual_backward(phys_weight * phys_loss)
 
+        if self.balancing_mode == "sota_2025":
+            # [SOTA 2025] Single-Pass Uncertainty Weighting
+            # Formula: (L / exp(log_var)) + log_var
+            # SpecialistBalances [Expert, Router]. Critic remains at 0.5 static weight.
+            loss_expert_weighted = task_expert / torch.exp(self.log_var_diff) + self.log_var_diff
+            loss_router_weighted = task_router / torch.exp(self.log_var_router) + self.log_var_router
+            loss_critic_weighted = task_critic * 0.5
+            
+            total_loss = loss_expert_weighted + loss_router_weighted + loss_critic_weighted
+            
+            # Physics constraint as additive regularization (curriculum-weighted)
+            phys_weight = self._get_curriculum_physics_weight()
+            phys_loss_raw = out.get("phys_loss", torch.tensor(0.0, device=self.device))
+            total_loss += phys_weight * phys_loss_raw
+            
+            self.manual_backward(total_loss)
+            gn_loss = torch.tensor(0.0, device=self.device) # Dummy for telemetry
+            task_weights = [torch.exp(-self.log_var_diff), torch.exp(-self.log_var_router)]
+            
+        else:
+            # [Legacy Surgical] Multi-Pass CAGrad + GradNorm
+            # 2. Dynamic Loss Weighting via GradNorm (Only for competing tasks)
+            primary_losses = torch.stack([task_expert, task_router])
+            gn_loss, task_weights = self.gradnorm.update(primary_losses)
+            
+            # 3. Weighted losses for CAGrad surgery
+            weighted_tasks = [
+                task_expert * task_weights[0], 
+                task_critic * 0.5, 
+                task_router * task_weights[1]
+            ]
+            
+            # 4. Conflict-Averse Surgery (Backward Pass)
+            opt.pc_backward(
+                weighted_tasks, 
+                backward_fn=self.manual_backward, 
+                accumulate=not is_start_of_accum
+            )
+            
+            # --- Post-Surgery Constraint Optimization (Physics) ---
+            phys_weight = self._get_curriculum_physics_weight()
+            phys_loss_raw = out.get("phys_loss", torch.tensor(0.0, device=self.device))
+            if phys_loss_raw > 0:
+                 self.manual_backward(phys_weight * phys_loss_raw)
+                 
         # --- Accumulation-Aware Step & Cleanup ---
         acc_batches = self.trainer.accumulate_grad_batches
         if (batch_idx + 1) % acc_batches == 0:
             # Gradient Clipping
             grad_clip = self.cfg.train.get("grad_clip", 1.0)
             if grad_clip > 0:
-                self.clip_gradients(opt, gradient_clip_val=grad_clip, gradient_clip_algorithm="norm")
+                torch.nn.utils.clip_grad_norm_(self.parameters(), grad_clip)
                 
             opt.step()
             opt.zero_grad()
@@ -860,11 +892,12 @@ class ICUSpecialistWrapper(pl.LightningModule):
             if sch is not None:
                 sch.step()            
             
-            # GradNorm Optimizer Step
-            if hasattr(self.gradnorm, 'optimizer') and self.gradnorm.optimizer is not None:
-                self.gradnorm.optimizer.zero_grad()
-                self.manual_backward(gn_loss)
-                self.gradnorm.optimizer.step()
+            # GradNorm Optimizer Step (Legacy Only)
+            if self.balancing_mode == "legacy_surgical":
+                if hasattr(self.gradnorm, 'optimizer') and self.gradnorm.optimizer is not None:
+                    self.gradnorm.optimizer.zero_grad()
+                    self.manual_backward(gn_loss)
+                    self.gradnorm.optimizer.step()
 
         # =====================================================================
         # H. COMPREHENSIVE TELEMETRY
@@ -1166,15 +1199,27 @@ class ICUSpecialistWrapper(pl.LightningModule):
         Returns:
             Dict with optimizer and LR scheduler configuration
         """
-        optimizer = CAGrad(
-             configure_robust_optimizer(
-                self.model,
-                learning_rate=self.cfg.train.lr,
-                weight_decay=self.cfg.train.weight_decay,
-                use_fused=True
-            ),
-            c=self.cfg.train.get("cagrad_c", 0.5)
+        # 1. Configure Parameters
+        optimizer_params = [{"params": self.model.parameters()}]
+        
+        # [v25.3] Add Uncertainty Parameters if in SOTA mode
+        if self.balancing_mode == "sota_2025":
+            uw_lr = self.cfg.train.get("uw_lr", 0.025)
+            optimizer_params.append({
+                "params": [self.log_var_diff, self.log_var_router],
+                "lr": uw_lr,
+                "weight_decay": 0.0
+            })
+
+        base_optimizer = torch.optim.AdamW(
+            optimizer_params,
+            lr=self.cfg.train.lr,
+            weight_decay=self.cfg.train.weight_decay,
+            fused=True
         )
+        
+        # 2. Wrap with CAGrad
+        optimizer = CAGrad(base_optimizer, c=self.cfg.train.get("cagrad_c", 0.5))
         
         # 2. Learning Rate Scheduler (Step-based SOTA)
         # Use estimated_stepping_batches for accurate total count

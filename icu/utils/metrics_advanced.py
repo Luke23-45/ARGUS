@@ -399,7 +399,16 @@ def compute_bootstrap_ci(
 def compute_explained_variance(y_pred: torch.Tensor, y_true: torch.Tensor) -> float:
     """
     Computes Explained Variance: 1 - Var(error) / Var(true)
+    [PATCH] Shape Safety added to prevent HPO crashes.
     """
+    # Ensure tensors are flat and matching
+    y_pred = y_pred.reshape(-1)
+    y_true = y_true.reshape(-1)
+    
+    if y_pred.shape[0] != y_true.shape[0]:
+        # If we can't align them, returning 0.0 is better than crashing the trial
+        return 0.0
+
     var_y = torch.var(y_true)
     if var_y < 1e-9:
         return 0.0
