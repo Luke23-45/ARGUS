@@ -415,8 +415,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
             rewards = self.awr_calculator.compute_clinical_reward(
                 fut, 
                 batch.get("outcome_label", None),
+                dones=batch.get("is_terminal", None),
                 feature_indices=self.clinical_feat_idx,
-                normalizer=self.model.normalizer
+                normalizer=self.model.normalizer,
+                src_mask=batch.get("future_mask", None) # [v12.6 FIX] Use Future Imputation Mask
             )
             # [SOTA] Use Teacher Context for bootstrapping
             with self.ema_teacher_context():
@@ -428,7 +430,23 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 )
                 target_values = self.model.value_head(teacher_global)
             
-            advantages = self.awr_calculator.compute_gae(rewards, target_values)
+            # [v12.7 SOTA FIX] Value-Head Bootstrapping
+            # If a window is truncated (not yet at end of stay), we bootstrap 
+            # from the last critic estimate. If terminal, we use zero.
+            is_truncated = batch.get("is_truncated", None)
+            if is_truncated is not None and is_truncated.any():
+                # [B, 1] bootstrap value from the last predicted value
+                # SOTA: This ensures Bellman backups don't treat window edges as episode ends.
+                bootstrap_value = target_values[:, -1:]
+            else:
+                bootstrap_value = None
+
+            advantages = self.awr_calculator.compute_gae(
+                rewards, 
+                target_values,
+                dones=batch.get("is_terminal", None),
+                bootstrap_value=bootstrap_value
+            )
             returns = (advantages + target_values).detach()
             
             # [2025 SOTA] High-Pressure AWR Weights
@@ -853,6 +871,38 @@ class ICUGeneralistWrapper(pl.LightningModule):
     # UTILITIES & SETUP
     # =========================================================================
 
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        """
+        [v12.5 FIX] Strict Loading Bypass.
+        
+        If we are resuming from a checkpoint that lacks our new SOTA buffers 
+        (ess_buffer, clip_rate_buffer), PyTorch's default load_state_dict will 
+        crash. This hook allows us to load matching weights and preserve
+        our new buffers with their default initializations.
+        """
+        state_dict = checkpoint.get("state_dict", {})
+        if not state_dict:
+            return
+            
+        # Check if critical new keys are missing
+        new_keys = [
+            "awr_calculator.beta", 
+            "awr_calculator.max_weight", 
+            "awr_calculator.ess_buffer", 
+            "awr_calculator.clip_rate_buffer"
+        ]
+        missing_count = sum(1 for k in new_keys if k not in state_dict)
+        
+        if missing_count > 0:
+            logger.warning(f"[RESUME] Checkpoint is missing {missing_count} SOTA buffers. Switching to non-strict loading.")
+            # We load the weights manually with strict=False
+            # This populates matching weights and leaves missing buffers at default
+            incompatible = self.load_state_dict(state_dict, strict=False)
+            if incompatible.missing_keys:
+                logger.info(f"[RESUME] Non-strict load complete. Missing keys (preserved as default): {len(incompatible.missing_keys)}")
+            if incompatible.unexpected_keys:
+                logger.warning(f"[RESUME] Unexpected keys in checkpoint: {len(incompatible.unexpected_keys)}")
+        
     def _get_curr_physics_weight(self) -> float:
         """
         Curriculum Learning for Physiological Constraints.

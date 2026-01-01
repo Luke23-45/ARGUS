@@ -71,6 +71,7 @@ import torch.nn.functional as F
 import numpy as np
 import logging
 import math
+import torch.distributed as dist
 from typing import Optional, Tuple, Dict, List, Union, Any
 
 logger = logging.getLogger("APEX_Advantage_Ultimate")
@@ -276,11 +277,11 @@ class ICUAdvantageCalculator(nn.Module):
     # CLINICAL REWARD FUNCTION
     # =========================================================================
 
-    def compute_intrinsic_reward(
+    def compute_clinical_reward(
         self, 
         vitals: torch.Tensor, 
         outcome_label: torch.Tensor,
-        dones: torch.Tensor,
+        dones: Optional[torch.Tensor] = None,
         feature_indices: Optional[Dict[str, int]] = None,
         normalizer: Optional[Any] = None,
         src_mask: Optional[torch.Tensor] = None
@@ -368,9 +369,11 @@ class ICUAdvantageCalculator(nn.Module):
         else:
             outcome_expanded = outcome_label
 
+        if dones is None:
+            dones = torch.zeros(B, T, device=device)
+            
         # Mask: Only apply sparse reward at true episode end
         # [FIX: Mask-Aware Terminal Placement]
-        # In sliding windows, 'last index' might be padding. We want the last VALID step.
         is_terminal = dones.bool()
         
         # If we have a source mask, intersect terminal with it
@@ -406,35 +409,42 @@ class ICUAdvantageCalculator(nn.Module):
 
         # --- DENSE REWARD BLOCK (REQUIRES VALID UNITS) ---
         if units_ok:
+            # [SOTA FIX] Fine-Grained Imputation Awareness
+            # We only penalize if the specific signal is valid (mask=1)
+            # Assumption: src_mask is [B, T, C] or [B, T]
+            def get_f_mask(idx):
+                if src_mask is None: return torch.ones(B, T, device=vitals.device)
+                if src_mask.dim() == 2: return src_mask.float()
+                if idx < src_mask.shape[-1]: return src_mask[..., idx].float()
+                return torch.ones(B, T, device=vitals.device)
+
             # --- 4. MAP Penalty (Sigmoid Soft-Cliff) ---
             if map_val is not None:
                 # Sigmoid centered at MAP=60, steepness=0.5
-                # MAP 65+ -> ~0 penalty, MAP 55 -> high penalty
-                # Formula: sigmoid((60 - MAP) * steepness)
                 map_penalty_score = torch.sigmoid((60.0 - map_val) * 0.5)
-                rewards -= self.shaping_coef * map_penalty_score
+                # Apply MAP-specific mask
+                rewards -= self.shaping_coef * map_penalty_score * get_f_mask(idx_map)
 
             # --- 5. SBP Penalty (Additional Hypotension Marker) ---
             if sbp_val is not None:
                 # Sigmoid centered at SBP=95, steepness=0.2
-                # SBP 100+ -> ~0 penalty, SBP 90 -> moderate penalty
                 sbp_penalty_score = torch.sigmoid((95.0 - sbp_val) * 0.2)
-                rewards -= self.shaping_coef * 0.5 * sbp_penalty_score
+                # Apply SBP-specific mask
+                rewards -= self.shaping_coef * 0.5 * sbp_penalty_score * get_f_mask(idx_sbp)
 
             # --- 6. Lactate Penalty (Sigmoid Soft-Cliff) ---
             if lactate_val is not None:
                 # Sigmoid centered at Lactate=3.0, steepness=1.0
-                # Lactate 2.0 -> low penalty, Lactate 4.0+ -> high penalty
                 lac_penalty_score = torch.sigmoid((lactate_val - 3.0) * 1.0)
-                # Higher weight for lactate (primary mortality predictor)
-                rewards -= self.shaping_coef * 1.5 * lac_penalty_score
+                # Apply Lactate-specific mask
+                rewards -= self.shaping_coef * 1.5 * lac_penalty_score * get_f_mask(idx_lac)
 
             # --- 7. Respiratory Penalty (qSOFA) ---
             if resp_val is not None:
                 # Sigmoid centered at Resp=24, steepness=0.3
-                # Resp 22 -> low penalty, Resp 30+ -> high penalty
                 resp_penalty_score = torch.sigmoid((resp_val - 24.0) * 0.3)
-                rewards -= self.shaping_coef * 0.3 * resp_penalty_score
+                # Apply Resp-specific mask
+                rewards -= self.shaping_coef * 0.3 * resp_penalty_score * get_f_mask(idx_resp)
 
             # --- 8. Delta Trends (Reward Recovery) ---
             if T > 1:
@@ -443,28 +453,36 @@ class ICUAdvantageCalculator(nn.Module):
                     # positive delta = lactate going DOWN (good)
                     lac_delta = lactate_val[:, :-1] - lactate_val[:, 1:]
                     lac_improvement = torch.clamp(lac_delta, min=0.0, max=2.0)
-                    rewards[:, 1:] += self.shaping_coef * 2.0 * lac_improvement
+                    # Use mask from previous step to ensure "start" was real
+                    rewards[:, 1:] += self.shaping_coef * 2.0 * lac_improvement * get_f_mask(idx_lac)[:, :-1]
 
                 # B. MAP Improvement: Reward INCREASE in MAP (if was low)
                 if map_val is not None:
                     map_delta = map_val[:, 1:] - map_val[:, :-1]
                     # Only reward MAP increase if it was in danger zone (<75)
-                    # Otherwise we encourage hypertension
                     map_was_low = (map_val[:, :-1] < 75.0).float()
                     map_improvement = torch.clamp(map_delta, min=0.0, max=10.0) * map_was_low
-                    rewards[:, 1:] += self.shaping_coef * 0.5 * map_improvement
+                    rewards[:, 1:] += self.shaping_coef * 0.5 * map_improvement * get_f_mask(idx_map)[:, :-1]
 
                 # C. SBP Improvement: Reward INCREASE in SBP (if was low)
                 if sbp_val is not None:
                     sbp_delta = sbp_val[:, 1:] - sbp_val[:, :-1]
                     sbp_was_low = (sbp_val[:, :-1] < 110.0).float()
                     sbp_improvement = torch.clamp(sbp_delta, min=0.0, max=15.0) * sbp_was_low
-                    rewards[:, 1:] += self.shaping_coef * 0.2 * sbp_improvement
+                    rewards[:, 1:] += self.shaping_coef * 0.2 * sbp_improvement * get_f_mask(idx_sbp)[:, :-1]
 
-            # --- 9. Clamp Total Dense Reward ---
+            # --- 9. Clamp Total Dense Reward & Handle NaNs ---
             # Prevent dense rewards from overwhelming sparse signal
             reward_cap = SEPSIS_CONSTANTS['DENSE_REWARD_CAP']
             rewards = torch.clamp(rewards, min=-reward_cap * 2, max=reward_cap)
+            
+            # [SOTA FIX] NaN-Robustness
+            # If any reward became NaN (e.g. from invalid clinical data), zero it out
+            # to prevent gradient explosion.
+            nan_mask = torch.isnan(rewards)
+            if nan_mask.any():
+                logger.warning(f"[NAN REWARD] Detected {nan_mask.sum()} NaNs in rewards. Zeroing them.")
+                rewards = torch.where(nan_mask, torch.zeros_like(rewards), rewards)
 
         # --- 10. Apply Source Mask (Zero out padding) ---
         if src_mask is not None:
@@ -478,42 +496,6 @@ class ICUAdvantageCalculator(nn.Module):
 
         return rewards
 
-    # Alias for backward compatibility
-    def compute_clinical_reward(
-        self, 
-        vitals: torch.Tensor, 
-        outcome_label: torch.Tensor,
-        feature_indices: Optional[Dict[str, int]] = None,
-        normalizer: Optional[Any] = None,
-        src_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        Backward-compatible wrapper for compute_intrinsic_reward.
-        
-        Creates a synthetic 'dones' tensor assuming terminal at last timestep.
-        
-        Args:
-            vitals: (B, T, C) Tensor of vital signs
-            outcome_label: (B,) or (B, T) binary outcome
-            feature_indices: Map of feature names to channel indices
-            normalizer: Optional ClinicalNormalizer
-            src_mask: Optional mask for padding logic
-        
-        Returns:
-            rewards: (B, T) Tensor of clinical rewards
-        """
-        B, T, _ = vitals.shape
-        dones = torch.zeros(B, T, device=vitals.device)
-        dones[:, -1] = 1.0  # Terminal at last timestep
-        
-        return self.compute_intrinsic_reward(
-            vitals=vitals,
-            outcome_label=outcome_label,
-            dones=dones,
-            feature_indices=feature_indices,
-            normalizer=normalizer,
-            src_mask=src_mask
-        )
 
     # =========================================================================
     # GENERALIZED ADVANTAGE ESTIMATION (GAE)
@@ -628,42 +610,54 @@ class ICUAdvantageCalculator(nn.Module):
         # --- 2. Scaled Advantage ---
         scaled_adv = norm_adv / self.beta
         
-        # --- 3. FP16 Safety: Pre-Exp Clamping ---
-        # float16 max is ~65504. exp(11.1) ≈ 65000.
-        # We clamp input to exp() to prevent overflow
-        max_exp_input = 10.0  # Safe for FP16
-        scaled_adv_clamped = torch.clamp(scaled_adv, min=-max_exp_input, max=max_exp_input)
+        # --- 3. SOTA Numerical Stability: Exp-Normalize Trick ---
+        # Instead of clamping, we subtract the maximum to prevent overflow 
+        # while preserving the exact probability distribution.
+        with torch.no_grad():
+            # max_adv should be computed per-batch/global for stability
+            max_log_w = scaled_adv.max()
         
-        # --- 4. Exponentiation ---
-        weights = torch.exp(scaled_adv_clamped)
+        # weights = exp((A - max(A)) / beta)
+        # This ensures the maximum weight is always 1.0 (before normalization)
+        weights = torch.exp(scaled_adv - max_log_w)
         
         # --- 5. Hard Clipping (Standard AWR practice) ---
         weights_clipped = torch.clamp(weights, max=self.max_weight)
         
-        # --- 6. Diagnostics ---
+        # --- 6. Diagnostics & Adaptive Sync ---
         with torch.no_grad():
-            numel = weights.numel()
+            numel_local = weights.numel()
             sum_w = weights_clipped.sum()
             sum_w_sq = (weights_clipped ** 2).sum()
+            # AWR Clipping Rate: How many weights hit the max hard-limit
+            clipping_count = (weights > self.max_weight).float().sum()
             
-            # Effective Sample Size (ESS)
-            ess = (sum_w ** 2) / (sum_w_sq * numel + 1e-8)
-            self.ess_buffer.fill_(ess / numel) # Normalized ESS
+            # [SOTA 2025] DDP Global Synchronization
+            # ESS and clipping rate must be global to prevent rank divergence
+            if dist.is_initialized():
+                stats = torch.stack([sum_w, sum_w_sq, clipping_count, torch.tensor(numel_local, device=weights.device, dtype=torch.float32)])
+                dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                g_sum_w, g_sum_w_sq, g_clip_count, g_numel = stats[0], stats[1], stats[2], stats[3]
+            else:
+                g_sum_w, g_sum_w_sq, g_clip_count, g_numel = sum_w, sum_w_sq, clipping_count, float(numel_local)
+
+            # Global Effective Sample Size (ESS)
+            ess = (g_sum_w ** 2) / (g_sum_w_sq * g_numel + 1e-8)
+            self.ess_buffer.fill_(ess / g_numel) # Normalized Global ESS
             
-            # Clipping Rate (Needed for adaptive safety)
-            clipped_rate = (scaled_adv > max_exp_input).float().mean()
+            # Global Clipping Rate
+            clipped_rate = g_clip_count / (g_numel + 1e-8)
             self.clip_rate_buffer.fill_(clipped_rate)
             
-            # [SOTA 2025] Adaptive Dynamics Update (Uses current ESS & Rate)
+            # [SOTA 2025] Adaptive Dynamics Update (Uses Global Statistics)
             if self.adaptive_beta or self.adaptive_clipping:
-                self._update_adaptive_stats(advantages, weights, ess / numel, clipped_rate.item())
+                self._update_adaptive_stats(advantages, weights, ess / g_numel, clipped_rate.item())
             
             # Weight Entropy (Information Theoretic)
             probs = weights_clipped / (sum_w + 1e-8)
             log_probs = torch.log(probs + 1e-8)
-            entropy = -torch.sum(probs * log_probs) / math.log(numel + 1)
+            entropy = -torch.sum(probs * log_probs) / math.log(numel_local + 1)
             
-            clipped_rate = (scaled_adv > max_exp_input).float().mean()
             hard_clipped_rate = (weights > self.max_weight).float().mean()
             
             diagnostics = {
@@ -844,9 +838,9 @@ if __name__ == "__main__":
     dones = torch.zeros(B, T)
     dones[:, -1] = 1.0  # Terminal at end
     
-    # 3. Compute Intrinsic Reward
-    print("\n[1] Computing Intrinsic Rewards...")
-    rewards = calc.compute_intrinsic_reward(
+    # 3. Compute Clinical Reward
+    print("\n[1] Computing Clinical Rewards...")
+    rewards = calc.compute_clinical_reward(
         vitals, outcomes, dones, normalizer=MockNormalizer()
     )
     print(f"    Rewards Shape: {rewards.shape}")

@@ -403,9 +403,11 @@ class ICUTrajectoryDataset(Dataset):
         obs_mask = masks_win[:self.history_len]
         fut_mask = masks_win[self.history_len:]
         
-        # 6. Compute Metadata
-        phase = self._get_phase_label(labels_win)
-        outcome = np.max(labels_win[self.history_len:]) # Max prob in future
+        # [v12.7 SOTA FIX] RL Topology Awareness
+        # is_terminal: Does the episode actually end? (True if end of history)
+        # is_truncated: Does the sequence window cut off before the episode end?
+        is_terminal = (t_end >= len(full_vitals))
+        is_truncated = (t_end < len(full_vitals))
 
         return {
             "observed_data": torch.from_numpy(obs_data.copy()),  # Shape: [Hist, 28]
@@ -415,6 +417,8 @@ class ICUTrajectoryDataset(Dataset):
             "future_mask":    torch.from_numpy(fut_mask.copy()),    # Shape: [Pred, 28]
             "outcome_label":  torch.tensor(outcome, dtype=torch.float32),
             "phase_label":    torch.tensor(phase, dtype=torch.long),
+            "is_terminal":    torch.tensor(is_terminal, dtype=torch.bool),
+            "is_truncated":   torch.tensor(is_truncated, dtype=torch.bool),
             "patient_id":     str(ep_meta.get("patient_id", "unknown"))
         }
 

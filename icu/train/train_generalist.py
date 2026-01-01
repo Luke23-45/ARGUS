@@ -154,6 +154,11 @@ def load_checkpoint_robust(
             # The weights are already in 'system', so a "fresh" PL run will use them.
             return None
             
+        # [v12.5 FIX] Checkpoint Key Mismatch Protection
+        # If the checkpoint HAS Lightning metadata but is missing keys (e.g., from old DDP config)
+        # We must tell PL to use strict=False during the internal load_state_dict call.
+        # This is handled by patching the LightningModule's on_load_checkpoint.
+        logger.info(f"[RESUME] Checkpoint version found: {checkpoint.get('pytorch-lightning_version')}. Proceeding with native PL loader.")
         return ckpt_path
         
     except Exception as e:

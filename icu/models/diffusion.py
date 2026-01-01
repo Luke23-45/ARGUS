@@ -1076,7 +1076,7 @@ class ICUUnifiedPlanner(nn.Module):
             base_p=cfg.base_safety_percentile,
             min_p=cfg.min_safety_percentile
         )
-        self.clinical_feat_idx = {'map': 1, 'lactate': 8, 'spo2': 3, 'hr': 0}
+        self.clinical_feat_idx = {'hr': 0, 'o2sat': 1, 'sbp': 2, 'map': 4, 'lactate': 7, 'resp': 5}
 
         # Hooks for Normalizer
         logger.info(f"[APEX PLANNER] Initialized v11.0 Agentic: {self.cfg.d_model}d, {self.cfg.n_layers}L")
