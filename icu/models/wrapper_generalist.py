@@ -61,6 +61,7 @@ import logging
 import math
 import numpy as np
 import contextlib
+import traceback
 
 # [v2025 SOTA] Implementation Imports
 from icu.core.cagrad import CAGrad
@@ -281,8 +282,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
         )
         
         # Phase 2: Per-Feature Safety
-        # Mapping for Frontier 28: MAP=1, Lactate=8, SpO2=3, HR=0
-        self.clinical_feat_idx = {'map': 1, 'lactate': 8, 'spo2': 3, 'hr': 0}
+        # [v2025 SOTA FIX] Align with CANONICAL_COLUMNS from dataset.py
+        # HR=0, O2Sat=1, SBP=2, DBP=3, MAP=4, Resp=5, Temp=6, Lactate=7
+        self.clinical_feat_idx = {
+            'map': 4, 'lactate': 7, 'o2sat': 1, 'spo2': 1, 'hr': 0, 'sbp': 2, 'resp': 5
+        }
         self.safety_envelope = PhysiologicalSafetyEnvelope(self.clinical_feat_idx)
         
         # Phase 3: Longitudinal Convergence
@@ -411,6 +415,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             rewards = self.awr_calculator.compute_clinical_reward(
                 fut, 
                 batch.get("outcome_label", None),
+                feature_indices=self.clinical_feat_idx,
                 normalizer=self.model.normalizer
             )
             # [SOTA] Use Teacher Context for bootstrapping
@@ -561,17 +566,20 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # [TELEMETRY] Primary Metrics (Visible in Progress Bar)
             # Use detached scalars (.item()) for the progress bar to ensure immediate visibility.
             # Shortening to L, D, V, etc. is handled by the APEXProgressBar callback.
+            # [TELEMETRY] Primary Metrics (Visible in Progress Bar)
+            # [SOTA FIX] DO NOT use .item() here. It causes graph breaks in torch.compile.
+            # Lightning handles tensor logging efficiently.
             self.log_dict({
-                "total_loss": (diff_loss + critic_loss + aux_loss).item(),
-                "diff_loss": diff_loss.item(),
-                "critic_loss": critic_loss.item(),
-                "phys_loss": phys_loss.item() if torch.is_tensor(phys_loss) else phys_loss,
-                "aux_loss": aux_loss.item() if torch.is_tensor(aux_loss) else aux_loss,
+                "total_loss": (diff_loss + critic_loss + aux_loss),
+                "diff_loss": diff_loss,
+                "critic_loss": critic_loss,
+                "phys_loss": phys_loss,
+                "aux_loss": aux_loss,
                 "awr_ess": diag["ess"],
-                "explained_var": ev.item() if torch.is_tensor(ev) else ev,
-                "curr_phys_weight": curr_phys_weight,
-                "w_aux": task_weights[2],
-                "lr": self.optimizers().param_groups[0]["lr"]
+                "explained_var": ev,
+                "curr_phys_weight": torch.tensor(curr_phys_weight, device=self.device),
+                "w_aux": torch.tensor(task_weights[2], device=self.device),
+                "lr": torch.tensor(self.optimizers().param_groups[0]["lr"], device=self.device)
             }, on_step=True, on_epoch=False, prog_bar=True)
 
             # [TELEMETRY] Detailed Diagnostics (WandB Only)
@@ -697,7 +705,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # 3. Clinical Trajectory Sampling (Only first batch to save compute)
         # This prevents the "Validation Trap" (105x compute overhead)
         if batch_idx == 0:
-            self._validate_clinical_sampling(batch)
+            if self.cfg.get("debug", False):
+                try:
+                    self._validate_clinical_sampling(batch)
+                except Exception as e:
+                    logger.error(f"[DEBUG MODE] Clinical sampling failed: {e}")
+                    logger.error(traceback.format_exc())
+            else:
+                self._validate_clinical_sampling(batch)
 
         # Return for external callbacks (e.g., ClinicalMetricCallback)
         result = {}
@@ -725,7 +740,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # Sample using the *Teacher* (EMA) for best generation quality
         with self.ema_teacher_context():
             with torch.no_grad():
-                pred = self.model.sample(subset)
+                if self.cfg.get("debug", False):
+                    try:
+                        pred = self.model.sample(subset)
+                    except Exception as e:
+                        logger.error(f"[DEBUG MODE] model.sample failed: {e}")
+                        logger.error(traceback.format_exc())
+                        return # Skip the rest of clinical validation for this batch
+                else:
+                    pred = self.model.sample(subset)
         
         # A. Global MSE (Overall prediction quality)
         # [ROBUSTNESS FIX] Last line of defense: filter infinite values to prevent telemetry corruption

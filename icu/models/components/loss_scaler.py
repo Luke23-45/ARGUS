@@ -66,8 +66,8 @@ class UncertaintyLossScaler(nn.Module):
                 
                 total_loss += weighted_loss
                 
-                # Logging metrics
-                log_metrics[f"weight/{key}"] = 0.5 * precision.item()
-                log_metrics[f"sigma/{key}"] = torch.exp(0.5 * log_var).item()
+                # Logging metrics (Keep as tensors to avoid graph breaks)
+                log_metrics[f"weight/{key}"] = 0.5 * precision
+                log_metrics[f"sigma/{key}"] = torch.exp(0.5 * log_var)
                 
         return total_loss, log_metrics

@@ -56,10 +56,10 @@ class ConfidenceAwareGovernor(nn.Module):
         for i in range(B):
             # Flatten T, C for quantile calculation
             s = x[i].abs().view(-1)
-            # Calculate the percentile value for this specific sample
             # [FIX] torch.quantile requires float32 or float64, and q must match input dtype.
             # Cast both to float32 for compatibility with mixed precision/bfloat16.
-            thresh = torch.quantile(s.float(), p[i].float())
+            # [SOTA FIX] Detach to avoid graph retention in the safety threshold.
+            thresh = torch.quantile(s.detach().float(), p[i].float())
             # Clamp outliers to the threshold
             x_out[i] = torch.clamp(x[i], min=-thresh, max=thresh)
             

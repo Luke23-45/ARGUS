@@ -10,6 +10,12 @@ run_name: "gen_v1_${now:%Y-%m-%d_%H-%M-%S}"
 seed: 42
 compile_model: true
 
+# --- Debug Mode (Smoke Test) ---
+# Set to 'true' to run only a few batches for rapid verification.
+debug: false
+debug_limit_batches: 200
+debug_limit_val: 20
+
 # --- Directory Paths ---
 output_dir: "outputs/phase1"           # Main output directory
 checkpoint_dir: "/content/drive/MyDrive/pda/icu/checkpoints"  # Where checkpoints are saved

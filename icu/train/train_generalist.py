@@ -465,7 +465,9 @@ def main(cfg: DictConfig):
         accumulate_grad_batches=cfg.train.get("accumulate_grad_batches", 1),
         val_check_interval=cfg.train.get("val_check_interval", 1.0),
         # [PERF] Limit validation batches for speed during experimentation
-        limit_val_batches=cfg.train.get("limit_val_batches", 1.0),
+        limit_val_batches=cfg.get("debug_limit_val", 20) if cfg.get("debug", False) else cfg.train.get("limit_val_batches", 1.0),
+        # [DEBUG] Limit training batches for rapid smoke test
+        limit_train_batches=cfg.get("debug_limit_batches", 200) if cfg.get("debug", False) else 1.0,
         # [ROBUSTNESS] Enable model summary
         enable_model_summary=True,
         # [DDP] Sync batch norm for distributed training

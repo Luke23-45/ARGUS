@@ -119,9 +119,11 @@ DEFAULT_FEATURE_INDICES = {
     'resp': 5,        # Respiratory Rate (bpm)
     'temp': 6,        # Temperature (°C)
     'lactate': 7,     # Lactate (mmol/L)
-    'wbc': 8,         # White Blood Cell count (10^9/L)
-    'creatinine': 9,  # Creatinine (mg/dL)
-    'glucose': 10,    # Glucose (mg/dL)
+    'creatinine': 8,  # [FIX] Aligned to Clinical 28 Spec
+    'bilirubin': 9,   # [FIX] Aligned to Clinical 28 Spec
+    'platelets': 10,  # [FIX] Aligned to Clinical 28 Spec
+    'wbc': 11,         # [FIX] Aligned to Clinical 28 Spec
+    'glucose': 15,    # [FIX] Aligned to Clinical 28 Spec
 }
 
 
@@ -175,13 +177,17 @@ class ICUAdvantageCalculator(nn.Module):
             adaptive_clipping: Enable dynamic weight clipping (quantile-based)
         """
         super().__init__()
-        self.beta = beta
+        self.register_buffer("beta", torch.tensor(beta).float())
         self.gamma = gamma
         self.lambda_gae = lambda_gae
-        self.max_weight = max_weight
+        self.register_buffer("max_weight", torch.tensor(max_weight).float())
         self.sparse_scale = sparse_reward_scale
         self.shaping_coef = reward_shaping_coef
         self.focal_alpha = focal_alpha
+        
+        # [v2025 SOTA] State Buffers for DDP Synchronization
+        self.register_buffer("ess_buffer", torch.zeros(1))
+        self.register_buffer("clip_rate_buffer", torch.zeros(1))
         
         # [SOTA 2025] Adaptive Hyperparameters
         self.adaptive_beta = adaptive_beta
@@ -642,13 +648,15 @@ class ICUAdvantageCalculator(nn.Module):
             
             # Effective Sample Size (ESS)
             ess = (sum_w ** 2) / (sum_w_sq * numel + 1e-8)
+            self.ess_buffer.fill_(ess / numel) # Normalized ESS
             
             # Clipping Rate (Needed for adaptive safety)
             clipped_rate = (scaled_adv > max_exp_input).float().mean()
+            self.clip_rate_buffer.fill_(clipped_rate)
             
             # [SOTA 2025] Adaptive Dynamics Update (Uses current ESS & Rate)
             if self.adaptive_beta or self.adaptive_clipping:
-                self._update_adaptive_stats(advantages, weights, ess, clipped_rate.item())
+                self._update_adaptive_stats(advantages, weights, ess / numel, clipped_rate.item())
             
             # Weight Entropy (Information Theoretic)
             probs = weights_clipped / (sum_w + 1e-8)
@@ -664,12 +672,12 @@ class ICUAdvantageCalculator(nn.Module):
                 "weights_max": weights_clipped.max().item(),
                 "weights_mean": weights_clipped.mean().item(),
                 "weights_std": weights_clipped.std().item(),
-                "ess": ess.item(),
+                "ess": self.ess_buffer.item(),
                 "weight_entropy": entropy.item(),
-                "fp16_clipped_ratio": clipped_rate.item(),
+                "fp16_clipped_ratio": self.clip_rate_buffer.item(),
                 "hard_clipped_ratio": hard_clipped_rate.item(),
-                "beta_dynamic": self.beta, # [Telemetry]
-                "max_weight_dynamic": self.max_weight # [Telemetry]
+                "beta_dynamic": self.beta.item(), # [Telemetry]
+                "max_weight_dynamic": self.max_weight.item() # [Telemetry]
             }
         
         return weights_clipped, diagnostics
@@ -710,9 +718,9 @@ class ICUAdvantageCalculator(nn.Module):
                     
                     # Momentum Update (Reduced lag)
                     # 0.80 allows faster tracking of distribution shifts.
-                    self.beta = (0.80 * self.beta) + (0.20 * new_beta)
+                    self.beta.copy_((0.80 * self.beta) + (0.20 * new_beta))
                 
-                self.beta = max(self.min_beta, min(self.max_beta, self.beta))
+                self.beta.copy_(self.beta.clamp(min=self.min_beta, max=self.max_beta))
                 
             # B. Adaptive Clipping (Target = 95th Percentile)
             if self.adaptive_clipping:
@@ -720,16 +728,35 @@ class ICUAdvantageCalculator(nn.Module):
                 # We use 'weights' which is unclamped by max_weight (only FP16 clamped)
                 if weights.numel() > 0:
                     try:
-                        p95 = torch.quantile(weights.float(), 0.95).item()
+                        # [SOTA FIX] Quantile requires .detach().float() for safety
+                        p95 = torch.quantile(weights.detach().float(), 0.95).item()
                         
                         # Soft expansion: Allow clip to grow if signal is strong but stable
                         # We limit growth rate to avoid explosions
                         target_clip = max(2.0, min(100.0, p95 * 1.5)) # 1.5x buffer
                         
-                        self.max_weight = (self.clip_momentum * self.max_weight) + \
+                        new_max_weight = (self.clip_momentum * self.max_weight) + \
                                           ((1 - self.clip_momentum) * target_clip)
+                        self.max_weight.copy_(torch.tensor(new_max_weight).to(self.max_weight.device))
                     except:
                         pass # Fallback if quantile fails (e.g. not enough elements)
+
+            # [DDP SYNCHRONIZATION] Prevent divergence of adaptive parameters across ranks
+            if torch.distributed.is_initialized():
+                with torch.no_grad():
+                    # Average beta and max_weight across all ranks
+                    torch.distributed.all_reduce(self.beta, op=torch.distributed.ReduceOp.SUM)
+                    self.beta.div_(torch.distributed.get_world_size())
+                    
+                    torch.distributed.all_reduce(self.max_weight, op=torch.distributed.ReduceOp.SUM)
+                    self.max_weight.div_(torch.distributed.get_world_size())
+                    
+                    # Also sync metric buffers for consistent telemetry
+                    torch.distributed.all_reduce(self.ess_buffer, op=torch.distributed.ReduceOp.SUM)
+                    self.ess_buffer.div_(torch.distributed.get_world_size())
+                    
+                    torch.distributed.all_reduce(self.clip_rate_buffer, op=torch.distributed.ReduceOp.SUM)
+                    self.clip_rate_buffer.div_(torch.distributed.get_world_size())
 
     def calculate_weights(
         self, 
