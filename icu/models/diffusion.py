@@ -47,6 +47,19 @@ import torch.nn.functional as F
 # Gradient checkpointing for memory efficiency
 from torch.utils.checkpoint import checkpoint
 
+# SOTA Components
+from icu.models.components.geometric_projector import GeometricProjector
+from icu.models.components.temporal_sampler import TemporalSampler
+from icu.models.components.nth_encoder import NTHEncoderBlock
+from icu.models.components.sequence_aux_head import SequenceAuxHead
+from icu.models.components.loss_scaler import UncertaintyLossScaler
+
+# [PHASE 4-5] Agentic Evolution Components
+from icu.models.components.risk_scorer import PhysiologicalRiskScorer
+from icu.models.components.adaptive_sampler import StateAwareSampler
+from icu.models.components.clinical_governor import ConfidenceAwareGovernor
+from icu.utils.stability import DynamicThresholding
+
 # Setup Logger
 logger = logging.getLogger("ICU_Diffusion_v11")
 
@@ -101,6 +114,11 @@ class ICUConfig:
 
     # Stable Sampling [v18.0]
     use_dynamic_thresholding: bool = True
+    
+    # [v11.0] Agentic Evolution
+    min_sampling_steps: int = 25
+    base_safety_percentile: float = 0.99
+    min_safety_percentile: float = 0.90
 
 # =============================================================================
 # 2. LOW-LEVEL PRIMITIVES (Mask-Aware & Robust)
@@ -460,24 +478,20 @@ class TemporalFusionEncoder(nn.Module):
         self.cfg = cfg
         
         # Projects
-        # [CRITICAL FIX v3.0] vitals_proj only processes DYNAMIC features (22 channels)
-        # Static features (6 channels) are processed separately via static_proj
-        # This prevents "Demographic Drowning" where static features at every timestep
-        # drown out the actual physiological dynamics
-        
-        # [v12.0] Imputation Awareness
-        # If enabled, we concatenate the imputation mask (22 dynamic channels) to the input.
-        input_channels = 22 * 2 if cfg.use_imputation_masks else 22
-        
-        self.vitals_proj = nn.Linear(input_channels, cfg.d_model)  # NOT cfg.input_dim (28)
+        # [SOTA Phase 1] Geometric Projector
+        self.vitals_proj = GeometricProjector(cfg.d_model, use_imputation_masks=cfg.use_imputation_masks)
         self.static_proj = nn.Linear(cfg.static_dim, cfg.d_model)
         
-        # RoPE for history sequence
+        # [SOTA Phase 1] Temporal Sampler
+        self.temporal_sampler = TemporalSampler(cfg.d_model)
+
+        # RoPE for history sequence (Legacy: NTHEncoder handles its own RoPE now, but kept for compatibility if mixed)
         self.rope = RotaryEmbedding(cfg.d_model // cfg.n_heads, max_seq_len=cfg.history_len + 24)
         
-        # Encoder Layers
+        # Encoder Layers (NTH Architecture)
         self.layers = nn.ModuleList([
-            EncoderBlock(cfg) for _ in range(cfg.encoder_layers)
+            NTHEncoderBlock(cfg.d_model, cfg.n_heads, hidden_dim=cfg.d_model * 2) 
+            for _ in range(cfg.encoder_layers)
         ])
         
         # Pooling Strategy (v10.0 adds TimeAttentionPooling option)
@@ -525,13 +539,45 @@ class TemporalFusionEncoder(nn.Module):
             if imputation_mask is not None:
                 # Slice mask to dynamic features only
                 mask_dynamic = imputation_mask[..., :22]
-                network_input = torch.cat([past_vitals_dynamic, mask_dynamic], dim=-1)
+                
+                # [CRITICAL FIX v12.1] Geometric Group Alignment
+                # GeometricProjector expects: [Hemo_V, Hemo_M, Lab_V, Lab_M, Elec_V, Elec_M]
+                # Default "cat" produces: [All_V, All_M] which misaligns the groups.
+                
+                # 1. Hemodynamics (Indices 0-6)
+                hemo_v = past_vitals_dynamic[..., 0:7]
+                hemo_m = mask_dynamic[..., 0:7]
+                hemo_grp = torch.cat([hemo_v, hemo_m], dim=-1) # 14 channels
+                
+                # 2. Labs (Indices 7-17)
+                labs_v = past_vitals_dynamic[..., 7:18]
+                labs_m = mask_dynamic[..., 7:18]
+                labs_grp = torch.cat([labs_v, labs_m], dim=-1) # 22 channels
+                
+                # 3. Electrolytes (Indices 18-21)
+                elec_v = past_vitals_dynamic[..., 18:22]
+                elec_m = mask_dynamic[..., 18:22]
+                elec_grp = torch.cat([elec_v, elec_m], dim=-1) # 8 channels
+                
+                # Final Interleaved Input
+                network_input = torch.cat([hemo_grp, labs_grp, elec_grp], dim=-1)
             else:
                 # Fallback: Assume all real (ones) if no mask provided but expected
-                # Or zeros if strictly missing? Ones (Real) is safer default for conditioning.
-                # However, dataset usually provides it.
                 mask_dynamic = torch.ones_like(past_vitals_dynamic)
-                network_input = torch.cat([past_vitals_dynamic, mask_dynamic], dim=-1)
+                # Apply same interleaving fallback
+                hemo_v = past_vitals_dynamic[..., 0:7]
+                hemo_m = mask_dynamic[..., 0:7]
+                hemo_grp = torch.cat([hemo_v, hemo_m], dim=-1)
+                
+                labs_v = past_vitals_dynamic[..., 7:18]
+                labs_m = mask_dynamic[..., 7:18]
+                labs_grp = torch.cat([labs_v, labs_m], dim=-1)
+                
+                elec_v = past_vitals_dynamic[..., 18:22]
+                elec_m = mask_dynamic[..., 18:22]
+                elec_grp = torch.cat([elec_v, elec_m], dim=-1)
+                
+                network_input = torch.cat([hemo_grp, labs_grp, elec_grp], dim=-1)
         else:
             network_input = past_vitals_dynamic
 
@@ -539,6 +585,19 @@ class TemporalFusionEncoder(nn.Module):
         x_seq = self.vitals_proj(network_input)  # [B, T, D]
         x_static = self.static_proj(static_context).unsqueeze(1)  # [B, 1, D]
         
+        # 2. Concat Static (Prepend) -- MOVED BELOW SAMPLER
+        # Sequence: [Static, H_0, H_1, ..., H_23]
+        # x = torch.cat([x_static, x_seq], dim=1)
+        
+            
+        # 4. RoPE (Global Time 0..T) - Generated for consistency but NTH uses internal
+        # Note: We generate this AFTER concat to get full length embeddings if needed
+        
+        # 4b. Temporal Sampling (Volatility Aware)
+        # [SOTA REFINEMENT]: Apply only to dynamic history (x_seq), NOT static.
+        # Volatility between Static->Time0 is meaningless.
+        x_seq, sample_weights = self.temporal_sampler(x_seq, padding_mask)
+
         # 2. Concat Static (Prepend)
         # Sequence: [Static, H_0, H_1, ..., H_23]
         x = torch.cat([x_static, x_seq], dim=1)
@@ -556,17 +615,14 @@ class TemporalFusionEncoder(nn.Module):
             # Create a [B, T] mask of Falses
             valid_seq = torch.zeros(B, T, dtype=torch.bool, device=x.device)
             full_mask = torch.cat([valid_static, valid_seq], dim=1)
-            
-        # 4. RoPE (Global Time 0..T)
-        cos, sin = self.rope(x.shape[1], x.device, offset=0)
-        
-        # 5. Encoding
+
+        # 5. Encoding (NTH-Attention)
         for layer in self.layers:
-            if self.cfg.gradient_checkpointing:
-                x = checkpoint(layer, x, cos, sin, full_mask, use_reentrant=False)
-            else:
-                x = layer(x, cos, sin, full_mask)
-        
+            # NTHEncoderBlock signature: (x, mask=None)
+            x = layer(x, mask=full_mask) 
+            # Note: We ignore 'cos', 'sin' here as NTHEncoderBlock has internal RoPE.
+            # If we wanted to use global RoPE, we'd need to modify NTHEncoder.
+            
         x = self.out_norm(x)
         
         # 6. Masked Pooling -> Global Context
@@ -975,12 +1031,20 @@ class ICUUnifiedPlanner(nn.Module):
         
         # APEX Auxiliary Heads (Hardened)
         if cfg.use_auxiliary_head:
-            # Replaced with 2025 SOTA ClinicalResidualHead
-            self.aux_head = ClinicalResidualHead(
-                input_dim=cfg.d_model, 
-                output_dim=cfg.num_phases,
-                dropout=0.1
+            # Replaced with 2025 SOTA SequenceAuxHead
+            self.aux_head = SequenceAuxHead(
+                d_model=cfg.d_model, 
+                num_classes=cfg.num_phases, # Usually 3 phases? Or binary?
+                # SequenceAuxHead supports multi-class output projection.
+                # However, Asymmetric Loss is typically binary/multi-label.
+                # If num_phases=3 (Stable/Pre/Shock), it's multi-class.
+                # NTH SequenceAuxHead output shape is [B, num_classes].
+                num_layers=2,
+                n_heads=4
             )
+            
+            # [SOTA Phase 1] Uncertainty Loss Scaler
+            self.loss_scaler = UncertaintyLossScaler(num_tasks=2)
             
         # Dense Value Head for GAE-Lambda (AWR)
         # Replaced with 2025 SOTA ClinicalResidualHead
@@ -994,7 +1058,28 @@ class ICUUnifiedPlanner(nn.Module):
         # [v10.0] Physics Loss for both training and PGS
         self.phys_loss = PhysiologicalConsistencyLoss()
         
+        # [v13.0 SOTA FIX] Dynamic Manifold Governance
+        # Replaces hard clamps with Google Imagen-style thresholding
+        self.governance = DynamicThresholding(percentile=0.995, threshold=3.0)
+        
+        # =====================================================================
+        # [NEW] AGENTIC EVOLUTION CORE (Phases 4-5)
+        # =====================================================================
+        self.risk_scorer = PhysiologicalRiskScorer()
+        # Phase 4: Adaptive Compute
+        self.adaptive_sampler = StateAwareSampler(
+            min_steps=cfg.min_sampling_steps, 
+            max_steps=cfg.timesteps
+        )
+        # Phase 5: Teacher Governance
+        self.clinical_governor = ConfidenceAwareGovernor(
+            base_p=cfg.base_safety_percentile,
+            min_p=cfg.min_safety_percentile
+        )
+        self.clinical_feat_idx = {'map': 1, 'lactate': 8, 'spo2': 3, 'hr': 0}
+
         # Hooks for Normalizer
+        logger.info(f"[APEX PLANNER] Initialized v11.0 Agentic: {self.cfg.d_model}d, {self.cfg.n_layers}L")
         from icu.datasets.normalizer import ClinicalNormalizer
         self.normalizer = ClinicalNormalizer(ts_channels=cfg.input_dim, static_channels=cfg.static_dim)
 
@@ -1076,9 +1161,9 @@ class ICUUnifiedPlanner(nn.Module):
                     # 2. Calculate
                     guess_x0 = (noisy_fut - torch.sqrt(1 - alpha_bar) * guess_eps) / sqrt_alpha_clamped
 
-                    # 3. Manifold Constraint (Keep it within valid normalized bounds)
-                    guess_x0 = guess_x0.clamp(-3.0, 3.0)
-                    self_cond_tensor = guess_x0.detach()
+                    # 3. Manifold Constraint (SOTA Governance)
+                    # Replaces guess_x0.clamp(-3.0, 3.0) with dynamic thresholding
+                    self_cond_tensor = self.governance(guess_x0).detach()
 
         # Pass 2: Final Denoising with Conditioning
         pred_noise = self.backbone(noisy_fut, t, ctx_seq, global_ctx, ctx_mask, self_cond=self_cond_tensor)
@@ -1089,29 +1174,40 @@ class ICUUnifiedPlanner(nn.Module):
             diff_loss = F.mse_loss(pred_noise, noise_eps, reduction='none').mean(dim=[1, 2])
             
             if self.cfg.use_auxiliary_head and "phase_label" in batch:
-                logits = self.aux_head(global_ctx)
-                K = 3  # Target clinical phases
-                effective_logits = logits[:, :K] if logits.shape[-1] > K else logits
-                aux_loss = F.cross_entropy(effective_logits, batch["phase_label"].long(), reduction='none')
+                # [SOTA Upgrade] SequenceAuxHead takes (x_seq, mask, targets)
+                # We use ctx_seq from Encoder (result of TemporalSampler + NTH)
+                # ctx_seq: [B, T', D] 
+                # ctx_mask: [B, T']
+                # Targets: phase_label [B]
+                
+                # Note: SequenceAuxHead returns (logits, loss).
+                logits, sota_aux_loss = self.aux_head(
+                    ctx_seq, 
+                    mask=ctx_mask, 
+                    targets=batch["phase_label"].long() if batch["phase_label"] is not None else None
+                )
+                
+                # If sota_aux_loss is returned, use it directly (includes Asymmetric Logic)
+                if sota_aux_loss is not None:
+                    aux_loss = sota_aux_loss 
+                else:
+                    # Fallback (shouldn't happen if targets provided)
+                    aux_loss = F.cross_entropy(logits, batch["phase_label"].long(), reduction='none')
             else:
                 aux_loss = torch.zeros(B, device=past.device)
         else:
             diff_loss = F.mse_loss(pred_noise, noise_eps)
-            aux_loss = torch.tensor(0.0, device=past.device)
-            
             if self.cfg.use_auxiliary_head and "phase_label" in batch:
-                logits = self.aux_head(global_ctx)
-                
-                # SOTA: Apply class weighting for the 3.1% Sepsis Imbalance
-                w = batch.get("aux_weight") 
-                
-                # [CRITICAL FIX v3.0] Handle num_phases > labels mismatch (e.g. 6 vs 3)
-                effective_logits = logits
-                if w is not None and logits.shape[-1] > w.shape[0]:
-                    effective_logits = logits[:, :w.shape[0]]
-                
-                aux_loss = F.cross_entropy(effective_logits, batch["phase_label"].long(), weight=w)
-                
+                # Scaler handles reduction usually, but here we return scalar
+                 logits, sota_aux_loss = self.aux_head(
+                    ctx_seq, 
+                    mask=ctx_mask, 
+                    targets=batch["phase_label"].long()
+                )
+                 aux_loss = sota_aux_loss
+            else:
+                aux_loss = torch.tensor(0.0, device=past.device)
+            
         # 5. Value Prediction (Critic for AWR)
         pred_val = self.value_head(global_ctx)
         value_loss = torch.tensor(0.0, device=past.device)
@@ -1146,12 +1242,21 @@ class ICUUnifiedPlanner(nn.Module):
         
         # Total loss (Value weight 0.5 is standard for AWR baselines)
         # Total loss (Value weight 0.5 is standard for AWR baselines)
-        total = diff_loss + self.cfg.aux_loss_scale * aux_loss + 0.5 * value_loss
+        # Total loss (Value weight 0.5 is standard for AWR baselines)
+        # [SOTA Upgrade] Use Uncertainty Scaler if available
+        if hasattr(self, 'loss_scaler') and self.cfg.use_auxiliary_head:
+            losses = {'diffusion': diff_loss, 'aux': aux_loss}
+            total, logs = self.loss_scaler(losses)
+            total = total + 0.5 * value_loss
+        else:
+            total = diff_loss + self.cfg.aux_loss_scale * aux_loss + 0.5 * value_loss
+            logs = {}
         
         # Compute aux_logits for return (needed by callbacks)
-        aux_logits = self.aux_head(global_ctx) if self.cfg.use_auxiliary_head else None
+        # Use logits computed earlier (from SequenceAuxHead)
+        aux_logits = logits if self.cfg.use_auxiliary_head else None
         
-        return {
+        ret = {
             "loss": total,
             "diffusion_loss": diff_loss,
             "aux_loss": aux_loss,
@@ -1159,9 +1264,15 @@ class ICUUnifiedPlanner(nn.Module):
             "value_loss": value_loss,
             "pred_value": pred_val
         }
+        ret.update(logs) # Add sigma/weight logs
+        return ret
+
 
     @torch.no_grad()
-    def sample(self, batch: Dict[str, torch.Tensor], num_steps: Optional[int] = None) -> torch.Tensor:
+    def sample(self, 
+               batch: Dict[str, torch.Tensor], 
+               num_steps: Optional[int] = None, 
+               teacher_model: Optional[nn.Module] = None) -> torch.Tensor:
         """
         [v10.0] Physics-Guided Sampling Loop.
         
@@ -1170,10 +1281,6 @@ class ICUUnifiedPlanner(nn.Module):
         
         This is the inference-time generation method.
         
-        Args:
-            batch: Dictionary containing observed_data, static_context, src_mask
-            num_steps: Number of denoising steps (defaults to cfg.timesteps)
-        
         Returns:
             [B, T_pred, 28] - Generated future vitals (in clinical units)
         """
@@ -1181,14 +1288,30 @@ class ICUUnifiedPlanner(nn.Module):
         static = batch["static_context"]
         src_mask = batch.get("src_mask", None)
         
+        # [PHASE 4] Adaptive Compute & Risk Scoring
+        risk_coef = self.risk_scorer(past, self.clinical_feat_idx)
+        if num_steps is None:
+            steps_batch = self.adaptive_sampler.calculate_steps(risk_coef)
+            steps = int(steps_batch.max().item())
+            logger.info(f"[Agentic Sample] Adaptive Horizon: {steps} steps (Risk range: {risk_coef.min():.2f}-{risk_coef.max():.2f})")
+        else:
+            steps = num_steps
+        
         B = past.shape[0]
         
         # 1. Perception (Encode history)
         past_norm, static_norm = self.normalize(past, static)
         
         # [v12.1] Robust Padding Detection (Inference)
-        # [v16.0] FIX: Disable unsafe padding inference.
-        padding_mask = None
+        # [v12.1] Robust Padding Detection (Inference)
+        # Check batch for mask, default to None if missing
+        padding_mask = batch.get("padding_mask", None)
+        
+        # [Phase 2 Audit] Fallback: If no explicit padding mask, infer from src_mask (Standard logic)
+        if padding_mask is None and src_mask is not None:
+             # src_mask is [B, T, 28]. If all channels are 0/Nan -> Padding.
+             if src_mask.dim() == 3:
+                 padding_mask = (src_mask.sum(dim=-1) == 0)
              
         ctx_seq, global_ctx, ctx_mask = self.encoder(
             past_norm, static_norm, 
@@ -1198,7 +1321,7 @@ class ICUUnifiedPlanner(nn.Module):
         
         # 2. Initialize from pure noise
         x_t = torch.randn(B, self.cfg.pred_len, self.cfg.input_dim, device=past.device)
-        steps = num_steps or self.cfg.timesteps
+        # steps already calculated above
         
         # [v10.0] Initialize Self-Conditioning Buffer (Analog Bits)
         x_self_cond = torch.zeros_like(x_t)
@@ -1248,39 +1371,40 @@ class ICUUnifiedPlanner(nn.Module):
 
 
             # --- B. Standard Diffusion Step ---
-            out = self.backbone(x_t, t, ctx_seq, global_ctx, ctx_mask, self_cond=x_self_cond)
+            out_student = self.backbone(x_t, t, ctx_seq, global_ctx, ctx_mask, self_cond=x_self_cond)
+            
+            # [PHASE 5] Teacher Governance (Audit)
+            distrust = None
+            if teacher_model is not None:
+                # Use teacher's encoder or just the backbone if encoders are shared
+                _, t_global_ctx, _ = teacher_model.encoder(past_norm, static_norm, padding_mask=padding_mask)
+                out_teacher = teacher_model.backbone(x_t, t, ctx_seq, t_global_ctx, ctx_mask, self_cond=x_self_cond)
+                
+                distrust = self.clinical_governor.calculate_distrust(out_student, out_teacher, risk_coef)
+                p_eff = self.clinical_governor.get_dynamic_percentile(distrust)
+            else:
+                p_eff = torch.full((B,), self.clinical_governor.base_p, device=x_t.device)
+
+            # Apply Confidence-Aware Governance
+            out = self.clinical_governor.apply_governance(out_student, p_eff)
             
             # [v10.0] Update Self-Conditioning for next step
             # We need x0 estimate to condition the next step.
             alpha_bar = self.scheduler.alphas_cumprod[t][:, None, None]
             sqrt_alpha = torch.sqrt(alpha_bar).clamp(min=1e-3)
-            x_self_cond = (x_t - torch.sqrt(1 - alpha_bar) * out) / sqrt_alpha
-            x_self_cond = x_self_cond.clamp(-3.0, 3.0) # Manifold Constraint
-            x_self_cond = x_self_cond.detach()
+            x_self_cond_raw = (x_t - torch.sqrt(1 - alpha_bar) * out) / sqrt_alpha
+            
+            # [v13.0 SOTA FIX] Dynamic Manifold Governance (Sampler)
+            x_self_cond = self.governance(x_self_cond_raw).detach()
 
             
             # Step (DDIM or DDPM)
             x_t = self.scheduler.step(out, t, x_t, use_ddim=self.cfg.use_ddim_sampling)
             
             # --- C. SOTA Stability Patches ---
-            # [v18.0] Dynamic Thresholding (Google Imagen)
-            # This prevents sampling drift by scaling the vector if extreme values are predicted.
-            # Unlike hard clamping, it preserves the relative "shape" of the prediction.
-            if getattr(self.cfg, "use_dynamic_thresholding", True):
-                # 1. Calculate per-sample s-th percentile of absolute values
-                # We use 99.5th percentile as recommended in Saharia et al.
-                abs_x0 = torch.abs(x_self_cond)
-                s = torch.quantile(abs_x0.view(B, -1), 0.995, dim=1).view(B, 1, 1)
-                
-                # 2. Scale factor: If s > threshold, scale x0 back to threshold range
-                # Our "Threshold" is the 3-sigma clinical boundary
-                threshold = 3.0
-                s = torch.clamp(s, min=threshold)
-                x_self_cond = x_self_cond * (threshold / s)
-            
-            # [SAFETY] Iterative Manifold Clamp
-            # Last defense to prevent infinite recursion
-            x_t = x_t.clamp(-5.0, 5.0)
+            # [v13.0] Final Manifold Projection
+            # We apply governance to the final x_t estimate
+            x_t = self.governance(x_t).detach()
 
         # Final denormalization with one last safety check
-        return self.unnormalize(x_t.clamp(-5.0, 5.0))
+        return self.unnormalize(self.governance(x_t))

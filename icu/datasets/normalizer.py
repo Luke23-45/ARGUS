@@ -616,23 +616,26 @@ class ClinicalNormalizer(nn.Module):
         s_max = self.ts_stat_max.to(x_ts_norm.device).view(view_shape)
         l_mask = self.log_mask.to(x_ts_norm.device).view(view_shape)
         
-        # 1. Inverse linear scaling: [-1, 1] → [0, 1] → [s_min, s_max]
+        # 2. Inverse linear scaling: [-1, 1] → [0, 1] → [s_min, s_max]
         x_01 = (x_ts_norm + 1.0) / 2.0
         x_scaled = x_01 * (s_max - s_min) + s_min
         
-        # 2. Inverse log transform (expm1 for channels with log_mask)
-        # [SOTA FIX] Soft-Saturating Tanh-Guard
-        # Prevents exp overflow from wild predictions (+1000 sigma).
-        # We scale input so it saturates smoothly around 10.0 (e^10 ~ 22,000).
-        x_log_input = torch.where(
-            l_mask, 
-            10.0 * torch.tanh(x_scaled / 10.0), 
-            x_scaled
-        )
+        # 3. [SOTA 2025 FIX] Tanh-Guard Protection (Log-Targeted)
+        # We apply soft-saturation specifically to the input of the exponential 
+        # transform. This prevents e^x explosions.
+        # We also apply a much wider guard (1000.0) to linear channels as a 
+        # last-resort safety against INF.
+        LOG_GUARD = 10.0
+        LINEAR_GUARD = 1000.0
+        
+        x_log_input = LOG_GUARD * torch.tanh(x_scaled / LOG_GUARD)
+        x_linear_input = LINEAR_GUARD * torch.tanh(x_scaled / LINEAR_GUARD)
+        
+        # 4. Inverse log transform (expm1)
         x_exp = torch.expm1(x_log_input)
         
-        # 3. Select log vs linear based on mask
-        x_final = torch.where(l_mask, x_exp, x_scaled)
+        # 5. Select based on mask
+        x_final = torch.where(l_mask, x_exp, x_linear_input)
         
         return x_final
 
@@ -659,13 +662,20 @@ class ClinicalNormalizer(nn.Module):
         # Undo z-score normalization
         x = x * self._instance_std + self._instance_mean
         
-        # Undo log transform for applicable channels
+        # 3. [SOTA 2025 FIX] Tanh-Guard Protection (Log-Targeted)
+        LOG_GUARD = 10.0
+        LINEAR_GUARD = 1000.0
+        
+        x_log_guarded = LOG_GUARD * torch.tanh(x / LOG_GUARD)
+        x_linear_guarded = LINEAR_GUARD * torch.tanh(x / LINEAR_GUARD)
+        
+        # 4. Undo log transform for applicable channels
         rank = len(x.shape)
         view_shape = [1] * (rank - 1) + [-1]
         l_mask = self.log_mask.to(x.device).view(view_shape)
         
-        x_exp = torch.expm1(x)
-        x_final = torch.where(l_mask, x_exp, x)
+        x_exp = torch.expm1(x_log_guarded)
+        x_final = torch.where(l_mask, x_exp, x_linear_guarded)
         
         return x_final
 

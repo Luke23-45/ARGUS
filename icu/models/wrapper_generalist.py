@@ -82,6 +82,14 @@ from icu.utils.metrics_advanced import (
     compute_overconfidence_error
 )
 from icu.utils.safety import OODGuardian
+from icu.utils.stability import ForensicStabilityAuditor
+from icu.models.components.loss_scaler import UncertaintyLossScaler
+
+# [PHASE 1-3] Agentic Evolution Components
+from icu.models.components.risk_scorer import PhysiologicalRiskScorer
+from icu.models.components.risk_aware_loss import RiskAwareAsymmetricLoss
+from icu.models.components.safety_envelope import PhysiologicalSafetyEnvelope
+from icu.models.components.horizon_scheduler import ClinicalHorizonScheduler
 
 # Specialized Metric Collection
 from torchmetrics import MeanSquaredError, Accuracy, MeanMetric, AUROC, Precision, Recall, F1Score
@@ -130,6 +138,47 @@ def get_cosine_schedule_with_warmup(
 # =============================================================================
 
 
+class DynamicClassBalancer(nn.Module):
+    """
+    [SOTA 2025] Dynamic Class Balancing for Online Learning.
+    Adapts loss weights based on running class prevalence to handle
+    imbalanced streams (Standard vs Sepsis).
+    Uses Effective Number of Samples (ENS) logic.
+    """
+    def __init__(self, num_classes: int, beta: float = 0.99, prior_pos_weight: float = None):
+        super().__init__()
+        self.num_classes = num_classes
+        self.beta = beta
+        self.register_buffer("counts", torch.zeros(num_classes))
+        self.register_buffer("initialized", torch.tensor(False))
+        
+        if prior_pos_weight is not None and num_classes > 1 and prior_pos_weight > 0:
+             n_neg = 1000.0
+             n_pos_each = n_neg / prior_pos_weight
+             self.counts[0] = n_neg
+             self.counts[1:] = n_pos_each
+             self.initialized.fill_(True)
+
+    def update(self, y: torch.Tensor):
+        if not self.initialized:
+            y = y.long()
+            b_counts = torch.bincount(y, minlength=self.num_classes).float()
+            self.counts.copy_(b_counts + 1.0)
+            self.initialized.fill_(True)
+        else:
+            y = y.long()
+            b_counts = torch.bincount(y, minlength=self.num_classes).float()
+            new_counts = self.beta * self.counts + (1 - self.beta) * b_counts
+            self.counts.copy_(new_counts)
+
+    def get_weights(self) -> torch.Tensor:
+        safe_counts = self.counts + 1.0 
+        total = safe_counts.sum()
+        weights = total / (self.num_classes * safe_counts)
+        weights = weights / (weights.mean() + 1e-8)
+        return weights
+
+
 
 class ICUGeneralistWrapper(pl.LightningModule):
     """
@@ -176,11 +225,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
         logger.info(f"Using balancing mode: {self.balancing_mode}")
 
         if self.balancing_mode == "sota_2025":
-            # Learnable log-variances for Uncertainty Weighting (Kendall et al. 2018)
-            self.log_var_diff = nn.Parameter(torch.tensor(0.0))
-            self.log_var_aux = nn.Parameter(torch.tensor(0.0))
-            self.log_var_critic = nn.Parameter(torch.tensor(0.0))
-            logger.info("Initializing Uncertainty Weighting Parameters...")
+            # [SOTA 2025] Use Model's internal UncertaintyLossScaler
+            logger.info("Using Model's UncertaintyLossScaler for balancing.")
         
         # Authority check: EMACallback will attach here as self.ema
         self.ema = None 
@@ -193,7 +239,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
             beta=cfg.train.get("awr_beta", 0.05),
             max_weight=cfg.train.get("awr_max_weight", 50.0),
             lambda_gae=cfg.train.get("awr_lambda", 0.95),
-            gamma=cfg.train.get("awr_gamma", 0.99)
+            gamma=cfg.train.get("awr_gamma", 0.99),
+            adaptive_beta=cfg.train.get("adaptive_beta", True),
+            adaptive_clipping=cfg.train.get("adaptive_clipping", True)
         )
         
         # =====================================================================
@@ -211,6 +259,39 @@ class ICUGeneralistWrapper(pl.LightningModule):
         
         self.base_phys_weight = cfg.train.get("phys_loss_weight", 0.2)
         self.safety_guardian = OODGuardian()
+        self.forensic_auditor = ForensicStabilityAuditor(guardian=self.safety_guardian)
+        
+        # --- Internal Buffers ---
+        pos_weight = cfg.train.get("pos_weight", None)
+        self.class_balancer = DynamicClassBalancer(
+            num_classes=cfg.model.get("num_phases", 3),
+            prior_pos_weight=pos_weight
+        )
+        self.model.loss_scaler = UncertaintyLossScaler(num_tasks=2) # Diffusion + Aux
+        
+        # =====================================================================
+        # [NEW] AGENTIC EVOLUTION CORE (Phases 1-3)
+        # =====================================================================
+        # Phase 1: Dynamic Diagnostics
+        self.risk_scorer = PhysiologicalRiskScorer()
+        self.risk_aware_loss = RiskAwareAsymmetricLoss(
+            gamma_neg=cfg.train.get("asl_gamma_neg", 4.0),
+            gamma_pos=cfg.train.get("asl_gamma_pos", 0.0),
+            critical_multiplier=cfg.train.get("risk_multiplier", 2.0)
+        )
+        
+        # Phase 2: Per-Feature Safety
+        # Mapping for Frontier 28: MAP=1, Lactate=8, SpO2=3, HR=0
+        self.clinical_feat_idx = {'map': 1, 'lactate': 8, 'spo2': 3, 'hr': 0}
+        self.safety_envelope = PhysiologicalSafetyEnvelope(self.clinical_feat_idx)
+        
+        # Phase 3: Longitudinal Convergence
+        self.horizon_scheduler = ClinicalHorizonScheduler(
+            start_gamma=cfg.train.get("start_gamma", 0.80),
+            end_gamma=cfg.train.get("end_gamma", 0.99),
+            warmup_epochs=cfg.train.get("horizon_warmup", 10),
+            ramp_epochs=cfg.train.get("horizon_ramp", 40)
+        )
         
         # =====================================================================
         # 5. TRAINING TELEMETRY (Accumulated Metrics)
@@ -260,7 +341,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # =====================================================================
         # 7. STATE FLAGS
         # =====================================================================
-        self._awr_stats_initialized = False
+        self.register_buffer("_awr_stats_initialized", torch.tensor(False))
+
+    def on_train_epoch_start(self):
+        """[Phase 3] Update AWR Horizon based on curriculum."""
+        new_gamma = self.horizon_scheduler.get_gamma(self.current_epoch)
+        # Note: gamma is a float attribute on the nn.Module
+        self.awr_calculator.gamma = new_gamma
+        logger.info(f"[Epoch {self.current_epoch}] Agentic Foresight: Gamma={new_gamma:.4f} "
+                    f"({self.horizon_scheduler.get_foresight_hours(new_gamma):.1f}h)")
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -290,6 +379,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
         past_norm, static_norm = self.model.normalize(past, static)
         fut_norm, _ = self.model.normalize(fut, None)
         
+        # [PHASE 1] Dynamic Risk Scoring
+        risk_coef = self.risk_scorer(past, self.clinical_feat_idx)
+        
         # [v25.1 SAFETY FIX] Convert per-feature mask to per-timestep mask
         # src_mask: [B, T, 28] (0=Missing, 1=Valid)
         # padding_mask: [B, T] (True=Pad/Ignore, False=Keep/Attend)
@@ -316,35 +408,58 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
         # B. Advantage Engine (AWR with authoritative EMA Teacher)
         with torch.no_grad():
-            rewards = self.awr_calculator.compute_clinical_reward(fut, batch.get("outcome_label", None))
+            rewards = self.awr_calculator.compute_clinical_reward(
+                fut, 
+                batch.get("outcome_label", None),
+                normalizer=self.model.normalizer
+            )
             # [SOTA] Use Teacher Context for bootstrapping
             with self.ema_teacher_context():
-                _, teacher_ctx, _ = self.model.encoder(past_norm, static_norm, src_mask)
-                target_values = self.model.value_head(teacher_ctx)
+                teacher_seq, teacher_global, teacher_mask = self.model.encoder(
+                    past_norm, 
+                    static_norm, 
+                    imputation_mask=src_mask, 
+                    padding_mask=bool_padding_mask
+                )
+                target_values = self.model.value_head(teacher_global)
             
             advantages = self.awr_calculator.compute_gae(rewards, target_values)
             returns = (advantages + target_values).detach()
             
             # [2025 SOTA] High-Pressure AWR Weights
-            weights_awr, diag = self.awr_calculator.calculate_weights(advantages.mean(dim=1))
+            weights_awr, diag = self.awr_calculator.calculate_weights(
+                advantages.mean(dim=1),
+                values=target_values.mean(dim=1),
+                rewards=returns.mean(dim=1)
+            )
             weights_awr = weights_awr / (weights_awr.mean() + 1e-8)
+            weights_awr_log = {"train/awr_ess": diag["ess"]}
 
         diff_loss = (raw_diff_loss * weights_awr).mean()
+        self.train_awr_ess.update(weights_awr_log.get("train/awr_ess", 0.0))
         
         # C. Critic Task (Robust SmoothL1)
         pred_values = self.model.value_head(global_ctx)
         critic_loss = smooth_l1_critic_loss(pred_values, returns)
         
-        # D. Auxiliary Task (Clinical Phase Classification)
+        # D. Auxiliary Task (MoE / Sepsis Diagnostics)
         aux_loss = torch.tensor(0.0, device=self.device)
-        if self.model.cfg.use_auxiliary_head and "phase_label" in batch:
-            aux_logits = self.model.aux_head(global_ctx)
-            aux_loss = F.cross_entropy(aux_logits, batch["phase_label"].long())
+        if self.cfg.model.use_auxiliary_head and "phase_label" in batch:
+            # [SOTA FIX] Alignment: Use teacher_mask (length 25) to match teacher_seq.
+            # Raw bool_padding_mask (length 24) causes off-by-one mismatch in AuxHead.
+            logits, _ = self.model.aux_head(teacher_seq, mask=teacher_mask)
+            
+            # [SOTA FIX] Align targets for RiskAwareAsymmetricLoss (Expects one-hot if multi-class)
+            targets = batch["phase_label"]
+            if logits.shape[-1] > 1 and targets.ndim == 1:
+                targets = F.one_hot(targets.long(), num_classes=logits.shape[-1]).float()
+            elif logits.shape[-1] == 1 and targets.ndim == 1:
+                targets = targets.float().unsqueeze(-1)
+                
+            aux_loss = self.risk_aware_loss(logits, targets, risk_coef)
 
         # --- 3. SOTA Path: Gradient Scaling Hooks (O(1) Conflict Resolution) ---
         if self.balancing_mode == "sota_2025":
-            # Throttle diffusion gradients back to shared encoder (0.2 scale)
-            # This prevents generative dominance and protects clinical features.
             throttle_scale = self.cfg.train.get("throttle_scale", 0.2)
             for ctx in [ctx_seq, global_ctx]:
                 if ctx.requires_grad:
@@ -353,37 +468,35 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # --- 4. Multi-Task Balancing Logic ---
         if self.balancing_mode == "sota_2025":
             # [SOTA 2025] Single-Pass Uncertainty Weighting
-            # Merges Physics Loss to save a backward pass.
             curr_phys_weight = self._get_curr_physics_weight()
             alpha_t = self.model.scheduler.alphas_cumprod[t][:, None, None]
             x0_approx = (noisy_fut - torch.sqrt(1 - alpha_t) * pred_noise) / torch.sqrt(alpha_t).clamp(min=1e-5)
-            phys_loss = physiological_violation_loss(x0_approx, weight=curr_phys_weight)
             
-            # Weighted Diffusion (includes physics)
-            combined_diff_loss = (raw_diff_loss * weights_awr).mean() + phys_loss
+            # [PHASE 2] Safety envelope operates on clinical units. Denormalize x0 first.
+            x0_clinical = self.model.unnormalize(x0_approx)
+            phys_violation = self.safety_envelope(x0_clinical, risk_coef)
+            phys_loss = phys_violation * curr_phys_weight
             
-            # Uncertainty Weighting (Kendall et al. 2018 style)
-            # Formula: (L / exp(log_var)) + log_var
-            # log_var = log(sigma^2), so we divide by exp(log_var) which is sigma^2.
-            loss_diff_weighted = combined_diff_loss / torch.exp(self.log_var_diff) + self.log_var_diff
-            loss_aux_weighted = aux_loss / torch.exp(self.log_var_aux) + self.log_var_aux
-            loss_critic_weighted = critic_loss / torch.exp(self.log_var_critic) + self.log_var_critic
-            
-            total_loss = loss_diff_weighted + loss_aux_weighted + loss_critic_weighted
+            loss_dict = {
+                'diffusion': (raw_diff_loss * weights_awr).mean() + phys_loss,
+                'aux': aux_loss
+            }
+            scaled_total, logs = self.model.loss_scaler(loss_dict)
+            total_loss = scaled_total + 0.5 * critic_loss
             
             # Single Backward Pass
             self.manual_backward(total_loss)
-            gn_loss = torch.tensor(0.0, device=self.device) # Dummy for telemetry
-            task_weights = [torch.exp(-self.log_var_diff), torch.exp(-self.log_var_critic), torch.exp(-self.log_var_aux)]
+            gn_loss = torch.tensor(0.0, device=self.device)
+            task_weights = [logs.get('weight/diffusion', 1.0), 0.5, logs.get('weight/aux', 1.0)]
             
         else:
             # [Legacy Surgical] Multi-Pass CAGrad + GradNorm
-            # 1. Dynamic Loss Weighting via GradNorm
-            primary_losses = torch.stack([diff_loss, critic_loss, aux_loss])
+            diff_loss_unweighted = (raw_diff_loss * weights_awr).mean()
+            primary_losses = torch.stack([diff_loss_unweighted, critic_loss, aux_loss])
             gn_loss, task_weights = self.gradnorm.update(primary_losses)
             
             # 2. Weighted losses for CAGrad surgery
-            weighted_tasks = [diff_loss * task_weights[0], critic_loss * task_weights[1], aux_loss * task_weights[2]]
+            weighted_tasks = [diff_loss_unweighted * task_weights[0], critic_loss * task_weights[1], aux_loss * task_weights[2]]
             
             # 3. Conflict-Averse Surgery (Backward Pass)
             is_start_of_accum = (batch_idx % self.trainer.accumulate_grad_batches == 0)
@@ -397,7 +510,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
             curr_phys_weight = self._get_curr_physics_weight()
             alpha_t = self.model.scheduler.alphas_cumprod[t][:, None, None]
             x0_approx = (noisy_fut - torch.sqrt(1 - alpha_t) * pred_noise) / torch.sqrt(alpha_t).clamp(min=1e-5)
-            phys_loss = physiological_violation_loss(x0_approx, weight=curr_phys_weight)
+            
+            # [PHASE 2] Denormalize for clinical safety envelope
+            x0_clinical = self.model.unnormalize(x0_approx)
+            phys_violation = self.safety_envelope(x0_clinical, risk_coef)
+            phys_loss = phys_violation * curr_phys_weight
             if phys_loss > 0:
                 self.manual_backward(phys_loss)
 
@@ -437,7 +554,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             self.train_loss_aux.update(aux_loss.detach())
             self.train_loss_phys.update(phys_loss.detach())
             self.train_loss_gradnorm.update(gn_loss.detach())
-            self.train_awr_ess.update(diag.get("ess", 1.0))
+            self.train_awr_ess.update(diag["ess"])
             self.train_explained_var.update(ev)
             
             # Global Rank 0 Logging (SOTA: Pass objects, not .compute(), to avoid sync bottleneck)
@@ -813,7 +930,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                logger.info(f"⚡ [AWR] Fast-Path Active: Using Injected Stats (mu={injected_mean:.4f}, sigma={injected_std:.4f})")
             
             self.awr_calculator.set_stats(mean=injected_mean, std=injected_std)
-            self._awr_stats_initialized = True
+            self._awr_stats_initialized.fill_(True)
             return
 
         stats_tensor = torch.zeros(2, device=self.device)
@@ -878,7 +995,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             torch.distributed.broadcast(stats_tensor, src=0)
             
         self.awr_calculator.set_stats(mean=stats_tensor[0].item(), std=stats_tensor[1].item())
-        self._awr_stats_initialized = True
+        self.register_buffer("_awr_stats_initialized", torch.tensor(True))
 
     # Removed on_before_optimizer_step in favor of manual clipping in training_step
 
@@ -890,17 +1007,25 @@ class ICUGeneralistWrapper(pl.LightningModule):
         from icu.utils.train_utils import configure_robust_optimizer, get_cosine_schedule_with_warmup
 
         # 1. Configure Robust AdamW (Fused + Parameter Hygiene)
-        optimizer_params = [{"params": self.model.parameters()}]
-        
-        # [v25.3] Add Uncertainty Parameters if in SOTA mode
         if self.balancing_mode == "sota_2025":
+            # [v25.3] Parameter Hygiene: Separate Model and Uncertainty parameters
+            # We must ensure groups are disjoint, or PyTorch raises ValueError
+            scaler_params = list(self.model.loss_scaler.parameters())
+            scaler_ids = {id(p) for p in scaler_params}
+            model_params = [p for p in self.model.parameters() if id(p) not in scaler_ids]
+            
             # Uncertainty weights need a slightly higher LR for faster convergence
             uw_lr = self.cfg.train.get("uw_lr", 0.025)
-            optimizer_params.append({
-                "params": [self.log_var_diff, self.log_var_aux, self.log_var_critic],
-                "lr": uw_lr,
-                "weight_decay": 0.0  # Do not decay weighting parameters
-            })
+            optimizer_params = [
+                {"params": model_params},
+                {
+                    "params": scaler_params,
+                    "lr": uw_lr,
+                    "weight_decay": 0.0  # Do not decay weighting parameters
+                }
+            ]
+        else:
+            optimizer_params = [{"params": self.model.parameters()}]
 
         base_optimizer = torch.optim.AdamW(
             optimizer_params,

@@ -106,6 +106,7 @@ from icu.utils.metrics_advanced import (
     compute_demographic_accuracy_gaps
 )
 from icu.utils.safety import OODGuardian
+from icu.utils.stability import ForensicStabilityAuditor
 
 # TorchMetrics (SOTA Clinical Metrics)
 from torchmetrics import MeanSquaredError, MeanMetric, AUROC
@@ -238,7 +239,9 @@ class ICUSpecialistWrapper(pl.LightningModule):
             beta=cfg.train.get("awr_beta", 0.5),
             max_weight=cfg.train.get("awr_max_weight", 20.0),
             lambda_gae=cfg.train.get("awr_lambda", 0.95),
-            gamma=cfg.train.get("awr_gamma", 0.99)
+            gamma=cfg.train.get("awr_gamma", 0.99),
+            adaptive_beta=cfg.train.get("adaptive_beta", True), # [SOTA 2025] Enable by default
+            adaptive_clipping=cfg.train.get("adaptive_clipping", True)
         )
         logger.info(f"[AWR] Temperature (beta)={self.awr_calculator.beta}, Max Weight={self.awr_calculator.max_weight}")
         
@@ -346,6 +349,9 @@ class ICUSpecialistWrapper(pl.LightningModule):
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
             
+        # [v13.0 SOTA FIX] Forensic Stability Auditor
+        # Unmasks explosions that the normalizer might hide.
+        self.forensic_auditor = ForensicStabilityAuditor(guardian=self.safety_guardian)
         logger.info("[PRE-FLIGHT] Initialization complete. All systems nominal.")
 
     def _calibrate_normalizer_safe(self):
@@ -691,15 +697,16 @@ class ICUSpecialistWrapper(pl.LightningModule):
                 # 1. Perception (Encoder is frozen)
                 past_norm, static_norm = self.model.normalize(past, static)
                 # [v15.2.2] Robust Padding Hygiene
-                # [FIX v16.0] Disable unsafe padding inference from imputation mask.
-                # Fixed-window dataset does not have structural padding.
-                # "Missing" != "Padding" for Temporal Attention.
-                padding_mask = None 
+                # [SOTA Phase 1 Audit] Use Robust Inference
+                if src_mask is not None:
+                     bool_padding_mask = (src_mask.sum(dim=-1) == 0)
+                else:
+                     bool_padding_mask = None
                 
                 _, global_ctx, _ = self.model.encoder(
                     past_norm, static_norm, 
                     imputation_mask=src_mask,
-                    padding_mask=padding_mask
+                    padding_mask=bool_padding_mask
                 )
                 
                 # 2. Value Estimate (Critic)
@@ -890,7 +897,12 @@ class ICUSpecialistWrapper(pl.LightningModule):
             opt.zero_grad()
             sch = self.lr_schedulers()
             if sch is not None:
-                sch.step()            
+                # [FIX] Robust Scheduler Step (Handle list or single)
+                if isinstance(sch, list):
+                    for s in sch: s.step()
+                else:
+                    sch.step()
+            
             
             # GradNorm Optimizer Step (Legacy Only)
             if self.balancing_mode == "legacy_surgical":
@@ -950,20 +962,15 @@ class ICUSpecialistWrapper(pl.LightningModule):
             "train/routing_max_prob": routing_max_prob,
             "train/routing_uniformity": routing_uniformity,
             
-             "train/lr": self.optimizers().param_groups[0]["lr"]
+            "train/routing_max_prob": routing_max_prob,
+            "train/routing_uniformity": routing_uniformity,
+            
+            "train/lr": self.optimizers().param_groups[0]["lr"],
+            
+            # [SOTA 2025] Dynamic AWR Telemetry
+            "train/awr_beta": awr_diag.get("beta_dynamic", self.awr_calculator.beta),
+            "train/awr_max_weight": awr_diag.get("max_weight_dynamic", self.awr_calculator.max_weight)
         }
-        
-        # Expert Load Distribution
-        log_payload.update({f"train/{k}": v for k, v in expert_counts.items()})
-        
-        self.log_dict(
-            log_payload,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-            batch_size=B
-        )
         
         return None
 
@@ -1128,12 +1135,21 @@ class ICUSpecialistWrapper(pl.LightningModule):
         mae = (pred_vitals - gt).abs().mean()
         self.val_mae_clinical.update(mae)
         
-        # 2. OOD Guardian (Dynamics Safety)
-        # Observed data from dataset is already in clinical units (unnormalized)
-        past = batch["observed_data"]
-        
-        safety_results = self.safety_guardian.check_trajectories(past, pred_vitals)
-        
+        # 2. Forensic Metric Audit (SOTA 2025)
+        # We check physics violations on RAW clinical predictions *before* clamping.
+        with torch.no_grad():
+            forensic_logs = self.forensic_auditor.audit_batch(
+                pred_vitals, 
+                past, 
+                self.model.normalizer
+            )
+            ood_rate = forensic_logs["forensic/ood_rate"]
+            phys_violations = forensic_logs["forensic/phys_violation_rate"]
+            max_sigma = forensic_logs["forensic/max_sigma"]
+            
+            # Log forensic telemetry
+            self.log("val/forensic_max_sigma", max_sigma, sync_dist=True)
+            self.log("val/phys_violation_rate", phys_violations, on_epoch=True, sync_dist=True)
         # 3. Action Continuity (Smoothness)
         smoothness = compute_action_continuity(pred_vitals)
         

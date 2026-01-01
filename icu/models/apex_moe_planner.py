@@ -311,18 +311,26 @@ class APEX_MoE_Planner(nn.Module):
             f"Invalid phase label detected: max={gt_phases.max()}, expected < {N_GT_PHASES}"
         
         # --- 2. Shared Perception (Encoder is frozen) ---
-        # [v16.0] FIX: Disable unsafe padding inference. Fixed window dataset has no padding.
-        padding_mask = None
+        # --- 2. Shared Perception (Encoder is frozen) ---
+        # [SOTA Phase 1 Audit] Robust Padding Logic
+        # Inherited from ICUUnifiedPlanner (Phase 1 Fix)
+        if src_mask is not None:
+            # A timestep is PADDED only if ALL features are missing (0)
+            bool_padding_mask = (src_mask.sum(dim=-1) == 0) # [B, T] Result is bool
+        else:
+            bool_padding_mask = None
         
         with torch.no_grad():
             ctx_seq, global_ctx, ctx_mask = self.encoder(
                 past_norm, static_norm, 
                 imputation_mask=src_mask,
-                padding_mask=padding_mask
+                padding_mask=bool_padding_mask
             )
 
         # --- 3. Router Decision (Trainable) ---
-        router_logits = self.router(global_ctx)  # [B, num_experts]
+        # [SOTA Upgrade] SequenceAuxHead requires Sequence Context
+        # Note: We ignore the returned 'loss' here as we compute our own Gated Loss later
+        router_logits, _ = self.router(ctx_seq, mask=ctx_mask)  # [B, num_experts]
         
         # Apply Loss-Free Balancing bias if enabled
         if self.use_loss_free_balancing:
@@ -780,17 +788,21 @@ class APEX_MoE_Planner(nn.Module):
         
         # 1. Perception (Frozen Encoder)
         past_norm, static_norm = self.normalize(past, static)
-        # [v16.0] FIX: Disable unsafe padding inference.
-        padding_mask = None
+        # [SOTA Phase 1 Audit] Robust Padding Logic
+        if src_mask is not None:
+             bool_padding_mask = (src_mask.sum(dim=-1) == 0)
+        else:
+             bool_padding_mask = None
         
         ctx_seq, global_ctx, ctx_mask = self.encoder(
             past_norm, static_norm, 
             imputation_mask=src_mask,
-            padding_mask=padding_mask
+            padding_mask=bool_padding_mask
         )
         
         # 2. Router Decision
-        logits = self.router(global_ctx)  # [B, N_experts]
+        # [SOTA Upgrade] Use Sequence Context
+        logits, _ = self.router(ctx_seq, mask=ctx_mask)  # [B, N_experts]
         
         # Apply Loss-Free Balancing bias if enabled
         if self.use_loss_free_balancing:

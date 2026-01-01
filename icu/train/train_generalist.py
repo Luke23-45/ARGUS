@@ -414,8 +414,21 @@ def main(cfg: DictConfig):
     # for Teacher-Student distillation logic. Double-update avoidance.
     # [FIX] Inject explicit ModelCheckpoint path
     raw_callbacks = get_sota_callbacks(cfg)
-    callbacks = [cb for cb in raw_callbacks if not isinstance(cb, EMACallback)]
     
+    # Filter callbacks if necessary (but KEEP TieredEMACallback if use_teacher is enabled)
+    callbacks = []
+    for cb in raw_callbacks:
+        # If use_teacher is enabled, we expect TieredEMACallback to be present and we should keep it.
+        # Otherwise, if it's a generic EMACallback and use_teacher is NOT enabled, we filter it out
+        # to avoid double-updating if the wrapper handles EMA manually.
+        if isinstance(cb, EMACallback) and not cfg.model.get("use_teacher", False):
+            logger.info(f"[CALLBACKS] Filtering out {type(cb).__name__} as use_teacher is False or wrapper handles EMA.")
+            continue
+        
+        # If it's a TieredEMACallback and use_teacher is enabled, we keep it.
+        # If it's any other callback, we keep it.
+        callbacks.append(cb)
+
     # Ensure ModelCheckpoint callback uses the correct dirpath if present
     for cb in callbacks:
         if isinstance(cb, ModelCheckpoint):

@@ -26,7 +26,10 @@ import logging
 import random
 import numpy as np
 import pandas as pd
-import kagglehub
+try:
+    import kagglehub
+except ImportError:
+    kagglehub = None
 from pathlib import Path
 from tqdm.auto import tqdm
 
@@ -233,6 +236,10 @@ class IngestionEngine:
 def run_build_pipeline(output_dir: str):
     """Main Entry Point."""
     logger.info("Downloading dataset (PhysioNet 2019)...")
+    if kagglehub is None:
+        logger.critical("Kagglehub not installed. Cannot download dataset.")
+        return
+
     try:
         path = kagglehub.dataset_download("farjanayesmin/the-physionet-challenge-2019-dataset")
     except Exception as e:
