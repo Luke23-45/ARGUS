@@ -544,14 +544,27 @@ class ICUAdvantageCalculator(nn.Module):
         
         # --- 2. Construct Non-Terminal Mask ---
         if dones is not None:
-            # If done[t]=1, then V(s_{t+1}) should be masked (treated as 0)
-            non_terminal = 1.0 - dones.float()
+            # [v25.5 SOTA FIX] Robust Dimensionality Handling
+            # drones can be (B,) if only the last step is considered terminal,
+            # or (B, T) if terminals are dispersed.
+            if dones.dim() == 1:
+                # If dones is (B,), it refers to the last step of the trajectory.
+                # However, for GAE, we need a (B, T) mask where only the terminal step
+                # zeros out the bootstrap.
+                # Default: all steps are non-terminal
+                non_terminal = torch.ones((B, T), device=device)
+                # Mark ONLY the last step as potentially terminal
+                non_terminal[:, -1] = 1.0 - dones.float()
+            else:
+                # dones is (B, T)
+                non_terminal = 1.0 - dones.float()
         else:
             # Assume all steps are non-terminal (sliding window assumption)
-            non_terminal = torch.ones_like(rewards)
+            non_terminal = torch.ones((B, T), device=device)
         
         # --- 3. TD Error (Delta) ---
         # δ_t = r_t + γ * V(s_{t+1}) * (1-d_t) - V(s_t)
+        # Ensure non_terminal is broadcastable to next_values (B, T)
         deltas = rewards + (self.gamma * next_values * non_terminal) - values
         
         # --- 4. GAE Recursion (Backwards) ---

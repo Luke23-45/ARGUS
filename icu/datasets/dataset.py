@@ -409,6 +409,12 @@ class ICUTrajectoryDataset(Dataset):
         is_terminal = (t_end >= len(full_vitals))
         is_truncated = (t_end < len(full_vitals))
 
+        # [v12.8 SOTA FIX] Label Synthesis
+        # phase: Gating signal (Stable/Pre-Shock/Shock)
+        # outcome: Binary target (Does Sepsis occur in next prediction window?)
+        phase = self._get_phase_label(labels_win)
+        outcome = float((labels_win[self.history_len:] > 0.5).any())
+
         return {
             "observed_data": torch.from_numpy(obs_data.copy()),  # Shape: [Hist, 28]
             "future_data":   torch.from_numpy(fut_data.copy()),  # Shape: [Pred, 28]

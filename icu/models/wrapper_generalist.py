@@ -1060,8 +1060,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 label = sample["outcome_label"].unsqueeze(0).to(self.device)
                 
                 with torch.no_grad():
-                    # Compute reward (using mean to match training scale)
-                    r = self.awr_calculator.compute_clinical_reward(future, label, normalizer=None)
+                    # [v25.5 FIX] Calibration Parity: Include sparse rewards and masking
+                    # rewards_list.append(r.mean().item()) -> Use rewards collected with terminal awareness
+                    r = self.awr_calculator.compute_clinical_reward(
+                        future, 
+                        label, 
+                        dones=sample.get("is_terminal").unsqueeze(0).to(self.device),
+                        feature_indices=self.clinical_feat_idx,
+                        normalizer=None,
+                        src_mask=sample.get("future_mask").unsqueeze(0).to(self.device)
+                    )
                     rewards_list.append(r.mean().item())
             
             if len(rewards_list) > 0:

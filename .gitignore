@@ -88,7 +88,7 @@ data/
 ready/
 checkpoints/
 outputs/
-sepsis_clinical_28
+# sepsis_clinical_28
 run.bat
 patches.md
 log.md
@@ -100,3 +100,5 @@ code.md
 logs.md
 # error.md
 error.md
+sepsis_clinical_28/train_index.json
+sepsis_clinical_28/val_index.json
