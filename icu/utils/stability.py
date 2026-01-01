@@ -19,8 +19,9 @@ class DynamicThresholding(nn.Module):
         abs_x = torch.abs(x)
         flat_abs = abs_x.view(B, -1)
         
+        # [FIX] torch.quantile requires float32 or float64.
         # Calculate s-th percentile
-        s = torch.quantile(flat_abs, self.percentile, dim=1).view(B, 1, 1)
+        s = torch.quantile(flat_abs.float(), self.percentile, dim=1).view(B, 1, 1)
         
         # Scale factor
         s = torch.clamp(s, min=self.threshold)

@@ -73,12 +73,18 @@ class CAGrad(torch.optim.Optimizer):
         g_avg = g.mean(dim=0)
         GG = g @ g.t()
         try:
-            alpha = torch.linalg.solve(GG + 1e-6 * torch.eye(len(losses), device=GG.device), 
-                                     torch.ones(len(losses), device=GG.device))
+            # [FIX] torch.linalg.solve requires float32 for stability and compatibility
+            # Especially critical for mixed-precision/bfloat16 training.
+            alpha = torch.linalg.solve(
+                (GG + 1e-6 * torch.eye(len(losses), device=GG.device)).float(), 
+                torch.ones(len(losses), device=GG.device, dtype=torch.float32)
+            )
             alpha = torch.clamp(alpha, min=0) 
             alpha = alpha / (alpha.sum() + 1e-8)
+            # Cast back to input dtype for consistent gradient surgery
+            alpha = alpha.to(g.dtype) 
         except:
-            alpha = torch.ones(len(losses), device=GG.device) / len(losses)
+            alpha = torch.ones(len(losses), device=GG.device, dtype=g.dtype) / len(losses)
 
         final_grad = (alpha @ g)
         if torch.norm(final_grad) > 1e-8:

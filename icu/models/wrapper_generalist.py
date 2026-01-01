@@ -559,10 +559,18 @@ class ICUGeneralistWrapper(pl.LightningModule):
             
             # Global Rank 0 Logging (SOTA: Pass objects, not .compute(), to avoid sync bottleneck)
             # [TELEMETRY] Primary Metrics (Visible in Progress Bar)
+            # Use detached scalars (.item()) for the progress bar to ensure immediate visibility.
+            # Shortening to L, D, V, etc. is handled by the APEXProgressBar callback.
             self.log_dict({
-                "loss": self.train_loss_total,
-                "diff": self.train_loss_diff,
-                "w_aux": task_weights[2], # Monitor Aux Weight for collapse
+                "total_loss": (diff_loss + critic_loss + aux_loss).item(),
+                "diff_loss": diff_loss.item(),
+                "critic_loss": critic_loss.item(),
+                "phys_loss": phys_loss.item() if torch.is_tensor(phys_loss) else phys_loss,
+                "aux_loss": aux_loss.item() if torch.is_tensor(aux_loss) else aux_loss,
+                "awr_ess": diag["ess"],
+                "explained_var": ev.item() if torch.is_tensor(ev) else ev,
+                "curr_phys_weight": curr_phys_weight,
+                "w_aux": task_weights[2],
                 "lr": self.optimizers().param_groups[0]["lr"]
             }, on_step=True, on_epoch=False, prog_bar=True)
 

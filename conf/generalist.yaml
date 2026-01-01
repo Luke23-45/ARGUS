@@ -12,10 +12,10 @@ compile_model: true
 
 # --- Directory Paths ---
 output_dir: "outputs/phase1"           # Main output directory
-checkpoint_dir: "/content/drive/MyDrive/icu/checkpoints"  # Where checkpoints are saved
-log_dir: "/content/drive/MyDrive/icu/logs/icu"         # Training logs directory
+checkpoint_dir: "/content/drive/MyDrive/pda/icu/checkpoints"  # Where checkpoints are saved
+log_dir: "/content/drive/MyDrive/pda/icu/logs/icu"         # Training logs directory
 backup_dir: null                        # Remote/backup directory
-resume_from: null             # Explicit checkpoint to resume from (optional)
+resume_from: "/content/drive/MyDrive/pda/checkpoints/icu_model-epoch=01-val/clinical_auroc=0.714.ckpt"             # Explicit checkpoint to resume from (optional)
 # "/content/drive/MyDrive/pda/models/checkpoints/icu_model-epoch=05-val/clinical_auroc=0.747.ckpt"          
 # --- Model Architecture (ICUUnifiedPlanner) ---
 model:
@@ -44,7 +44,7 @@ model:
 train:
   phase: "phase1"
   epochs: 100
-  batch_size: 128           # [v20.6] Increased update frequency for classification signal
+  batch_size: 256           # [v20.6] Increased update frequency for classification signal
   num_workers: 2
   lr: 1.5e-4                  # [NERYVA-ALPHA] Optimal tempo for sepsis innovation
   min_lr: 1e-6

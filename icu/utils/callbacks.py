@@ -147,12 +147,21 @@ class APEXProgressBar(RichProgressBar):
 
             sk = k.replace("train/", "").replace("val/", "").replace("health/", "")
             sk = sk.replace("total_loss", "L").replace("loss", "L")
-            sk = sk.replace("diff_L", "D").replace("aux_L", "A").replace("value_L", "V")
+            sk = sk.replace("diff_L", "D").replace("diff_loss", "D")
+            sk = sk.replace("critic_L", "V").replace("critic_loss", "V").replace("value_L", "V")
+            sk = sk.replace("phys_L", "P").replace("phys_loss", "P")
+            sk = sk.replace("aux_L", "A").replace("aux_loss", "A")
+            sk = sk.replace("awr_ess", "ESS")
+            sk = sk.replace("explained_var", "EV").replace("explained_variance", "EV")
+            sk = sk.replace("curr_phys_weight", "PW").replace("w_aux", "WA")
+            
+            # Validation Specifics
+            sk = sk.replace("mse_global", "GMSE").replace("sepsis_auroc", "AUC").replace("sepsis_AUC", "AUC")
+            sk = sk.replace("sepsis_acc", "ACC").replace("ood_rate_avg", "OOD").replace("ood_rate", "OOD")
+            sk = sk.replace("safe_trajectories_avg", "SAFE").replace("phys_violation_rate", "PV")
+            
             sk = sk.replace("clinical_", "").replace("auroc", "AUC").replace("auprc", "PRC")
-            sk = sk.replace("generative_mse", "GMSE").replace("generative_mae", "GMAE")
-            sk = sk.replace("policy_entropy", "E").replace("explained_variance", "EV")
-            sk = sk.replace("preshock_L", "PS").replace("stable_L", "S").replace("crash_L", "C")
-            sk = sk.replace("ood_rate", "OOD").replace("grad_norm_total", "GN").replace("max_weight", "MW")
+            sk = sk.replace("grad_norm_total", "GN")
             
             clean_metrics[sk] = val
             
@@ -199,13 +208,21 @@ class APEXTQDMProgressBar(TQDMProgressBar):
             # train/loss -> L, val/clinical_auroc -> A, diff_L -> D
             sk = k.replace("train/", "").replace("val/", "").replace("health/", "")
             sk = sk.replace("total_loss", "L").replace("loss", "L")
-            sk = sk.replace("diff_L", "D").replace("aux_L", "A").replace("value_L", "V")
+            sk = sk.replace("diff_L", "D").replace("diff_loss", "D")
+            sk = sk.replace("critic_L", "V").replace("critic_loss", "V").replace("value_L", "V")
+            sk = sk.replace("phys_L", "P").replace("phys_loss", "P")
+            sk = sk.replace("aux_L", "A").replace("aux_loss", "A")
+            sk = sk.replace("awr_ess", "ESS")
+            sk = sk.replace("explained_var", "EV").replace("explained_variance", "EV")
+            sk = sk.replace("curr_phys_weight", "PW").replace("w_aux", "WA")
+            
+            # Validation Specifics
+            sk = sk.replace("mse_global", "GMSE").replace("sepsis_auroc", "AUC").replace("sepsis_AUC", "AUC")
+            sk = sk.replace("sepsis_acc", "ACC").replace("ood_rate_avg", "OOD").replace("ood_rate", "OOD")
+            sk = sk.replace("safe_trajectories_avg", "SAFE").replace("phys_violation_rate", "PV")
+            
             sk = sk.replace("clinical_", "").replace("auroc", "AUC").replace("auprc", "PRC")
-            sk = sk.replace("generative_mse", "GMSE").replace("generative_mae", "GMAE")
-            sk = sk.replace("policy_entropy", "E").replace("explained_variance", "EV")
-            sk = sk.replace("preshock_L", "PS").replace("stable_L", "S").replace("crash_L", "C")
-            sk = sk.replace("router_ce_L", "RCE").replace("load_balance_L", "LB")
-            sk = sk.replace("ood_rate", "OOD").replace("grad_norm_total", "GN").replace("max_weight", "MW")
+            sk = sk.replace("grad_norm_total", "GN")
             
             clean_metrics[sk] = val
             

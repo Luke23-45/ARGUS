@@ -57,7 +57,9 @@ class ConfidenceAwareGovernor(nn.Module):
             # Flatten T, C for quantile calculation
             s = x[i].abs().view(-1)
             # Calculate the percentile value for this specific sample
-            thresh = torch.quantile(s, p[i])
+            # [FIX] torch.quantile requires float32 or float64, and q must match input dtype.
+            # Cast both to float32 for compatibility with mixed precision/bfloat16.
+            thresh = torch.quantile(s.float(), p[i].float())
             # Clamp outliers to the threshold
             x_out[i] = torch.clamp(x[i], min=-thresh, max=thresh)
             
