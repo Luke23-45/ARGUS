@@ -53,8 +53,10 @@ class UncertaintyLossScaler(nn.Module):
             if key in loss_dict:
                 loss = loss_dict[key]
                 
-                # Get learned parameter s_i
-                log_var = self.log_vars[i]
+                # [v12.8 SOTA FIX] Log-Var Clamping
+                # To prevent precision overflows and NaN gradients in FP16/BF16,
+                # we clamp the log_vars before exponentiation.
+                log_var = self.log_vars[i].clamp(min=-10.0, max=10.0)
                 
                 # Weight = 1 / (2 * exp(s))
                 # We use precision weighting

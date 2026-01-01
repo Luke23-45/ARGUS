@@ -23,7 +23,9 @@ class SinusoidalPositionalEncoding(nn.Module):
             pe: [1, T, D]
         """
         T = x.size(1)
-        return self.pe[:T, :].unsqueeze(0)
+        # [v12.8 SOTA FIX] DType Alignment
+        # Ensure the positional encoding buffer matches the input (BF16/FP16)
+        return self.pe[:T, :].unsqueeze(0).to(dtype=x.dtype, device=x.device)
 
 class VolatilityGate(nn.Module):
     """

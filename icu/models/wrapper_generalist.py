@@ -873,35 +873,38 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         """
-        [v12.5 FIX] Strict Loading Bypass.
+        [v12.8 SOTA FIX] In-Place StateDict Mutation for Strict Loading.
         
-        If we are resuming from a checkpoint that lacks our new SOTA buffers 
-        (ess_buffer, clip_rate_buffer), PyTorch's default load_state_dict will 
-        crash. This hook allows us to load matching weights and preserve
-        our new buffers with their default initializations.
+        PyTorch Lightning triggers a strict load AFTER this hook. To avoid 
+        'Missing Key' crashes when resuming from legacy checkpoints, we 
+        mutate the checkpoint['state_dict'] in-place by injecting current 
+        buffer values for any missing SOTA keys.
         """
         state_dict = checkpoint.get("state_dict", {})
         if not state_dict:
             return
             
-        # Check if critical new keys are missing
+        # Authoritative SOTA Keys
         new_keys = [
             "awr_calculator.beta", 
             "awr_calculator.max_weight", 
             "awr_calculator.ess_buffer", 
             "awr_calculator.clip_rate_buffer"
         ]
-        missing_count = sum(1 for k in new_keys if k not in state_dict)
         
-        if missing_count > 0:
-            logger.warning(f"[RESUME] Checkpoint is missing {missing_count} SOTA buffers. Switching to non-strict loading.")
-            # We load the weights manually with strict=False
-            # This populates matching weights and leaves missing buffers at default
-            incompatible = self.load_state_dict(state_dict, strict=False)
-            if incompatible.missing_keys:
-                logger.info(f"[RESUME] Non-strict load complete. Missing keys (preserved as default): {len(incompatible.missing_keys)}")
-            if incompatible.unexpected_keys:
-                logger.warning(f"[RESUME] Unexpected keys in checkpoint: {len(incompatible.unexpected_keys)}")
+        # [v12.8] Surgical Injection:
+        # We check if keys are missing from the checkpoint, and if so, 
+        # we populate them from the current model's buffers.
+        missing_keys = [k for k in new_keys if k not in state_dict]
+        
+        if missing_keys:
+            logger.warning(f"[RESUME] Checkpoint missing {len(missing_keys)} SOTA keys. Injecting model defaults to satisfy strict loader.")
+            current_model_dict = self.state_dict()
+            for k in missing_keys:
+                if k in current_model_dict:
+                    state_dict[k] = current_model_dict[k].clone()
+                else:
+                    logger.error(f"[RESUME] SOTA key '{k}' expected but not found in current model. Restoration may be partial.")
         
     def _get_curr_physics_weight(self) -> float:
         """
