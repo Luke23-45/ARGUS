@@ -467,16 +467,34 @@ class ICUGeneralistWrapper(pl.LightningModule):
             )
             returns = (advantages + student_values).detach()
             
-            # [2025 SOTA] High-Pressure AWR Weights
+            # [SOTA v3.1] Step-Level AWR with Padding Safety
+            f_mask = batch.get("future_mask")
+            if f_mask is not None:
+                if f_mask.dim() == 3: f_mask = f_mask.any(dim=-1)
+                f_mask = f_mask.float()
+            else:
+                f_mask = torch.ones_like(advantages, dtype=torch.float32)
+
+            # [2025 SOTA] High-Pressure AWR Weights (Global Pool: B*T clinical moments)
+            # Pass full [B, T] tensors to preserve step-level granularity.
             weights_awr, diag = self.awr_calculator.calculate_weights(
-                advantages.mean(dim=1),
-                values=target_values.mean(dim=1),
-                rewards=returns.mean(dim=1)
+                advantages,
+                values=target_values,
+                rewards=returns,
+                mask=f_mask
             )
-            weights_awr = weights_awr / (weights_awr.mean() + 1e-8)
+            
+            # Enforce Padding Safety & Global Normalization
+            # 1. Zero out weights for padding tokens
+            weights_awr = weights_awr * f_mask
+            # 2. Normalize by mean of VALID clinical moments across the entire batch
+            weights_awr = weights_awr / (weights_awr.sum() / (f_mask.sum() + 1e-8) + 1e-8)
+            
             weights_awr_log = {"train/awr_ess": diag["ess"]}
 
-        diff_loss = (raw_diff_loss * weights_awr).mean()
+        # [SOTA v3.1] Masked Weighted Diffusion Loss
+        # Ensure padding doesn't poison the gradient or the loss reporting.
+        diff_loss = (raw_diff_loss * weights_awr * f_mask).sum() / (f_mask.sum() + 1e-8)
         self.train_awr_ess.update(weights_awr_log.get("train/awr_ess", 0.0))
         
         # C. Critic Task (Robust SmoothL1)

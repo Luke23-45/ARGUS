@@ -1168,8 +1168,8 @@ class ICUUnifiedPlanner(nn.Module):
         
         # 4. Loss Computation
         if reduction == 'none':
-            # Mean over valid prediction horizon
-            diff_loss = F.mse_loss(pred_noise, noise_eps, reduction='none').mean(dim=[1, 2])
+            # Mean over features but preserve clinical moments [B, T]
+            diff_loss = F.mse_loss(pred_noise, noise_eps, reduction='none').mean(dim=2)
             
             if self.cfg.use_auxiliary_head and "phase_label" in batch:
                 # [SOTA Upgrade] SequenceAuxHead takes (x_seq, mask, targets)

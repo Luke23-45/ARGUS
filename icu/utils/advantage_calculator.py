@@ -641,7 +641,8 @@ class ICUAdvantageCalculator(nn.Module):
 
     def calculate_awr_weights(
         self, 
-        advantages: torch.Tensor
+        advantages: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Computes safe AWR weights with FP16 protection.
@@ -660,22 +661,40 @@ class ICUAdvantageCalculator(nn.Module):
             weights: Tensor of AWR weights (same shape as input)
             diagnostics: Dict with ESS, entropy, clipping rate, etc.
         """
+        # [SOTA v3.1] Mask-Aware Statistics
+        # Prevents padding (zeros) from biasing the mean and standard deviation.
+        if mask is not None:
+            mask_bool = mask.bool()
+            adv_flat = advantages[mask_bool]
+        else:
+            adv_flat = advantages.reshape(-1)
+
         # --- 1. Global Whitening & Winsorization ---
         if self.stats_initialized.item():
             mu, sigma = self.adv_mean, self.adv_std
         else:
-            mu = advantages.mean()
-            sigma = advantages.std() + 1e-8
+            if adv_flat.numel() > 0:
+                mu = adv_flat.mean()
+                sigma = adv_flat.std() + 1e-8
+            else:
+                mu = advantages.mean()
+                sigma = advantages.std() + 1e-8
             
         # [SOTA 2025] Advantage Winsorization (95th Percentile Clipping)
-        # Prevents "One-Hot" collapse (ESS=0.004) caused by clinical outliers.
+        # Uses the masked distribution to find the true 95th percentile.
         with torch.no_grad():
-            if advantages.numel() > 10:
-                p95 = torch.quantile(advantages.detach().float(), 0.95)
+            if adv_flat.numel() > 10:
+                p95 = torch.quantile(adv_flat.detach().float(), 0.95)
                 advantages = torch.clamp(advantages, max=p95)
         
         # Z-Score normalization: A ~ N(0, 1)
+        # Applied to all elements (the mask will zero out padding later if needed)
         norm_adv = (advantages - mu) / sigma
+        
+        # [SOTA 2025] Z-Score Normalization (Unclipped)
+        # We no longer hard-clamp at ±2.0 to preserve heavy-tailed 'clinical crash' signals.
+        # Stability is instead managed via Exponential Tempering and Hard-Weight Clipping.
+        
         
         # --- 2. Scaled Advantage ---
         scaled_adv = norm_adv / self.beta
@@ -684,8 +703,10 @@ class ICUAdvantageCalculator(nn.Module):
         # Instead of clamping, we subtract the maximum to prevent overflow 
         # while preserving the exact probability distribution.
         with torch.no_grad():
-            # max_adv should be computed per-batch/global for stability
+            # max_adv: Per-batch global maximum for numerical stability (Exp-Normalize trick)
             max_log_w = scaled_adv.max()
+            if dist.is_initialized():
+                dist.all_reduce(max_log_w, op=dist.ReduceOp.MAX)
         
         # weights = exp((A - max(A)) / beta)
         # This ensures the maximum weight is always 1.0 (before normalization)
@@ -712,8 +733,10 @@ class ICUAdvantageCalculator(nn.Module):
                 g_sum_w, g_sum_w_sq, g_clip_count, g_numel = sum_w, sum_w_sq, clipping_count, float(numel_local)
 
             # Global Effective Sample Size (ESS)
+            # [SOTA BUG FIX] 'ess' is already normalized to [0, 1] by 'g_numel' in denominator.
+            # Do NOT divide by g_numel again.
             ess = (g_sum_w ** 2) / (g_sum_w_sq * g_numel + 1e-8)
-            self.ess_buffer.fill_(ess / g_numel) # Normalized Global ESS
+            self.ess_buffer.fill_(ess) 
             
             # Global Clipping Rate
             clipped_rate = g_clip_count / (g_numel + 1e-8)
@@ -721,7 +744,7 @@ class ICUAdvantageCalculator(nn.Module):
             
             # [SOTA 2025] Adaptive Dynamics Update (Uses Global Statistics)
             if self.adaptive_beta or self.adaptive_clipping:
-                self._update_adaptive_stats(advantages, weights, ess / g_numel, clipped_rate.item())
+                self._update_adaptive_stats(advantages, weights, ess, clipped_rate.item())
             
             # Weight Entropy (Information Theoretic)
             probs = weights_clipped / (sum_w + 1e-8)
@@ -838,7 +861,8 @@ class ICUAdvantageCalculator(nn.Module):
         self, 
         advantages: torch.Tensor,
         values: Optional[torch.Tensor] = None,
-        rewards: Optional[torch.Tensor] = None
+        rewards: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Full AWR weight calculation with explained variance diagnostic.
@@ -857,7 +881,7 @@ class ICUAdvantageCalculator(nn.Module):
             diagnostics: Dict with ESS, entropy, explained variance, etc.
         """
         # Core AWR weight calculation
-        weights, diagnostics = self.calculate_awr_weights(advantages)
+        weights, diagnostics = self.calculate_awr_weights(advantages, mask=mask)
         
         # --- Additional Diagnostics ---
         

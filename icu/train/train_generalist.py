@@ -430,6 +430,11 @@ def main(cfg: DictConfig):
             logger.info(f"[CALLBACKS] Filtering out {type(cb).__name__} as use_teacher is False or wrapper handles EMA.")
             continue
         
+        # [FIX] Filter out ModelCheckpoint if checkpointing is disabled to prevent PL MisconfigurationException
+        if isinstance(cb, ModelCheckpoint) and not cfg.get("save_checkpoints", True):
+            logger.info(f"[CALLBACKS] Filtering out ModelCheckpoint as save_checkpoints is False.")
+            continue
+
         # If it's a TieredEMACallback and use_teacher is enabled, we keep it.
         # If it's any other callback, we keep it.
         callbacks.append(cb)
