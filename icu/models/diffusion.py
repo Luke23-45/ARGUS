@@ -1044,7 +1044,7 @@ class ICUUnifiedPlanner(nn.Module):
             )
             
             # [SOTA Phase 1] Uncertainty Loss Scaler
-            self.loss_scaler = UncertaintyLossScaler(num_tasks=2)
+            self.loss_scaler = UncertaintyLossScaler(num_tasks=4)
             
         # Dense Value Head for GAE-Lambda (AWR)
         # Replaced with 2025 SOTA ClinicalResidualHead

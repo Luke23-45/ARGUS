@@ -32,10 +32,18 @@ class AsymmetricContrastiveLoss(nn.Module):
             mask: (B, T) Optional boolean padding mask
         """
         if z.dim() == 3:
+            B, T, D = z.shape
+            # [DEFENSIVE] If y is window-level (B,), broadcast to seq-level (B, T)
+            if y.dim() == 1 and y.shape[0] == B:
+                y = y.unsqueeze(1).expand(B, T)
+                
             # Flatten to (B*T, D) and (B*T,)
             z = z.reshape(-1, self.d_model)
             y = y.reshape(-1)
             if mask is not None:
+                # Mask might be (B, T, D) or (B, T). Normalize to (B, T)
+                if mask.dim() == 3:
+                    mask = mask.any(dim=-1)
                 m = mask.reshape(-1)
                 z = z[m]
                 y = y[m]

@@ -51,11 +51,49 @@ def test_acl_stability():
     assert z.grad is not None
     print("ACL Stability Verified!")
 
-def test_loss_scaler_3task():
-    print("\n--- Testing Uncertainty Scaler (3 Tasks) ---")
-    scaler = UncertaintyLossScaler(num_tasks=3)
+def test_acl_broadcasting():
+    print("\n--- Testing ACL Broadcasting (Window -> Seq) ---")
+    acl = AsymmetricContrastiveLoss(d_model=16, num_classes=3)
+    
+    B, T = 4, 10
+    z = torch.randn(B, T, 16)
+    # y is window-level (B,)
+    y = torch.randint(0, 3, (B,))
+    mask = torch.ones(B, T).bool()
+    
+    # This should not raise IndexError
+    loss = acl(z, y, mask=mask)
+    print(f"ACL Broadcasting Loss: {loss.item()}")
+    assert not torch.isnan(loss)
+    print("ACL Broadcasting Verified!")
+
+def test_aux_head_alignment():
+    print("\n--- Testing Aux Head Alignment (Window-Level Logic) ---")
+    B, C = 256, 3
+    # Mocks SequenceAuxHead output (Window-Level)
+    logits = torch.randn(B, C, requires_grad=True)
+    targets = torch.randint(0, C, (B,))
+    
+    # Simulates training_step gather logic
+    probs = torch.softmax(logits, dim=-1)
+    true_probs = probs.gather(-1, targets.unsqueeze(-1).long())
+    error = 1.0 - true_probs.squeeze(-1)
+    mining_weight = 1.0 + torch.sigmoid(error * 5.0)
+    
+    loss = F.cross_entropy(logits, targets) * mining_weight.mean()
+    loss.backward()
+    
+    print(f"Aux Alignment Loss: {loss.item()}")
+    assert not torch.isnan(loss)
+    assert logits.grad is not None
+    print("Aux Head Alignment Verified!")
+
+def test_loss_scaler_4task():
+    print("\n--- Testing Uncertainty Scaler (4 Tasks) ---")
+    scaler = UncertaintyLossScaler(num_tasks=4)
     loss_dict = {
         'diffusion': torch.tensor(1.0, requires_grad=True),
+        'critic': torch.tensor(1.5, requires_grad=True),
         'aux': torch.tensor(2.0, requires_grad=True),
         'acl': torch.tensor(0.5, requires_grad=True)
     }
@@ -65,14 +103,17 @@ def test_loss_scaler_3task():
     print(f"Weights: {metrics}")
     
     total.backward()
+    assert 'weight/critic' in metrics
     assert 'weight/acl' in metrics
-    print("3-Task Scaler Verified!")
+    print("4-Task Scaler Verified!")
 
 if __name__ == "__main__":
     try:
         test_saw_math()
         test_acl_stability()
-        test_loss_scaler_3task()
+        test_acl_broadcasting()
+        test_aux_head_alignment()
+        test_loss_scaler_4task()
         print("\n[SUCCESS] SOTA Upgrade Patches are numerically sound and functionally correct.")
     except Exception as e:
         print(f"\n[FAILURE] Audit failed: {e}")

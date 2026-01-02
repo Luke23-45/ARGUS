@@ -268,7 +268,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             num_classes=cfg.model.get("num_phases", 3),
             prior_pos_weight=pos_weight
         )
-        self.model.loss_scaler = UncertaintyLossScaler(num_tasks=3) # Diffusion + Sepsis-Clf + Sepsis-ACL
+        self.model.loss_scaler = UncertaintyLossScaler(num_tasks=4) # Diffusion, Critic, Aux, ACL
         # [v25.4 FIX] Initial Log-Var Reset: Start with balanced weights (sigma=1.0)
         nn.init.constant_(self.model.loss_scaler.log_vars, 0.0)
         
@@ -488,37 +488,40 @@ class ICUGeneralistWrapper(pl.LightningModule):
             logits, _ = self.model.aux_head(ctx_seq, mask=ctx_mask)
             
             # [FIX 3] Integrate DynamicClassBalancer for imbalanced sepsis data
-            targets = batch["phase_label"]
+            targets = batch["phase_label"] # [B]
             self.class_balancer.update(targets)
             class_weights = self.class_balancer.get_weights().to(self.device)
             
+            # [SOTA 2025] Shape Alignment
+            # Classification (Aux Head) is Window-Level [B] via CLS Token
+            # Contrastive (ACL) is Sequence-Level [B, T] (handled internally)
+            B, T, _ = ctx_seq.shape
+            
             # [SOTA 2025] Class Frequency Multiplier (CFM)
-            # Magnifies signal without numerical shock.
+            # Calculated based on window-level targets for the Aux head
             n_total = targets.numel()
             n_sepsis = (targets > 0).sum().item()
             cfm = n_total / max(1, n_sepsis)
             
             # [SOTA 2025] Dynamic Hard Negative Mining (Mining Weight)
-            # W_mining = 1.0 + Sigmoid(Error)
             with torch.no_grad():
                 probs = torch.softmax(logits, dim=-1)
-                # Error is 1.0 - probability of true class
-                true_probs = probs.gather(-1, targets.unsqueeze(-1).long() if targets.ndim==1 else targets.argmax(-1, keepdim=True))
+                # logits/probs: [B, C], targets: [B]
+                true_probs = probs.gather(-1, targets.unsqueeze(-1).long())
                 error = 1.0 - true_probs.squeeze(-1)
-                mining_weight = 1.0 + torch.sigmoid(error * 5.0) # Scale error for sharp response
+                mining_weight = 1.0 + torch.sigmoid(error * 5.0) 
             
-            if logits.shape[-1] > 1 and targets.ndim == 1:
-                targets_one_hot = F.one_hot(targets.long(), num_classes=logits.shape[-1]).float()
-            elif logits.shape[-1] == 1 and targets.ndim == 1:
-                targets_one_hot = targets.float().unsqueeze(-1)
-            else:
-                targets_one_hot = targets
+            # One-hot encoding for window-level targets
+            targets_one_hot = F.one_hot(targets.long(), num_classes=logits.shape[-1]).float()
 
-            # Sepsis Classification Loss (Weighted)
+            # Sepsis Classification Loss (Window-Level)
+            # Note: No explicit spatial masking needed here as SequenceAuxHead 
+            # internally handles padding via Attention masks during pooling.
             raw_aux_loss = self.risk_aware_loss(logits, targets_one_hot, risk_coef, class_weights=class_weights)
             aux_loss = raw_aux_loss * cfm * mining_weight.mean()
 
             # Sepsis Contrastive Loss (ACL)
+            # Pass window targets (B,); AsymmetricContrastiveLoss broadcasts to (B, T) internally
             acl_loss = self.sepsis_acl(ctx_seq, targets, mask=ctx_mask) * cfm
 
 
@@ -543,11 +546,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
             
             loss_dict = {
                 'diffusion': (raw_diff_loss * weights_awr).mean() + phys_loss,
+                'critic': critic_loss,
                 'aux': aux_loss,
                 'acl': acl_loss
             }
             scaled_total, logs = self.model.loss_scaler(loss_dict)
-            total_loss = scaled_total + 0.5 * critic_loss
+            total_loss = scaled_total
             
             # Single Backward Pass
             self.manual_backward(total_loss)
@@ -555,7 +559,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Weights for logging (Sigmas)
             task_weights = [
                 logs.get('weight/diffusion', 1.0), 
-                0.5, 
+                logs.get('weight/critic', 1.0),
                 logs.get('weight/aux', 1.0),
                 logs.get('weight/acl', 1.0)
             ]
@@ -926,38 +930,70 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         """
-        [v12.8 SOTA FIX] In-Place StateDict Mutation for Strict Loading.
+        [v12.8 SOTA FIX] Flexible Restoration Suite for Architectural Transitions.
         
-        PyTorch Lightning triggers a strict load AFTER this hook. To avoid 
-        'Missing Key' crashes when resuming from legacy checkpoints, we 
-        mutate the checkpoint['state_dict'] in-place by injecting current 
-        buffer values for any missing SOTA keys.
+        This hook intercept legacy checkpoints and adapts them to the 2025 SOTA 
+        architecture before the strict loader triggers.
+        
+        Capabilities:
+        1. Prefix Normalization: Handles 'model.' and '_orig_mod.' discrepancies.
+        2. Surgical Resizing: Adapts log_vars from 2 tasks to 3 tasks.
+        3. Buffer Injection: Ensures AWR/ACL buffers are populated if missing.
         """
         state_dict = checkpoint.get("state_dict", {})
         if not state_dict:
             return
+
+        current_state = self.state_dict()
+        new_state_dict = {}
+
+        # 1. Prefix-Agnostic Key Mapping
+        # We normalize all keys by removing wrappers to find common ground.
+        def normalize(k):
+            return k.replace("_orig_mod.", "").replace("model.", "")
+
+        norm_to_src = {normalize(k): k for k in state_dict.keys()}
+        
+        for tgt_key in current_state.keys():
+            norm_tgt = normalize(tgt_key)
             
-        # Authoritative SOTA Keys
-        new_keys = [
-            "awr_calculator.beta", 
-            "awr_calculator.max_weight", 
-            "awr_calculator.ess_buffer", 
-            "awr_calculator.clip_rate_buffer"
-        ]
-        
-        # [v12.8] Surgical Injection:
-        # We check if keys are missing from the checkpoint, and if so, 
-        # we populate them from the current model's buffers.
-        missing_keys = [k for k in new_keys if k not in state_dict]
-        
-        if missing_keys:
-            logger.warning(f"[RESUME] Checkpoint missing {len(missing_keys)} SOTA keys. Injecting model defaults to satisfy strict loader.")
-            current_model_dict = self.state_dict()
-            for k in missing_keys:
-                if k in current_model_dict:
-                    state_dict[k] = current_model_dict[k].clone()
+            if norm_tgt in norm_to_src:
+                src_key = norm_to_src[norm_tgt]
+                src_tensor = state_dict[src_key]
+                tgt_shape = current_state[tgt_key].shape
+                
+                # 2. Surgical Tensor Adaptation (e.g. log_vars resizing)
+                if src_tensor.shape != tgt_shape:
+                    if "loss_scaler.log_vars" in norm_tgt:
+                        logger.warning(f"[RESUME] Resizing {norm_tgt}: {src_tensor.shape} -> {tgt_shape}")
+                        # Copy existing learned tasks, keep others as current (0.0)
+                        adapted_tensor = current_state[tgt_key].clone()
+                        
+                        if src_tensor.shape[0] == 2 and tgt_shape[0] == 4:
+                            # 2-Task Legacy: [Diff, Aux]
+                            # 4-Task SOTA: [Diff, Critic, Aux, ACL]
+                            adapted_tensor[0] = src_tensor[0] # Diffusion
+                            adapted_tensor[2] = src_tensor[1] # Aux
+                            logger.info("[RESUME] Surgical Mapping: [Diff, Aux] -> [Diff, _, Aux, _]")
+                        else:
+                            # Generic fallback for other transitions
+                            n_copy = min(src_tensor.shape[0], tgt_shape[0])
+                            adapted_tensor[:n_copy] = src_tensor[:n_copy]
+                        
+                        new_state_dict[tgt_key] = adapted_tensor
+                    else:
+                        logger.warning(f"[RESUME] Shape mismatch for '{tgt_key}' ({src_tensor.shape} vs {tgt_shape}). Keeping current.")
+                        new_state_dict[tgt_key] = current_state[tgt_key].clone()
                 else:
-                    logger.error(f"[RESUME] SOTA key '{k}' expected but not found in current model. Restoration may be partial.")
+                    new_state_dict[tgt_key] = src_tensor
+            else:
+                # 3. Buffer Injection (Missing SOTA keys)
+                # Keep current model's initialized state for new components.
+                new_state_dict[tgt_key] = current_state[tgt_key].clone()
+
+        # Overwrite the checkpoint state dict with the adaptive version
+        checkpoint["state_dict"] = new_state_dict
+        logger.info("[RESUME] Flexible Restoration Suite: State-dict adapted for SOTA 2025.")
         
     def _get_curr_physics_weight(self) -> float:
         """
