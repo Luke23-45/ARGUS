@@ -64,8 +64,8 @@ train:
   uw_lr: 0.025                # Learning rate for uncertainty weights
   
   # Phase 3: Longitudinal Foresight (Agentic Convergence)
-  start_gamma: 0.92           # [v25.8] Increased from 0.80 (5h) to 12.5h
-  end_gamma: 0.99             # 100h horizon at training end
+  start_gamma: 0.92           # [v25.9 SOTA] Stabilized for Unleashed Run
+  end_gamma: 0.92             # [v25.9 SOTA] Parked at 12.5h for initial phase
   horizon_warmup: 10
   horizon_ramp: 40
 
@@ -79,7 +79,7 @@ train:
   awr_beta: 0.40             
   awr_max_weight: 20.0        
   awr_lambda: 0.95            # [SOTA] GAE-Lambda for credit assignment
-  awr_gamma: 0.99             # Baseline discount factor
+  awr_gamma: 0.92             # [v25.9 SOTA] Synchronized with Horizon Manifold
   adaptive_beta: true
   adaptive_clipping: true
   

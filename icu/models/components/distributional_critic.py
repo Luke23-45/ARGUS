@@ -91,11 +91,30 @@ class DistributionalValueHead(nn.Module):
         num_alpha = max(1, int(alpha * self.num_quantiles))
         return quantiles[:, :, :num_alpha].mean(dim=-1)
 
-    def get_expectile_summary(self, quantiles: torch.Tensor) -> torch.Tensor:
+    def get_expectile_summary(self, quantiles: torch.Tensor, tau: float = 0.5) -> torch.Tensor:
         """
-        Extracts the central expectile (mean) for scalar RL bootstrapping.
+        Extracts the tau-expectile summary for scalar RL bootstrapping.
+        If tau=0.5, returns the mean (risk-neutral).
+        If tau > 0.5 (pessimistic), emphasizes LOWER quantiles (worst outcomes).
+        
+        Note: In medical RL, pessimism means fearing the worst-case (lower quantiles).
+        This forces the policy to avoid actions that could lead to catastrophic states.
         """
-        return quantiles.mean(dim=-1)
+        if tau == 0.5:
+            return quantiles.mean(dim=-1)
+            
+        # [v4.2 SOTA] Quantile-to-Expectile weighted mapping
+        # For pessimistic RL (tau > 0.5), we weight LOWER quantiles more heavily.
+        N = self.num_quantiles
+        # Midpoint quantiles [0.02, 0.06... 0.98]
+        taus_q = torch.linspace(1/(2*N), 1 - 1/(2*N), N, device=quantiles.device)
+        
+        # Pessimistic Weights: Higher weight on LOWER quantiles when tau > 0.5
+        # This is the key insight: taus_q < 0.5 are the "danger zone" (lower outcomes)
+        weights = torch.where(taus_q < 0.5, tau, 1 - tau)  # Flipped from before
+        weights = weights / weights.sum()
+        
+        return (quantiles * weights.view(1, 1, -1)).sum(dim=-1)
 
 
 class IQLQuantileLoss(nn.Module):

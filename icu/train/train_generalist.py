@@ -268,6 +268,10 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
             drop_last=True
         )
         
+        # [v4.1.1 SOTA FIX] Final Handle Wipe
+        # Just in case any other logic touched the dataset before this point.
+        self.train_ds._lmdb_env = None
+        
         return DataLoader(
             self.train_ds,
             batch_size=self.cfg.train.batch_size,

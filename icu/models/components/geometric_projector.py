@@ -76,23 +76,19 @@ class GeometricProjector(nn.Module):
     3. Symmetry Gating: Captures non-linear correlations.
     4. Imputation Awareness: Handles dual-stream (Value + Mask) inputs.
     """
-    def __init__(self, d_model: int, use_imputation_masks: bool = True):
+    def __init__(self, d_model: int, hemo_dim: int = 7, labs_dim: int = 11, elec_dim: int = 4, use_imputation_masks: bool = True):
         super().__init__()
         self.d_model = d_model
         self.use_imputation_masks = use_imputation_masks
         
-        # Dimensions based on ICUConfig v11.0
-        # Hemo: 7, Labs: 11, Elec: 4
-        # Dynamic Feature Groups
-        # Indices 0-6: Hemodynamics (7)
-        # Indices 7-17: Labs (11)
-        # Indices 18-21: Electrolytes (4)
+        # [v4.2.1 SOTA] Dynamic Feature Groups
+        # Passed from ICUConfig to ensure macro-alignment
         
         scale = 2 if use_imputation_masks else 1
         
-        self.hemo_dim = 7 * scale
-        self.labs_dim = 11 * scale
-        self.elec_dim = 4 * scale
+        self.hemo_dim = hemo_dim * scale
+        self.labs_dim = labs_dim * scale
+        self.elec_dim = elec_dim * scale
         
         # Branch Projections
         # We allocate d_model/2 for Hemo (primary), d_model/2 for Labs, and d_model/4 for Elec
@@ -134,16 +130,13 @@ class GeometricProjector(nn.Module):
         B, T, C = x.shape
         scale = 2 if self.use_imputation_masks else 1
         
-        # Split into groups
-        # Based on icu/models/diffusion.py indices 0..21
-        hemo_idx = 7 * scale
-        labs_idx = (7 + 11) * scale
-        elec_idx = (7 + 11 + 4) * scale
+        # [v4.2.1 SOTA] Dynamic Slicing
+        # Uses branch dims set during __init__ to ensure alignment
         
         # Slice carefully - assumes x matches these groups perfectly
-        x_hemo = x[..., :hemo_idx]
-        x_labs = x[..., hemo_idx:labs_idx]
-        x_elec = x[..., labs_idx:elec_idx]
+        x_hemo = x[..., :self.hemo_dim]
+        x_labs = x[..., self.hemo_dim : self.hemo_dim + self.labs_dim]
+        x_elec = x[..., self.hemo_dim + self.labs_dim : self.hemo_dim + self.labs_dim + self.elec_dim]
         
         # 1. Branch Projections
         z_hemo = self.hemo_proj(x_hemo)

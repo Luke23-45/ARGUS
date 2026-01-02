@@ -920,7 +920,8 @@ class TieredEMA:
         for name, buffer in model.named_buffers():
             if name in self.shadow:
                 self.backup[name] = buffer.data.detach().cpu().clone()
-                buffer.data.copy_(self.shadow[name].to(buffer.device, non_blocking=True))
+                # [v4.2.1 SOTA FIX] Standardize on Sync for Validation Swaps
+                buffer.data.copy_(self.shadow[name].to(buffer.device, non_blocking=False))
 
     def restore(self, model: nn.Module):
         """
@@ -932,12 +933,13 @@ class TieredEMA:
         # Parameters
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.backup:
-                param.data.copy_(self.backup[name].to(param.device, non_blocking=True))
+                # [v4.2.1 SOTA FIX] Standardize on Sync for Validation Swaps
+                param.data.copy_(self.backup[name].to(param.device, non_blocking=False))
         
         # Buffers
         for name, buffer in model.named_buffers():
             if name in self.backup:
-                saved_data = self.backup[name].to(buffer.device, non_blocking=True)
+                saved_data = self.backup[name].to(buffer.device, non_blocking=False)
                 # Handle type mismatch
                 if buffer.dtype != saved_data.dtype:
                     if not torch.is_floating_point(buffer):

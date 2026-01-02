@@ -113,18 +113,25 @@ class SinusoidalPositionalEncoding(nn.Module):
         return self.pe[:T, :].unsqueeze(0).to(dtype=x.dtype, device=x.device)
 
 class AsymmetricLatentBottleneck(nn.Module):
-    def __init__(self, encoder: nn.Module, input_dim: int, d_model: int):
+    def __init__(self, encoder: nn.Module, cfg: Any):
         super().__init__()
         self.encoder = encoder
-        self.bypass = LateralBypass(input_dim, d_model)
-        self.pos_encoder = SinusoidalPositionalEncoding(d_model)
+        self.bypass = LateralBypass(
+            cfg.input_dim, 
+            cfg.d_model,
+            hemo_dim=cfg.idx_hemo_end,
+            labs_dim=cfg.idx_labs_end - cfg.idx_hemo_end,
+            elec_dim=cfg.idx_elec_end - cfg.idx_labs_end,
+            static_dim=cfg.static_dim
+        )
+        self.pos_encoder = SinusoidalPositionalEncoding(cfg.d_model)
         
         # [v4.0 PERFECT] Manifold Synchronization with RoPE and GRN
-        self.sync = RoPEMultiheadAttention(d_model)
+        self.sync = RoPEMultiheadAttention(cfg.d_model)
         self.expert_proj = nn.Sequential(
-            GatedResidualNetwork(d_model),
-            GatedResidualNetwork(d_model),
-            GatedResidualNetwork(d_model) # 3 Layers for Deep Expert Representation
+            GatedResidualNetwork(cfg.d_model),
+            GatedResidualNetwork(cfg.d_model),
+            GatedResidualNetwork(cfg.d_model) # 3 Layers for Deep Expert Representation
         )
 
     def forward(

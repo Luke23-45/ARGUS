@@ -172,6 +172,11 @@ class NTHAttention(nn.Module):
         dist = indices.unsqueeze(0) - indices.unsqueeze(1)
         # 0 for keep, -inf for mask
         local_mask_2d = (dist.abs() > self.local_window) # True to mask
+        
+        # [v4.2.1 SOTA FIX] Unstall Static Token
+        # Always allow attention to index 0 (Static Context) regardless of distance
+        local_mask_2d[:, 0] = False
+        
         local_mask_float = torch.zeros((T, T), device=x.device)
         local_mask_float = local_mask_float.masked_fill(local_mask_2d, -1e9)
         

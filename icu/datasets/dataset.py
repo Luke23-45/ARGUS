@@ -257,6 +257,7 @@ class ICUTrajectoryDataset(Dataset):
         
         # --- Lazy LMDB Handle ---
         self._lmdb_env = None
+        self._parent_pid = os.getpid() # [v4.1.1 SOTA FIX] Fork-Safety
         self.max_cache_size = max_cache_size
 
         logger.info(f"[{split.upper()}] Initialized. Windows: {self.total_chunks:,} | Episodes: {valid_episodes:,}")
@@ -265,7 +266,18 @@ class ICUTrajectoryDataset(Dataset):
         return self.total_chunks
 
     def _init_lmdb(self):
-        """Thread-safe lazy initialization of the LMDB environment."""
+        """
+        Thread-safe lazy initialization of the LMDB environment.
+        [v4.1.1 SOTA FIX] PID-Aware Multiprocessing Safety.
+        Ensures that if the dataset is forked (DataLoader workers), 
+        the child processes open their own LMDB environment handles.
+        """
+        curr_pid = os.getpid()
+        if self._lmdb_env is not None and curr_pid != self._parent_pid:
+            # Fork detected! The inherited handle is unsafe in child.
+            self._lmdb_env = None
+            self._parent_pid = curr_pid
+
         if self._lmdb_env is None:
             self._lmdb_env = lmdb.open(
                 str(self.lmdb_path),

@@ -22,12 +22,15 @@ class UncertaintyLossScaler(nn.Module):
         # We learn log_var (s) for numerical stability. 
         # sigma^2 = exp(s)
         # s is initialized to log(init_scale)
+        # [v4.2.1 SOTA FIX] Robust Registry
+        # Enforce that num_tasks matches the known ICU objective list
+        self.keys = ['diffusion', 'critic', 'aux', 'acl', 'bgsl', 'tcb']
+        if num_tasks != len(self.keys):
+             # We allow it for individual component testing, but warn for main wrapper
+             print(f"[WARNING] LossScaler num_tasks ({num_tasks}) != Registry ({len(self.keys)})")
+        
         self.num_tasks = num_tasks
         self.log_vars = nn.Parameter(torch.zeros(num_tasks))
-        
-        # Initialize custom scales if provided
-        # e.g. if we want to start with aux_scale=5.0, we affect the initial "s"
-        # However, typically we start at 0.0 (sigma=1.0) and let it drift.
         
     def forward(self, loss_dict: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
@@ -44,12 +47,12 @@ class UncertaintyLossScaler(nn.Module):
         # Task 1: Aux (Discriminative)
         
         # Default keys for ICU research (Order must match log_vars)
-        keys = ['diffusion', 'critic', 'aux', 'acl', 'bgsl', 'tcb']
+        # Use the registry defined in __init__
         
         total_loss = 0.0
         log_metrics = {}
         
-        for i, key in enumerate(keys):
+        for i, key in enumerate(self.keys):
             if i >= self.num_tasks: break # Defensive: don't exceed parameter count
             
             if key in loss_dict:

@@ -126,13 +126,18 @@ class VolatilityAwareGate(nn.Module):
         return g
 
 class LateralBypass(nn.Module):
-    def __init__(self, input_dim: int, d_model: int, dropout: float = 0.1):
+    def __init__(self, input_dim: int, d_model: int, hemo_dim: int = 7, labs_dim: int = 11, elec_dim: int = 4, static_dim: int = 6, dropout: float = 0.1):
         super().__init__()
-        # Grouped Projections
-        self.hemo_proj = nn.Linear(7, d_model // 4)
-        self.labs_proj = nn.Linear(11, d_model // 4)
-        self.elec_proj = nn.Linear(4, d_model // 4)
-        self.other_proj = nn.Linear(6, d_model // 4)
+        # [v4.2.1 SOTA] Dynamic Groups
+        self.hemo_dim = hemo_dim
+        self.labs_dim = labs_dim
+        self.elec_dim = elec_dim
+        self.static_dim = static_dim
+        
+        self.hemo_proj = nn.Linear(hemo_dim, d_model // 4)
+        self.labs_proj = nn.Linear(labs_dim, d_model // 4)
+        self.elec_proj = nn.Linear(elec_dim, d_model // 4)
+        self.other_proj = nn.Linear(static_dim, d_model // 4)
         
         self.group_gate = SymmetryGate(d_model)
         self.feat_extractor = ClinicalInceptionBlock(d_model, d_model, dropout=dropout)
@@ -161,11 +166,15 @@ class LateralBypass(nn.Module):
             static_mask = None
             temporal_mask = mask
 
-        # 1. Grouped Projection
-        z_hemo = self.hemo_proj(raw_past[:, :, :7])
-        z_labs = self.labs_proj(raw_past[:, :, 7:18])
-        z_elec = self.elec_proj(raw_past[:, :, 18:22])
-        z_other = self.other_proj(raw_past[:, :, 22:])
+        # 1. Grouped Projection [v4.2.1 SOTA Dynamic]
+        idx_hemo = self.hemo_dim
+        idx_labs = self.hemo_dim + self.labs_dim
+        idx_elec = self.hemo_dim + self.labs_dim + self.elec_dim
+        
+        z_hemo = self.hemo_proj(raw_past[:, :, :idx_hemo])
+        z_labs = self.labs_proj(raw_past[:, :, idx_hemo:idx_labs])
+        z_elec = self.elec_proj(raw_past[:, :, idx_labs:idx_elec])
+        z_other = self.other_proj(raw_past[:, :, idx_elec:])
         z_raw = torch.cat([z_hemo, z_labs, z_elec, z_other], dim=-1)
         
         # [SOTA] Gated multi-modal fusion

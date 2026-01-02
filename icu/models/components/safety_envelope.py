@@ -54,11 +54,11 @@ class PhysiologicalSafetyEnvelope(nn.Module):
             
         return dynamic_bounds
 
-    def forward(self, vitals: torch.Tensor, risk_coef: torch.Tensor) -> torch.Tensor:
+    def forward(self, vitals: torch.Tensor, risk_coef: torch.Tensor, sigma_scale: float = 1.0) -> torch.Tensor:
         """
         Computes the Violation Score.
         Violation = Mean( ReLU(x - Max) + ReLU(Min - x) )
-        Weighted by 1/effective_sigma.
+        Weighted by 1/(effective_sigma * sigma_scale).
         """
         B, T, C = vitals.shape
         bounds = self.get_bounds(risk_coef)
@@ -74,7 +74,7 @@ class PhysiologicalSafetyEnvelope(nn.Module):
             # Broadcast bounds [B] -> [B, T]
             l = low.unsqueeze(1)
             h = high.unsqueeze(1)
-            s = sigma.unsqueeze(1)
+            s = sigma.unsqueeze(1) * sigma_scale
             
             # Calculate distance from 'Clinical Safe Zone'
             # Divided by sigma: sensitive features (SpO2) generate MUCH higher loss per unit violation.
