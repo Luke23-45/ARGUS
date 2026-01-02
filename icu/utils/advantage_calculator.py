@@ -159,8 +159,8 @@ class ICUAdvantageCalculator(nn.Module):
             reward_shaping_coef: float = 0.1,   # Dense reward scale
             focal_alpha: float = 0.25,      # Negative reward emphasis
             qsofa_thresholds: Optional[Dict[str, float]] = None,  # Override defaults
-            adaptive_beta: bool = False,    # [SOTA 2025] Dynamic Temperature
-            adaptive_clipping: bool = False # [SOTA 2025] Dynamic Weight Clipping
+            adaptive_beta: bool = True,     # [SOTA 2025] Enabled by default for fresh start
+            adaptive_clipping: bool = True  # [SOTA 2025] Enabled by default for fresh start
         ):
         """
         Initialize the Advantage Calculator.
@@ -178,7 +178,7 @@ class ICUAdvantageCalculator(nn.Module):
             adaptive_clipping: Enable dynamic weight clipping (quantile-based)
         """
         super().__init__()
-        self.register_buffer("beta", torch.tensor(beta).float())
+        self.register_buffer("beta", torch.tensor(1.0).float()) # Fresh Start: Default to 1.0
         self.gamma = gamma
         self.lambda_gae = lambda_gae
         self.register_buffer("max_weight", torch.tensor(max_weight).float())
@@ -188,7 +188,7 @@ class ICUAdvantageCalculator(nn.Module):
         
         # [v2025 SOTA] State Buffers for DDP Synchronization
         self.register_buffer("ess_buffer", torch.zeros(1))
-        self.register_buffer("ess_momentum_buffer", torch.tensor(0.15)) # Target 15%
+        self.register_buffer("ess_momentum_buffer", torch.tensor(0.15)) # Improved Target: 15%
         self.register_buffer("clip_rate_buffer", torch.zeros(1))
         
         # [SOTA 2025] Adaptive Hyperparameters
@@ -660,13 +660,19 @@ class ICUAdvantageCalculator(nn.Module):
             weights: Tensor of AWR weights (same shape as input)
             diagnostics: Dict with ESS, entropy, clipping rate, etc.
         """
-        # --- 1. Global Whitening ---
+        # --- 1. Global Whitening & Winsorization ---
         if self.stats_initialized.item():
             mu, sigma = self.adv_mean, self.adv_std
         else:
-            # Batch estimation (fallback)
             mu = advantages.mean()
             sigma = advantages.std() + 1e-8
+            
+        # [SOTA 2025] Advantage Winsorization (95th Percentile Clipping)
+        # Prevents "One-Hot" collapse (ESS=0.004) caused by clinical outliers.
+        with torch.no_grad():
+            if advantages.numel() > 10:
+                p95 = torch.quantile(advantages.detach().float(), 0.95)
+                advantages = torch.clamp(advantages, max=p95)
         
         # Z-Score normalization: A ~ N(0, 1)
         norm_adv = (advantages - mu) / sigma
@@ -766,16 +772,15 @@ class ICUAdvantageCalculator(nn.Module):
                     target_ess = 0.20
                     current_ess = ess.item()
                     
-                    # P-Controller
+                    # P-Controller with Anti-Windup
                     error_ess = (target_ess - current_ess)
                     
-                    # Gain k=10.0 (High-performance / Low-Latency)
-                    # Increased from 4.0 to respond to clinical shocks instantly.
+                    # Correction factor capped to [0.5, 2.0] range to prevent runaway
                     correction = math.exp(10.0 * error_ess)
+                    correction = max(0.5, min(2.0, correction))
                     new_beta = self.beta * correction
                     
                     # Momentum Update (Reduced lag)
-                    # 0.80 allows faster tracking of distribution shifts.
                     self.beta.copy_((0.80 * self.beta) + (0.20 * new_beta))
                 
                 # [FIX 5] ESS Safety Floor: If ESS critically low, force-warm beta
@@ -802,9 +807,13 @@ class ICUAdvantageCalculator(nn.Module):
                         # We limit growth rate to avoid explosions
                         target_clip = max(2.0, min(100.0, p95 * 1.5)) # 1.5x buffer
                         
-                        new_max_weight = (self.clip_momentum * self.max_weight) + \
-                                          ((1 - self.clip_momentum) * target_clip)
-                        self.max_weight.copy_(torch.tensor(new_max_weight).to(self.max_weight.device))
+                        # [v12.8.2 SOTA FIX] Safe Tensor Assignment
+                        new_max_weight_tensor = torch.as_tensor(
+                            new_max_weight, 
+                            device=self.max_weight.device, 
+                            dtype=self.max_weight.dtype
+                        )
+                        self.max_weight.copy_(new_max_weight_tensor)
                     except:
                         pass # Fallback if quantile fails (e.g. not enough elements)
 

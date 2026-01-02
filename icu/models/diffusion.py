@@ -52,7 +52,7 @@ from icu.models.components.geometric_projector import GeometricProjector
 from icu.models.components.temporal_sampler import TemporalSampler
 from icu.models.components.nth_encoder import NTHEncoderBlock
 from icu.models.components.sequence_aux_head import SequenceAuxHead
-from icu.models.components.loss_scaler import UncertaintyLossScaler
+# from icu.models.components.loss_scaler import UncertaintyLossScaler (Removed: Scaling handled by Wrapper)
 
 # [PHASE 4-5] Agentic Evolution Components
 from icu.models.components.risk_scorer import PhysiologicalRiskScorer
@@ -1043,8 +1043,6 @@ class ICUUnifiedPlanner(nn.Module):
                 n_heads=4
             )
             
-            # [SOTA Phase 1] Uncertainty Loss Scaler
-            self.loss_scaler = UncertaintyLossScaler(num_tasks=4)
             
         # Dense Value Head for GAE-Lambda (AWR)
         # Replaced with 2025 SOTA ClinicalResidualHead
@@ -1241,16 +1239,8 @@ class ICUUnifiedPlanner(nn.Module):
                 value_loss = masked_mse
         
         # Total loss (Value weight 0.5 is standard for AWR baselines)
-        # Total loss (Value weight 0.5 is standard for AWR baselines)
-        # Total loss (Value weight 0.5 is standard for AWR baselines)
-        # [SOTA Upgrade] Use Uncertainty Scaler if available
-        if hasattr(self, 'loss_scaler') and self.cfg.use_auxiliary_head:
-            losses = {'diffusion': diff_loss, 'aux': aux_loss}
-            total, logs = self.loss_scaler(losses)
-            total = total + 0.5 * value_loss
-        else:
-            total = diff_loss + self.cfg.aux_loss_scale * aux_loss + 0.5 * value_loss
-            logs = {}
+        total = diff_loss + self.cfg.aux_loss_scale * aux_loss + 0.5 * value_loss
+        logs = {}
         
         # Compute aux_logits for return (needed by callbacks)
         # Use logits computed earlier (from SequenceAuxHead)

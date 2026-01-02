@@ -9,13 +9,14 @@ defaults:
 run_name: "gen_v1_${now:%Y-%m-%d_%H-%M-%S}"
 seed: 42
 compile_model: true
+save_checkpoints: false
 
 # --- Directory Paths ---
 output_dir: "outputs/phase1"           # Main output directory
 checkpoint_dir: "/content/drive/MyDrive/pda/icu/checkpoints"  # Where checkpoints are saved
 log_dir: "/content/drive/MyDrive/pda/icu/logs/icu"         # Training logs directory
 backup_dir: null                        # Remote/backup directory
-resume_from: "/content/drive/MyDrive/pda/checkpoints/icu_model-epoch=01-val/clinical_auroc=0.714.ckpt"             # Explicit checkpoint to resume from (optional)
+resume_from: null             # Explicit checkpoint to resume from (optional)
 # "/content/drive/MyDrive/pda/models/checkpoints/icu_model-epoch=05-val/clinical_auroc=0.747.ckpt"          
 # --- Model Architecture (ICUUnifiedPlanner) ---
 model:
@@ -63,8 +64,8 @@ train:
 
   # Debug Mode (Smoke Test)
   debug_run: true
-  debug_limit_batches: 500
-  debug_limit_val: 100
+  debug_limit_batches: 100
+  debug_limit_val: 500
 
   
   # AWR (Advantage Weighted Regression) v2.0 (Globally Optimal via Exhaustive Audit)

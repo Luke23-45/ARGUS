@@ -465,7 +465,7 @@ def main(cfg: DictConfig):
         # Handled manually in Wrapper.on_before_optimizer_step()
         gradient_clip_val=0,
         log_every_n_steps=cfg.logging.get("log_every_n_steps", 10),
-        enable_checkpointing=True,
+        enable_checkpointing=cfg.get("save_checkpoints", True),
         num_sanity_val_steps=0,  # [FIX] Allow calibration first
         accumulate_grad_batches=cfg.train.get("accumulate_grad_batches", 1),
         val_check_interval=cfg.train.get("val_check_interval", 1.0),

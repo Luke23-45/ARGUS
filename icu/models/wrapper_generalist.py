@@ -227,7 +227,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
         logger.info(f"Using balancing mode: {self.balancing_mode}")
 
         if self.balancing_mode == "sota_2025":
-            # [SOTA 2025] Use Model's internal UncertaintyLossScaler
+            # [SOTA 2025] Uncertainty Loss Scaler
+            # [v12.8.3 SOTA FIX] Direct Attachment
+            # Attaching to self instead of self.model to ensure safe device movement
+            # and registration within the LightningModule, avoiding torch.compile issues.
+            self.loss_scaler = UncertaintyLossScaler(num_tasks=4)
             logger.info("Using Model's UncertaintyLossScaler for balancing.")
         
         # Authority check: EMACallback will attach here as self.ema
@@ -268,9 +272,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
             num_classes=cfg.model.get("num_phases", 3),
             prior_pos_weight=pos_weight
         )
-        self.model.loss_scaler = UncertaintyLossScaler(num_tasks=4) # Diffusion, Critic, Aux, ACL
         # [v25.4 FIX] Initial Log-Var Reset: Start with balanced weights (sigma=1.0)
-        nn.init.constant_(self.model.loss_scaler.log_vars, 0.0)
+        if self.balancing_mode == "sota_2025":
+            nn.init.constant_(self.loss_scaler.log_vars, 0.0)
         
         # =====================================================================
         # [NEW] AGENTIC EVOLUTION CORE (Phases 1-3)
@@ -545,13 +549,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
             phys_loss = phys_violation * curr_phys_weight
             
             loss_dict = {
-                'diffusion': (raw_diff_loss * weights_awr).mean() + phys_loss,
+                'diffusion': (raw_diff_loss * weights_awr).mean(), # Removed: + phys_loss
                 'critic': critic_loss,
                 'aux': aux_loss,
                 'acl': acl_loss
             }
-            scaled_total, logs = self.model.loss_scaler(loss_dict)
-            total_loss = scaled_total
+            # [SOTA 2025] Exclusive Uncertainty Scaling
+            # phys_loss is a hard constraint (Curriculum), not aleatoric noise.
+            scaled_total, logs = self.loss_scaler(loss_dict)
+            total_loss = scaled_total + phys_loss
             
             # Single Backward Pass
             self.manual_backward(total_loss)
@@ -603,6 +609,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # Only step if we've accumulated enough batches
         acc_batches = self.trainer.accumulate_grad_batches
         if (batch_idx + 1) % acc_batches == 0:
+            # [SOTA FIX] Manual unscaling required for AdamW (especially with fused or complex states)
+            if self.trainer.precision_plugin.scaler is not None:
+                self.trainer.precision_plugin.scaler.unscale_(opt)
+            # [SOTA FIX] Manual unscaling required for fused=True AdamW in 16-mixed precision
+            # This line is redundant if the previous one handles it. Keeping one for clarity.
+            # if self.trainer.precision_plugin.scaler is not None:
+            #     self.trainer.precision_plugin.scaler.unscale_(opt)
+
             # 2025 Grad Clipping (Final safety before step)
             if self.cfg.train.get("grad_clip", 0) > 0:
                 # [SOTA FIX] Manual clipping to avoid PL MisconfigurationException
@@ -612,7 +626,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             opt.zero_grad()
             sch = self.lr_schedulers()
             if sch is not None:
-                sch.step()            
+                sch.step()
             
             # GradNorm Optimizer Step (Legacy Only)
             if self.balancing_mode == "legacy_surgical":
@@ -929,71 +943,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
     # =========================================================================
 
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        """
-        [v12.8 SOTA FIX] Flexible Restoration Suite for Architectural Transitions.
-        
-        This hook intercept legacy checkpoints and adapts them to the 2025 SOTA 
-        architecture before the strict loader triggers.
-        
-        Capabilities:
-        1. Prefix Normalization: Handles 'model.' and '_orig_mod.' discrepancies.
-        2. Surgical Resizing: Adapts log_vars from 2 tasks to 3 tasks.
-        3. Buffer Injection: Ensures AWR/ACL buffers are populated if missing.
-        """
-        state_dict = checkpoint.get("state_dict", {})
-        if not state_dict:
-            return
-
-        current_state = self.state_dict()
-        new_state_dict = {}
-
-        # 1. Prefix-Agnostic Key Mapping
-        # We normalize all keys by removing wrappers to find common ground.
-        def normalize(k):
-            return k.replace("_orig_mod.", "").replace("model.", "")
-
-        norm_to_src = {normalize(k): k for k in state_dict.keys()}
-        
-        for tgt_key in current_state.keys():
-            norm_tgt = normalize(tgt_key)
-            
-            if norm_tgt in norm_to_src:
-                src_key = norm_to_src[norm_tgt]
-                src_tensor = state_dict[src_key]
-                tgt_shape = current_state[tgt_key].shape
-                
-                # 2. Surgical Tensor Adaptation (e.g. log_vars resizing)
-                if src_tensor.shape != tgt_shape:
-                    if "loss_scaler.log_vars" in norm_tgt:
-                        logger.warning(f"[RESUME] Resizing {norm_tgt}: {src_tensor.shape} -> {tgt_shape}")
-                        # Copy existing learned tasks, keep others as current (0.0)
-                        adapted_tensor = current_state[tgt_key].clone()
-                        
-                        if src_tensor.shape[0] == 2 and tgt_shape[0] == 4:
-                            # 2-Task Legacy: [Diff, Aux]
-                            # 4-Task SOTA: [Diff, Critic, Aux, ACL]
-                            adapted_tensor[0] = src_tensor[0] # Diffusion
-                            adapted_tensor[2] = src_tensor[1] # Aux
-                            logger.info("[RESUME] Surgical Mapping: [Diff, Aux] -> [Diff, _, Aux, _]")
-                        else:
-                            # Generic fallback for other transitions
-                            n_copy = min(src_tensor.shape[0], tgt_shape[0])
-                            adapted_tensor[:n_copy] = src_tensor[:n_copy]
-                        
-                        new_state_dict[tgt_key] = adapted_tensor
-                    else:
-                        logger.warning(f"[RESUME] Shape mismatch for '{tgt_key}' ({src_tensor.shape} vs {tgt_shape}). Keeping current.")
-                        new_state_dict[tgt_key] = current_state[tgt_key].clone()
-                else:
-                    new_state_dict[tgt_key] = src_tensor
-            else:
-                # 3. Buffer Injection (Missing SOTA keys)
-                # Keep current model's initialized state for new components.
-                new_state_dict[tgt_key] = current_state[tgt_key].clone()
-
-        # Overwrite the checkpoint state dict with the adaptive version
-        checkpoint["state_dict"] = new_state_dict
-        logger.info("[RESUME] Flexible Restoration Suite: State-dict adapted for SOTA 2025.")
+        """Fresh Start: Disabling legacy migration for stability-first run."""
+        pass
         
     def _get_curr_physics_weight(self) -> float:
         """
@@ -1189,33 +1140,48 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
         # 1. Configure Robust AdamW (Fused + Parameter Hygiene)
         if self.balancing_mode == "sota_2025":
-            # [v25.3] Parameter Hygiene: Separate Model and Uncertainty parameters
-            # We must ensure groups are disjoint, or PyTorch raises ValueError
-            scaler_params = list(self.model.loss_scaler.parameters())
+            # [v25.3] Parameter Hygiene: Separate Model, Critic, and Uncertainty parameters
+            scaler_params = list(self.loss_scaler.parameters())
             scaler_ids = {id(p) for p in scaler_params}
-            model_params = [p for p in self.model.parameters() if id(p) not in scaler_ids]
             
-            # Uncertainty weights need a slightly higher LR for faster convergence
-            uw_lr = self.cfg.train.get("uw_lr", 0.025)
-            optimizer_params = [
-                {"params": model_params},
-                {
-                    "params": scaler_params,
-                    "lr": uw_lr,
-                    "weight_decay": 0.0  # Do not decay weighting parameters
-                }
+            # [SOTA 2025] Critic LR Boost (5x) for rapid calibration
+            critic_params = list(self.model.value_head.parameters())
+            critic_ids = {id(p) for p in critic_params}
+            
+            # All other parameters
+            model_params = [
+                p for p in self.model.parameters() 
+                if id(p) not in scaler_ids and id(p) not in critic_ids
             ]
+            
+            uw_lr = self.cfg.train.get("uw_lr", 0.025)
+            critic_lr = self.cfg.train.lr * 5.0
+            
+            optimizer_params = [
+                {'params': model_params, 'lr': self.cfg.train.lr, 'weight_decay': self.cfg.train.weight_decay},
+                {'params': critic_params, 'lr': critic_lr, 'weight_decay': self.cfg.train.weight_decay},
+                {'params': self.loss_scaler.parameters(), 'lr': uw_lr, 'weight_decay': 0.0}
+            ]
+            
+            logger.info(f"Optimizer: Applying 5x Critic LR Boost ({critic_lr:.2e})")
+            
+            base_optimizer = torch.optim.AdamW(
+                optimizer_params,
+                lr=self.cfg.train.lr,
+                weight_decay=self.cfg.train.weight_decay,
+                betas=(0.9, 0.999),
+                fused=False
+            )
         else:
             optimizer_params = [{"params": self.model.parameters()}]
+            base_optimizer = torch.optim.AdamW(
+                optimizer_params,
+                lr=self.cfg.train.lr,
+                weight_decay=self.cfg.train.weight_decay,
+                betas=(0.9, 0.999),
+                fused=False # [v12.8.5 SOTA FIX] Use foreach=True (robuster for compiled models)
+            )
 
-        base_optimizer = torch.optim.AdamW(
-            optimizer_params,
-            lr=self.cfg.train.lr,
-            weight_decay=self.cfg.train.weight_decay,
-            betas=(0.9, 0.999),
-            fused=True
-        )
-        
         # 2. Wrap with CAGrad
         # c=0.5 provides the optimal balance for clinical MTL (LibMTL benchmark)
         if self.balancing_mode == "legacy_surgical":
