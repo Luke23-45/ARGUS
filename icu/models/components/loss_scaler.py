@@ -55,15 +55,17 @@ class UncertaintyLossScaler(nn.Module):
             if key in loss_dict:
                 loss = loss_dict[key]
                 
-                # [v3.1.5 SOTA] Master/Slave Task Priority Logic
-                # Instead of max-clamping, we MIN-clamp clinical diagnostics.
-                # log_var >= 0.69 ensures Weight <= 0.5 * exp(-0.69) ~= 0.25.
-                # This prevents classification tasks from dominating the generative backbone.
+                # [v4.1 SOTA] Clinical Pressure Hard-Floor
+                # We enforce a MINIMUM WEIGHT of 1.0 for clinical tasks.
+                # This prevents "Generative Collapse" where the model mutes sepsis diagnostics.
+                # log_var <= -0.69315 ensures Weight = 0.5 * exp(-log_var) >= 1.0.
                 min_log_var = -10.0
-                if key in ['aux', 'acl', 'critic']:
-                    min_log_var = 0.69
+                max_log_var = 10.0
+                if key in ['aux', 'acl', 'critic', 'bgsl', 'tcb']:
+                    max_log_var = -0.69315 # Floor: Weight >= 1.0
                 
-                log_var = self.log_vars[i].clamp(min=min_log_var, max=10.0)
+                # [ANCHOR GUARD] Diffusion (key='diffusion') remains un-capped (max=10.0)
+                log_var = self.log_vars[i].clamp(min=min_log_var, max=max_log_var)
                 
                 # Weight = 1 / (2 * exp(s))
                 # We use precision weighting

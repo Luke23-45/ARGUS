@@ -337,6 +337,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
         self.train_loss_critic = MeanMetric()
         self.train_loss_phys = MeanMetric()
         self.train_loss_aux = MeanMetric()
+        self.train_loss_acl = MeanMetric()
+        self.train_loss_bgsl = MeanMetric()
+        self.train_loss_tcb = MeanMetric()
         self.train_loss_gradnorm = MeanMetric()
         self.train_awr_ess = MeanMetric()
         self.train_explained_var = MeanMetric()
@@ -468,7 +471,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 teacher_global = out_teacher["global_planner"]
                 teacher_mask = out_teacher["ctx_mask"]
                 
-                target_values = self.model.value_head(teacher_global)
+                # [v4.1 SOTA] Distributional Value (Expert Expectile Summary)
+                # We use the specialized summary for bootstrapping the RL engine.
+                target_values = self.model.value_head.get_expectile_summary(
+                    self.model.value_head(teacher_global)
+                )
             
             # [v12.7 SOTA FIX] Value-Head Bootstrapping
             # If a window is truncated (not yet at end of stay), we bootstrap 
@@ -481,10 +488,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
             else:
                 bootstrap_value = None
 
-            # [v25.7 SOTA] SAW Calculation with Student-Teacher Transition
             # A(s, s') = r + gamma * V_teacher(s') - V_student(s)
             with torch.no_grad():
-                student_values = self.model.value_head(global_ctx).detach()
+                # [v4.1 SOTA] Expert Expectile Summary for Student
+                student_values = self.model.value_head.get_expectile_summary(
+                    self.model.value_head(global_ctx)
+                ).detach()
             
             advantages = self.awr_calculator.compute_saw(
                 rewards, 
@@ -525,9 +534,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
         diff_loss = (raw_diff_loss * weights_awr * f_mask).sum() / (f_mask.sum() + 1e-8)
         self.train_awr_ess.update(weights_awr_log.get("train/awr_ess", 0.0))
         
-        # C. Critic Task (Robust SmoothL1)
+        # C. Critic Task (SOTA IDC-25)
+        # Replaced scalar MSE with Distributional Implicit Q-Learning (IQL-QR)
         pred_values = self.model.value_head(global_ctx)
-        critic_loss = smooth_l1_critic_loss(pred_values, returns)
+        critic_loss = self.model.value_loss_fn(pred_values, returns)
+        
+        # [v4.1] Explained Variance calculation (using distribution mean)
+        with torch.no_grad():
+            self.train_explained_var.update(
+                self.model.value_loss_fn.compute_explained_variance(pred_values, returns)
+            )
         
         # D. Auxiliary Task (MoE / Sepsis Diagnostics)
         aux_loss = torch.tensor(0.0, device=self.device)
@@ -575,10 +591,23 @@ class ICUGeneralistWrapper(pl.LightningModule):
             raw_aux_loss = self.risk_aware_loss(logits, targets_one_hot, risk_coef, class_weights=class_weights)
             aux_loss = raw_aux_loss * cfm * mining_weight.mean()
 
+            # [SOTA v4.1] Global Embedding Synchronization (DDP Safety)
+            # Use torch.distributed.nn.functional to preserve gradients across ranks.
+            # This ensures that GPU-0 can learn from Sepsis cases on GPU-1.
+            if torch.distributed.is_initialized():
+                from torch.distributed.nn.functional import all_gather
+                ctx_aux_global = torch.cat(all_gather(ctx_aux), dim=0)
+                # Ensure targets are broadcastable to the global batch
+                targets_global = torch.cat(all_gather(targets.long()), dim=0)
+                mask_global = torch.cat(all_gather(ctx_mask), dim=0)
+            else:
+                ctx_aux_global = ctx_aux
+                targets_global = targets
+                mask_global = ctx_mask
+
             # Sepsis Contrastive Loss (ACL)
-            # Pass window targets (B,); AsymmetricContrastiveLoss broadcasts to (B, T) internally
-            # [SOTA v3.1.5] ACL also uses the throttled path for stability.
-            acl_loss = self.sepsis_acl(ctx_aux, targets, mask=ctx_mask) * cfm
+            # Use global pointers to solve the acl_L=0 locally on negative-only ranks.
+            acl_loss = self.sepsis_acl(ctx_aux_global, targets_global, mask=mask_global) * cfm
 
 
         # --- 3. [DEPRECATED] SOTA Path: Gradient Scaling Hooks ---
@@ -620,9 +649,6 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Alignment: BGSL expects T context derived from past_norm (T=24).
             # We strip the static token (index 0) to align with physiological vitals.
             true_state = batch["phase_label"].float().view(B, 1, 1).expand(-1, ctx_expert.size(1), 1)
-            
-            # [DEBUG] BGSL Shape Audit
-            print(f"DEBUG: ctx_expert={ctx_expert.shape}, pred_state={pred_state.shape}, ctx_mask={ctx_mask.shape}")
             
             bgsl_out = self.bgsl_loss(
                 pred_state[:, 1:], # [B, T, 1]
@@ -740,10 +766,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
             ev = compute_explained_variance(pred_values, returns)
             
             # Update metric accumulators
-            self.train_loss_total.update((diff_loss + critic_loss + aux_loss).detach())
+            self.train_loss_total.update(total_loss.detach())
             self.train_loss_diff.update(diff_loss.detach())
             self.train_loss_critic.update(critic_loss.detach())
             self.train_loss_aux.update(aux_loss.detach())
+            self.train_loss_acl.update(acl_loss.detach())
+            self.train_loss_bgsl.update(l_bgsl.detach())
+            self.train_loss_tcb.update(l_tcb.detach())
             self.train_loss_phys.update(phys_loss.detach())
             self.train_loss_gradnorm.update(gn_loss.detach())
             self.train_awr_ess.update(diag["ess"])
@@ -757,22 +786,28 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # [SOTA FIX] DO NOT use .item() here. It causes graph breaks in torch.compile.
             # Lightning handles tensor logging efficiently.
             self.log_dict({
-                "total_loss": (diff_loss + critic_loss + aux_loss),
+                "total_loss": total_loss,
                 "diff_loss": diff_loss,
                 "critic_loss": critic_loss,
                 "phys_loss": phys_loss,
                 "aux_loss": aux_loss,
+                "acl_loss": acl_loss,
+                "bgsl_loss": l_bgsl,
+                "tcb_loss": l_tcb,
                 "awr_ess": diag["ess"],
                 "explained_var": ev,
-                "curr_phys_weight": torch.tensor(curr_phys_weight, device=self.device),
-                "w_aux": torch.tensor(task_weights[2], device=self.device),
-                "lr": torch.tensor(self.optimizers().param_groups[0]["lr"], device=self.device)
+                "curr_phys_weight": torch.as_tensor(curr_phys_weight, device=self.device).detach().clone(),
+                "w_aux": torch.as_tensor(task_weights[2], device=self.device).detach().clone(),
+                "lr": torch.as_tensor(self.optimizers().param_groups[0]["lr"], device=self.device).detach().clone()
             }, on_step=True, on_epoch=False, prog_bar=True)
 
             # [TELEMETRY] Detailed Diagnostics (WandB Only)
             self.log_dict({
                 "train/loss_critic": self.train_loss_critic,
                 "train/loss_aux": self.train_loss_aux,
+                "train/loss_acl": self.train_loss_acl,
+                "train/loss_bgsl": self.train_loss_bgsl,
+                "train/loss_tcb": self.train_loss_tcb,
                 "train/loss_phys": self.train_loss_phys,
                 "train/loss_gradnorm": self.train_loss_gradnorm,
                 "train/explained_var": self.train_explained_var,
@@ -794,6 +829,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
             "train/epoch_loss_critic": self.train_loss_critic.compute(),
             "train/epoch_loss_phys": self.train_loss_phys.compute(),
             "train/epoch_loss_aux": self.train_loss_aux.compute(),
+            "train/epoch_loss_acl": self.train_loss_acl.compute(),
+            "train/epoch_loss_bgsl": self.train_loss_bgsl.compute(),
+            "train/epoch_loss_tcb": self.train_loss_tcb.compute(),
             "train/epoch_awr_ess": self.train_awr_ess.compute(),
             "train/epoch_explained_var": self.train_explained_var.compute(),
         }, sync_dist=True)
@@ -871,7 +909,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 # We previously compared pred_value (Returns [~-7, 5]) to binary_label (Outcome [0, 1]).
                 # This caused the meaningless -0.005 value due to scale mismatch.
                 # Now we compute actual validation returns for a true Critic Quality check.
-                value_preds = out.get("pred_value", None)
+                # [v4.1 SOTA] Distributional EV calculation 
+                # We use the mean of the quantiles as the 'expectile' summary for scalar metrics.
                 if value_preds is not None:
                     with torch.no_grad():
                         # Calculate ground truth rewards for the validation batch
@@ -880,13 +919,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
                             normalizer=self.model.normalizer if hasattr(self.model, 'normalizer') else None
                         )
                         # Estimate GAE advantages and total returns
-                        # (Using value_preds for GAE bootstrapping ensures internal consistency)
-                        val_adv = self.awr_calculator.compute_gae(val_rewards, value_preds)
-                        val_returns = (val_adv + value_preds).detach()
+                        # [v4.1 SOTA] Expert Expectile Summary
+                        v_mean = self.model.value_head.get_expectile_summary(value_preds)
+                        val_adv = self.awr_calculator.compute_gae(val_rewards, v_mean)
+                        val_returns = (val_adv + v_mean).detach()
                         
-                        # [v5.3.3 FIX] Shape Alignment: use mean across trajectory for scalar metric
-                        # This compares "The target return we expected" vs "The return we predicted".
-                        ev = compute_explained_variance(value_preds.mean(dim=1), val_returns.mean(dim=1))
+                        # Use the distributional EV calculator
+                        ev = self.model.value_loss_fn.compute_explained_variance(value_preds, val_returns)
                         self.val_explained_var.update(ev)
 
         # 3. Clinical Trajectory Sampling (Only first batch to save compute)

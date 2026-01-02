@@ -257,10 +257,12 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
 
         num_workers = self.cfg.train.num_workers
         
-        # [SOTA] Use EpisodeAwareSampler to prevent LRU Cache Thrashing
-        # This keeps 'shuffle' behavior (random episodes) but sequential frames.
-        sampler = EpisodeAwareSampler(
+        # [v4.1 SOTA] Balanced Clinical Sampling
+        # Ensures 15% sepsis prevalence to solve "Generative Collapse" / EV collapse.
+        from icu.utils.samplers import WeightedEpisodeSampler
+        sampler = WeightedEpisodeSampler(
             self.train_ds, 
+            target_prevalence=0.15,
             shuffle=True, 
             seed=self.cfg.seed,
             drop_last=True
