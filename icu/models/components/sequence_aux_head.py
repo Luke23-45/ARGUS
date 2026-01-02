@@ -52,7 +52,7 @@ class AsymmetricLoss(nn.Module):
         else:
             loss = -(los_pos + los_neg)
             
-        return loss.sum()
+        return loss.mean()
 
 # --- Shared SOTA Components (Duplicated from nth_encoder.py for independence) ---
 class SwiGLU(nn.Module):

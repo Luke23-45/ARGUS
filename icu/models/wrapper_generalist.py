@@ -269,6 +269,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
             prior_pos_weight=pos_weight
         )
         self.model.loss_scaler = UncertaintyLossScaler(num_tasks=2) # Diffusion + Aux
+        # [v25.4 FIX] Initial Log-Var Reset: Start with balanced weights (sigma=1.0)
+        nn.init.constant_(self.model.loss_scaler.log_vars, 0.0)
         
         # =====================================================================
         # [NEW] AGENTIC EVOLUTION CORE (Phases 1-3)
@@ -277,7 +279,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         self.risk_scorer = PhysiologicalRiskScorer()
         self.risk_aware_loss = RiskAwareAsymmetricLoss(
             gamma_neg=cfg.train.get("asl_gamma_neg", 4.0),
-            gamma_pos=cfg.train.get("asl_gamma_pos", 0.0),
+            gamma_pos=cfg.train.get("asl_gamma_pos", 1.0),
             critical_multiplier=cfg.train.get("risk_multiplier", 2.0)
         )
         
@@ -468,22 +470,26 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # D. Auxiliary Task (MoE / Sepsis Diagnostics)
         aux_loss = torch.tensor(0.0, device=self.device)
         if self.cfg.model.use_auxiliary_head and "phase_label" in batch:
-            # [SOTA FIX] Alignment: Use teacher_mask (length 25) to match teacher_seq.
-            # Raw bool_padding_mask (length 24) causes off-by-one mismatch in AuxHead.
-            logits, _ = self.model.aux_head(teacher_seq, mask=teacher_mask)
+            # [CRITICAL FIX 1] Use ctx_seq (Student) instead of teacher_seq
+            # teacher_seq is detached from graph, preventing encoder learning
+            logits, _ = self.model.aux_head(ctx_seq, mask=ctx_mask)
             
-            # [SOTA FIX] Align targets for RiskAwareAsymmetricLoss (Expects one-hot if multi-class)
+            # [FIX 3] Integrate DynamicClassBalancer for imbalanced sepsis data
             targets = batch["phase_label"]
+            self.class_balancer.update(targets)
+            class_weights = self.class_balancer.get_weights().to(self.device)
+            
             if logits.shape[-1] > 1 and targets.ndim == 1:
                 targets = F.one_hot(targets.long(), num_classes=logits.shape[-1]).float()
             elif logits.shape[-1] == 1 and targets.ndim == 1:
                 targets = targets.float().unsqueeze(-1)
                 
-            aux_loss = self.risk_aware_loss(logits, targets, risk_coef)
+            aux_loss = self.risk_aware_loss(logits, targets, risk_coef, class_weights=class_weights)
+
 
         # --- 3. SOTA Path: Gradient Scaling Hooks (O(1) Conflict Resolution) ---
-        if self.balancing_mode == "sota_2025":
-            throttle_scale = self.cfg.train.get("throttle_scale", 0.2)
+            # [FIX 4] Increase throttle_scale to 1.0 (was 0.2, muffling signal by 80%)
+            throttle_scale = self.cfg.train.get("throttle_scale", 1.0)
             for ctx in [ctx_seq, global_ctx]:
                 if ctx.requires_grad:
                     ctx.register_hook(lambda grad: grad * throttle_scale if grad is not None else None)

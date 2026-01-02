@@ -727,7 +727,12 @@ class ICUAdvantageCalculator(nn.Module):
                     # 0.80 allows faster tracking of distribution shifts.
                     self.beta.copy_((0.80 * self.beta) + (0.20 * new_beta))
                 
+                # [FIX 5] ESS Safety Floor: If ESS critically low, force-warm beta
+                if current_ess < 0.05:
+                    self.beta.copy_(self.beta * 1.5)
+                
                 self.beta.copy_(self.beta.clamp(min=self.min_beta, max=self.max_beta))
+
                 
             # B. Adaptive Clipping (Target = 95th Percentile)
             if self.adaptive_clipping:
