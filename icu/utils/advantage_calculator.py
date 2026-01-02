@@ -188,6 +188,7 @@ class ICUAdvantageCalculator(nn.Module):
         
         # [v2025 SOTA] State Buffers for DDP Synchronization
         self.register_buffer("ess_buffer", torch.zeros(1))
+        self.register_buffer("ess_momentum_buffer", torch.tensor(0.15)) # Target 15%
         self.register_buffer("clip_rate_buffer", torch.zeros(1))
         
         # [SOTA 2025] Adaptive Hyperparameters
@@ -501,6 +502,56 @@ class ICUAdvantageCalculator(nn.Module):
     # GENERALIZED ADVANTAGE ESTIMATION (GAE)
     # =========================================================================
 
+    # =========================================================================
+    # STATE ADVANTAGE WEIGHTING (SAW) - 2025 SOTA
+    # =========================================================================
+
+    def compute_saw(
+        self, 
+        rewards: torch.Tensor, 
+        student_values: torch.Tensor, 
+        teacher_values: torch.Tensor,
+        dones: Optional[torch.Tensor] = None,
+        bootstrap_value: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        [SOTA 2025] State Advantage Weighting (SAW).
+        De-couples actions from values by focusing on state transitions.
+        
+        Formula: A_t = r_t + gamma * V_teacher(s_{t+1}) * (1-d_t) - V_student(s_t)
+        
+        Args:
+            rewards: (B, T) Tensor of rewards
+            student_values: (B, T) V_student predictions
+            teacher_values: (B, T) V_teacher predictions (EMA)
+            dones: (B, T) Terminal markers
+            bootstrap_value: (B, 1) V_teacher(s_{T+1})
+        """
+        B, T = rewards.shape
+        device = rewards.device
+        
+        if bootstrap_value is not None:
+            if bootstrap_value.dim() == 1:
+                bootstrap_value = bootstrap_value.unsqueeze(1)
+            next_v_teacher = torch.cat([teacher_values[:, 1:], bootstrap_value], dim=1)
+        else:
+            next_v_teacher = torch.cat([teacher_values[:, 1:], teacher_values[:, -1:]], dim=1)
+
+        if dones is not None:
+            if dones.dim() == 1:
+                non_terminal = torch.ones((B, T), device=device)
+                non_terminal[:, -1] = 1.0 - dones.float()
+            else:
+                non_terminal = 1.0 - dones.float()
+        else:
+            non_terminal = torch.ones((B, T), device=device)
+
+        # SAW Advantage: r + gamma * V_teacher(s') - V_student(s)
+        # This prevents the student from "cheating" by lowering all values.
+        advantages = rewards + (self.gamma * next_v_teacher * non_terminal) - student_values
+        
+        return advantages
+
     def compute_gae(
         self, 
         rewards: torch.Tensor, 
@@ -730,6 +781,10 @@ class ICUAdvantageCalculator(nn.Module):
                 # [FIX 5] ESS Safety Floor: If ESS critically low, force-warm beta
                 if current_ess < 0.05:
                     self.beta.copy_(self.beta * 1.5)
+
+                # [v25.6 SOTA] ESS Momentum Buffer
+                # Stabilizes telemetry across jittery batches.
+                self.ess_momentum_buffer.copy_(0.95 * self.ess_momentum_buffer + 0.05 * current_ess)
                 
                 self.beta.copy_(self.beta.clamp(min=self.min_beta, max=self.max_beta))
 

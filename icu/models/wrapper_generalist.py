@@ -89,6 +89,7 @@ from icu.models.components.loss_scaler import UncertaintyLossScaler
 # [PHASE 1-3] Agentic Evolution Components
 from icu.models.components.risk_scorer import PhysiologicalRiskScorer
 from icu.models.components.risk_aware_loss import RiskAwareAsymmetricLoss
+from icu.models.components.contrastive_loss import AsymmetricContrastiveLoss
 from icu.models.components.safety_envelope import PhysiologicalSafetyEnvelope
 from icu.models.components.horizon_scheduler import ClinicalHorizonScheduler
 
@@ -249,14 +250,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # 4. SOTA GRADIENT & LOSS BALANCING
         # =====================================================================
         self.gradnorm = None
-        if self.balancing_mode == "legacy_surgical":
-            # GradNorm dynamically weights [Diffusion, Critic, Sepsis]
-            # We target the Shared Encoder as the primary balancing anchor.
+        if self.balancing_mode == "legacy_surgical" or True: # [v25.7] Force enable for ACL expansion
+            # GradNorm dynamically weights [Diffusion, Critic, Sepsis-Clf, Sepsis-ACL]
             self.gradnorm = GradNormBalancer(
-                num_tasks=3, 
+                num_tasks=4, 
                 shared_params=self.model.encoder.parameters(),
                 alpha=cfg.train.get("gradnorm_alpha", 1.5)
-            ).to(self.device) # [v20.1] Immediate device alignment for manual opt
+            ).to(self.device)
         
         self.base_phys_weight = cfg.train.get("phys_loss_weight", 0.2)
         self.safety_guardian = OODGuardian()
@@ -268,7 +268,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             num_classes=cfg.model.get("num_phases", 3),
             prior_pos_weight=pos_weight
         )
-        self.model.loss_scaler = UncertaintyLossScaler(num_tasks=2) # Diffusion + Aux
+        self.model.loss_scaler = UncertaintyLossScaler(num_tasks=3) # Diffusion + Sepsis-Clf + Sepsis-ACL
         # [v25.4 FIX] Initial Log-Var Reset: Start with balanced weights (sigma=1.0)
         nn.init.constant_(self.model.loss_scaler.log_vars, 0.0)
         
@@ -281,6 +281,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
             gamma_neg=cfg.train.get("asl_gamma_neg", 4.0),
             gamma_pos=cfg.train.get("asl_gamma_pos", 1.0),
             critical_multiplier=cfg.train.get("risk_multiplier", 2.0)
+        )
+        
+        self.sepsis_acl = AsymmetricContrastiveLoss(
+            d_model=cfg.model.d_model,
+            num_classes=3,
+            centroid_reg=cfg.train.get("acl_centroid_reg", 0.01)
         )
         
         # Phase 2: Per-Feature Safety
@@ -443,13 +449,19 @@ class ICUGeneralistWrapper(pl.LightningModule):
             else:
                 bootstrap_value = None
 
-            advantages = self.awr_calculator.compute_gae(
+            # [v25.7 SOTA] SAW Calculation with Student-Teacher Transition
+            # A(s, s') = r + gamma * V_teacher(s') - V_student(s)
+            with torch.no_grad():
+                student_values = self.model.value_head(global_ctx).detach()
+            
+            advantages = self.awr_calculator.compute_saw(
                 rewards, 
-                target_values,
+                student_values=student_values,
+                teacher_values=target_values,
                 dones=batch.get("is_terminal", None),
                 bootstrap_value=bootstrap_value
             )
-            returns = (advantages + target_values).detach()
+            returns = (advantages + student_values).detach()
             
             # [2025 SOTA] High-Pressure AWR Weights
             weights_awr, diag = self.awr_calculator.calculate_weights(
@@ -469,6 +481,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         
         # D. Auxiliary Task (MoE / Sepsis Diagnostics)
         aux_loss = torch.tensor(0.0, device=self.device)
+        acl_loss = torch.tensor(0.0, device=self.device)
         if self.cfg.model.use_auxiliary_head and "phase_label" in batch:
             # [CRITICAL FIX 1] Use ctx_seq (Student) instead of teacher_seq
             # teacher_seq is detached from graph, preventing encoder learning
@@ -479,12 +492,34 @@ class ICUGeneralistWrapper(pl.LightningModule):
             self.class_balancer.update(targets)
             class_weights = self.class_balancer.get_weights().to(self.device)
             
+            # [SOTA 2025] Class Frequency Multiplier (CFM)
+            # Magnifies signal without numerical shock.
+            n_total = targets.numel()
+            n_sepsis = (targets > 0).sum().item()
+            cfm = n_total / max(1, n_sepsis)
+            
+            # [SOTA 2025] Dynamic Hard Negative Mining (Mining Weight)
+            # W_mining = 1.0 + Sigmoid(Error)
+            with torch.no_grad():
+                probs = torch.softmax(logits, dim=-1)
+                # Error is 1.0 - probability of true class
+                true_probs = probs.gather(-1, targets.unsqueeze(-1).long() if targets.ndim==1 else targets.argmax(-1, keepdim=True))
+                error = 1.0 - true_probs.squeeze(-1)
+                mining_weight = 1.0 + torch.sigmoid(error * 5.0) # Scale error for sharp response
+            
             if logits.shape[-1] > 1 and targets.ndim == 1:
-                targets = F.one_hot(targets.long(), num_classes=logits.shape[-1]).float()
+                targets_one_hot = F.one_hot(targets.long(), num_classes=logits.shape[-1]).float()
             elif logits.shape[-1] == 1 and targets.ndim == 1:
-                targets = targets.float().unsqueeze(-1)
-                
-            aux_loss = self.risk_aware_loss(logits, targets, risk_coef, class_weights=class_weights)
+                targets_one_hot = targets.float().unsqueeze(-1)
+            else:
+                targets_one_hot = targets
+
+            # Sepsis Classification Loss (Weighted)
+            raw_aux_loss = self.risk_aware_loss(logits, targets_one_hot, risk_coef, class_weights=class_weights)
+            aux_loss = raw_aux_loss * cfm * mining_weight.mean()
+
+            # Sepsis Contrastive Loss (ACL)
+            acl_loss = self.sepsis_acl(ctx_seq, targets, mask=ctx_mask) * cfm
 
 
         # --- 3. SOTA Path: Gradient Scaling Hooks (O(1) Conflict Resolution) ---
@@ -508,7 +543,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
             
             loss_dict = {
                 'diffusion': (raw_diff_loss * weights_awr).mean() + phys_loss,
-                'aux': aux_loss
+                'aux': aux_loss,
+                'acl': acl_loss
             }
             scaled_total, logs = self.model.loss_scaler(loss_dict)
             total_loss = scaled_total + 0.5 * critic_loss
@@ -516,16 +552,27 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Single Backward Pass
             self.manual_backward(total_loss)
             gn_loss = torch.tensor(0.0, device=self.device)
-            task_weights = [logs.get('weight/diffusion', 1.0), 0.5, logs.get('weight/aux', 1.0)]
+            # Weights for logging (Sigmas)
+            task_weights = [
+                logs.get('weight/diffusion', 1.0), 
+                0.5, 
+                logs.get('weight/aux', 1.0),
+                logs.get('weight/acl', 1.0)
+            ]
             
         else:
             # [Legacy Surgical] Multi-Pass CAGrad + GradNorm
             diff_loss_unweighted = (raw_diff_loss * weights_awr).mean()
-            primary_losses = torch.stack([diff_loss_unweighted, critic_loss, aux_loss])
+            primary_losses = torch.stack([diff_loss_unweighted, critic_loss, aux_loss, acl_loss])
             gn_loss, task_weights = self.gradnorm.update(primary_losses)
             
             # 2. Weighted losses for CAGrad surgery
-            weighted_tasks = [diff_loss_unweighted * task_weights[0], critic_loss * task_weights[1], aux_loss * task_weights[2]]
+            weighted_tasks = [
+                diff_loss_unweighted * task_weights[0], 
+                critic_loss * task_weights[1], 
+                aux_loss * task_weights[2],
+                acl_loss * task_weights[3]
+            ]
             
             # 3. Conflict-Averse Surgery (Backward Pass)
             is_start_of_accum = (batch_idx % self.trainer.accumulate_grad_batches == 0)

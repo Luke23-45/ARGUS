@@ -43,8 +43,8 @@ class UncertaintyLossScaler(nn.Module):
         # Task 0: Diffusion (Generative)
         # Task 1: Aux (Discriminative)
         
-        # Default keys
-        keys = ['diffusion', 'aux']
+        # Default keys for ICU research
+        keys = ['diffusion', 'aux', 'acl']
         
         total_loss = 0.0
         log_metrics = {}
@@ -56,7 +56,7 @@ class UncertaintyLossScaler(nn.Module):
                 # [v12.8 SOTA FIX] Log-Var Clamping & Signal Floor
                 # To prevent precision overflows and ensure a minimum signal contribution.
                 max_log_var = 10.0
-                if key == 'aux':
+                if key in ['aux', 'acl']:
                     # Min weight 0.05 -> 0.5 * exp(-log_var) >= 0.05 -> log_var <= ~2.3
                     max_log_var = 2.3
                 
