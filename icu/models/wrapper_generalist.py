@@ -92,6 +92,8 @@ from icu.models.components.risk_aware_loss import RiskAwareAsymmetricLoss
 from icu.models.components.contrastive_loss import AsymmetricContrastiveLoss
 from icu.models.components.safety_envelope import PhysiologicalSafetyEnvelope
 from icu.models.components.horizon_scheduler import ClinicalHorizonScheduler
+from icu.models.components.bgsl_loss import BGSLLoss
+from icu.models.components.temporal_buffer import TemporalContrastiveBuffer
 
 # Specialized Metric Collection
 from torchmetrics import MeanSquaredError, Accuracy, MeanMetric, AUROC, Precision, Recall, F1Score
@@ -231,8 +233,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # [v12.8.3 SOTA FIX] Direct Attachment
             # Attaching to self instead of self.model to ensure safe device movement
             # and registration within the LightningModule, avoiding torch.compile issues.
-            self.loss_scaler = UncertaintyLossScaler(num_tasks=4)
-            logger.info("Using Model's UncertaintyLossScaler for balancing.")
+            # [v4.0 FIX] Initialized with 6 tasks: [diffusion, critic, aux, acl, bgsl, tcb]
+            self.loss_scaler = UncertaintyLossScaler(num_tasks=6)
+            logger.info("Using Model's UncertaintyLossScaler for balancing (6 tasks).")
         
         # Authority check: EMACallback will attach here as self.ema
         self.ema = None 
@@ -308,6 +311,23 @@ class ICUGeneralistWrapper(pl.LightningModule):
             warmup_epochs=cfg.train.get("horizon_warmup", 10),
             ramp_epochs=cfg.train.get("horizon_ramp", 40)
         )
+        
+        # [v4.0 PERFECT] Advanced Supervision Components
+        self.bgsl_loss = BGSLLoss(
+            pos_weight=cfg.train.get("pos_weight", 10.0),
+            gamma=cfg.train.get("asl_gamma_neg", 4.0), # Reusing ASL gamma
+            trend_coef=cfg.train.get("trend_coef", 1.0),
+            shock_coef=cfg.train.get("shock_coef", 2.0)
+        )
+        
+        self.tcb_buffer = TemporalContrastiveBuffer(
+            d_model=cfg.model.d_model,
+            capacity=cfg.train.get("tcb_capacity", 1024),
+            temperature=cfg.train.get("tcb_temp", 0.07)
+        )
+        
+        # [v4.0 PERFECT] Manifold Projections
+        self.expert_state_head = nn.Linear(cfg.model.d_model, 1)
         
         # =====================================================================
         # 5. TRAINING TELEMETRY (Accumulated Metrics)
@@ -407,12 +427,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
         else:
             bool_padding_mask = None
         
-        ctx_seq, global_ctx, ctx_mask = self.model.encoder(
+        out_alb = self.model.encoder(
             past_norm, 
             static_norm, 
             imputation_mask=src_mask,      # [v25.2 FIX] Pass 3D mask for Imputation Awareness
             padding_mask=bool_padding_mask # [v25.2 FIX] Pass 2D mask for Transformer Attention
         )
+        ctx_seq = out_alb["ctx_planner"]
+        global_ctx = out_alb["global_planner"]
+        ctx_expert = out_alb["ctx_expert"]
+        ctx_mask = out_alb["ctx_mask"]
         
         # --- 2. Per-Task Loss Component Computation ---
         
@@ -420,7 +444,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         t = torch.randint(0, self.model.cfg.timesteps, (B,), device=self.device)
         noisy_fut, noise_eps = self.model.scheduler.add_noise(fut_norm, t)
         pred_noise = self.model.backbone(noisy_fut, t, ctx_seq, global_ctx, ctx_mask)
-        raw_diff_loss = F.mse_loss(pred_noise, noise_eps, reduction='none').mean(dim=[1, 2])
+        raw_diff_loss = F.mse_loss(pred_noise, noise_eps, reduction='none').mean(dim=2)
 
         # B. Advantage Engine (AWR with authoritative EMA Teacher)
         with torch.no_grad():
@@ -434,12 +458,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
             )
             # [SOTA] Use Teacher Context for bootstrapping
             with self.ema_teacher_context():
-                teacher_seq, teacher_global, teacher_mask = self.model.encoder(
+                out_teacher = self.model.encoder(
                     past_norm, 
                     static_norm, 
                     imputation_mask=src_mask, 
                     padding_mask=bool_padding_mask
                 )
+                teacher_seq = out_teacher["ctx_planner"]
+                teacher_global = out_teacher["global_planner"]
+                teacher_mask = out_teacher["ctx_mask"]
+                
                 target_values = self.model.value_head(teacher_global)
             
             # [v12.7 SOTA FIX] Value-Head Bootstrapping
@@ -505,9 +533,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
         aux_loss = torch.tensor(0.0, device=self.device)
         acl_loss = torch.tensor(0.0, device=self.device)
         if self.cfg.model.use_auxiliary_head and "phase_label" in batch:
-            # [CRITICAL FIX 1] Use ctx_seq (Student) instead of teacher_seq
-            # teacher_seq is detached from graph, preventing encoder learning
-            logits, _ = self.model.aux_head(ctx_seq, mask=ctx_mask)
+            # [SOTA v3.1.5] Asymmetric Throttling: The "Peace Treaty"
+            # We clone the sequence context and restrict its gradient influence to 10%.
+            # This allows the Sepsis head to "read" features without "dominating" them.
+            ctx_aux = ctx_seq.clone()
+            if ctx_aux.requires_grad:
+                ctx_aux.register_hook(lambda g: g * 0.1)
+
+            logits, _ = self.model.aux_head(ctx_aux, mask=ctx_mask)
             
             # [FIX 3] Integrate DynamicClassBalancer for imbalanced sepsis data
             targets = batch["phase_label"] # [B]
@@ -544,15 +577,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
             # Sepsis Contrastive Loss (ACL)
             # Pass window targets (B,); AsymmetricContrastiveLoss broadcasts to (B, T) internally
-            acl_loss = self.sepsis_acl(ctx_seq, targets, mask=ctx_mask) * cfm
+            # [SOTA v3.1.5] ACL also uses the throttled path for stability.
+            acl_loss = self.sepsis_acl(ctx_aux, targets, mask=ctx_mask) * cfm
 
 
-        # --- 3. SOTA Path: Gradient Scaling Hooks (O(1) Conflict Resolution) ---
-            # [FIX 4] Increase throttle_scale to 1.0 (was 0.2, muffling signal by 80%)
-            throttle_scale = self.cfg.train.get("throttle_scale", 1.0)
-            for ctx in [ctx_seq, global_ctx]:
-                if ctx.requires_grad:
-                    ctx.register_hook(lambda grad: grad * throttle_scale if grad is not None else None)
+        # --- 3. [DEPRECATED] SOTA Path: Gradient Scaling Hooks ---
+        # Legacy manual hooks removed in v3.1.5 in favor of Unified Pass + 
+        # Asymmetric Throttling via ctx_aux path.
         
         # --- 4. Multi-Task Balancing Logic ---
         if self.balancing_mode == "sota_2025":
@@ -572,20 +603,69 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 'aux': aux_loss,
                 'acl': acl_loss
             }
+            
+            # [v4.0 PERFECT] Add BGSL and TCB to the balance
+            # pred_state is logits from aux_head. We need them to be [B, T, 1] for BGSL.
+            # SequenceAuxHead returns [B, C]. We need a sequence-level prediction.
+            # However, for now, let's assume we use the window-level logits for state loss
+            # and potentially expand SequenceAuxHead if we want sequence-level risk.
+            
+            # [REFINEMENT] Extract sequence-level logits for BGSL (Phase 1)
+            # For perfect alignment, we call BGSL on ctx_expert
+            pred_state = self.expert_state_head(ctx_expert) # [B, T, 1]
+            
+            # [v4.0 FIX] Proper expansion for sequence-level targets
+            # phase_label is [B]. We expand to [B, T, 1].
+            # [REFINEMENT] Prepare sequence-level inputs for BGSL (Phase 1)
+            # Alignment: BGSL expects T context derived from past_norm (T=24).
+            # We strip the static token (index 0) to align with physiological vitals.
+            true_state = batch["phase_label"].float().view(B, 1, 1).expand(-1, ctx_expert.size(1), 1)
+            
+            # [DEBUG] BGSL Shape Audit
+            print(f"DEBUG: ctx_expert={ctx_expert.shape}, pred_state={pred_state.shape}, ctx_mask={ctx_mask.shape}")
+            
+            bgsl_out = self.bgsl_loss(
+                pred_state[:, 1:], # [B, T, 1]
+                true_state[:, 1:], # [B, T, 1]
+                past_norm,          # [B, T, 28] 
+                risk_coef=risk_coef.view(B, 1, 1), # [B, 1, 1] for broadcasting
+                mask=ctx_mask[:, 1:] # [B, T]
+            )
+            l_bgsl = bgsl_out["loss"]
+            
+            # [v4.0 PERFECT] Contrastive Buffer Update
+            # Use current expert representations as queries (Student)
+            # Use teacher representations as positive keys (MoCo style)
+            # Use stable trajectories (label=0) as negative candidates for the bank
+            is_negative = (batch["phase_label"] == 0)
+            tcb_out = self.tcb_buffer(
+                global_ctx,           # Student Query
+                teacher_global,       # Teacher Positive
+                enqueue_mask=is_negative 
+            )
+            l_tcb = tcb_out["loss"]
+
+            loss_dict['bgsl'] = l_bgsl
+            loss_dict['tcb'] = l_tcb
+
             # [SOTA 2025] Exclusive Uncertainty Scaling
             # phys_loss is a hard constraint (Curriculum), not aleatoric noise.
+            # Task balancing should be stable from __init__ (6 tasks).
             scaled_total, logs = self.loss_scaler(loss_dict)
+            
             total_loss = scaled_total + phys_loss
             
             # Single Backward Pass
             self.manual_backward(total_loss)
+            
             gn_loss = torch.tensor(0.0, device=self.device)
+            
             # Weights for logging (Sigmas)
             task_weights = [
-                logs.get('weight/diffusion', 1.0), 
-                logs.get('weight/critic', 1.0),
-                logs.get('weight/aux', 1.0),
-                logs.get('weight/acl', 1.0)
+                logs.get('weight/diffusion', torch.tensor(1.0, device=self.device)), 
+                logs.get('weight/critic', torch.tensor(1.0, device=self.device)),
+                logs.get('weight/aux', torch.tensor(1.0, device=self.device)),
+                logs.get('weight/acl', torch.tensor(1.0, device=self.device))
             ]
             
         else:
@@ -703,7 +783,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 "train/curr_phys_weight": curr_phys_weight,
             }, on_step=True, on_epoch=False, prog_bar=False)
 
-        return (diff_loss + critic_loss + aux_loss).detach()
+        return total_loss
 
 
     def on_train_epoch_end(self):
@@ -1158,30 +1238,22 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
         # 1. Configure Robust AdamW (Fused + Parameter Hygiene)
         if self.balancing_mode == "sota_2025":
-            # [v25.3] Parameter Hygiene: Separate Model, Critic, and Uncertainty parameters
-            scaler_params = list(self.loss_scaler.parameters())
-            scaler_ids = {id(p) for p in scaler_params}
-            
-            # [SOTA 2025] Critic LR Boost (5x) for rapid calibration
-            critic_params = list(self.model.value_head.parameters())
-            critic_ids = {id(p) for p in critic_params}
-            
-            # All other parameters
-            model_params = [
-                p for p in self.model.parameters() 
-                if id(p) not in scaler_ids and id(p) not in critic_ids
-            ]
-            
+            # [SOTA 2025] Parameter Groups
             uw_lr = self.cfg.train.get("uw_lr", 0.025)
-            critic_lr = self.cfg.train.lr * 5.0
+            # Use 5x lr for critic ONLY if we can isolate it. 
+            # In ICUUnifiedPlanner, models are combined. 
+            # We'll stick to a unified model LR but keep expert_state_head and loss_scaler separate.
             
             optimizer_params = [
-                {'params': model_params, 'lr': self.cfg.train.lr, 'weight_decay': self.cfg.train.weight_decay},
-                {'params': critic_params, 'lr': critic_lr, 'weight_decay': self.cfg.train.weight_decay},
+                # 1. Main Planner Model (Backbone, Encoder, etc.)
+                {'params': self.model.parameters(), 'lr': self.cfg.train.lr, 'weight_decay': self.cfg.train.weight_decay},
+                # 2. Expert State Head (Risk Scorer)
+                {'params': self.expert_state_head.parameters(), 'lr': self.cfg.train.lr, 'weight_decay': self.cfg.train.weight_decay},
+                # 3. Uncertainty Scaler - High LR for rapid convergence
                 {'params': self.loss_scaler.parameters(), 'lr': uw_lr, 'weight_decay': 0.0}
             ]
             
-            logger.info(f"Optimizer: Applying 5x Critic LR Boost ({critic_lr:.2e})")
+            logger.info(f"Optimizer: Initialized with 3 param groups. Model LR: {self.cfg.train.lr:.2e}, Scaler LR: {uw_lr:.2e}")
             
             base_optimizer = torch.optim.AdamW(
                 optimizer_params,

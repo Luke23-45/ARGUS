@@ -44,7 +44,7 @@ class UncertaintyLossScaler(nn.Module):
         # Task 1: Aux (Discriminative)
         
         # Default keys for ICU research (Order must match log_vars)
-        keys = ['diffusion', 'critic', 'aux', 'acl']
+        keys = ['diffusion', 'critic', 'aux', 'acl', 'bgsl', 'tcb']
         
         total_loss = 0.0
         log_metrics = {}
@@ -55,14 +55,15 @@ class UncertaintyLossScaler(nn.Module):
             if key in loss_dict:
                 loss = loss_dict[key]
                 
-                # [v12.8 SOTA FIX] Log-Var Clamping & Signal Floor
-                # To prevent precision overflows and ensure a minimum signal contribution.
-                max_log_var = 10.0
+                # [v3.1.5 SOTA] Master/Slave Task Priority Logic
+                # Instead of max-clamping, we MIN-clamp clinical diagnostics.
+                # log_var >= 0.69 ensures Weight <= 0.5 * exp(-0.69) ~= 0.25.
+                # This prevents classification tasks from dominating the generative backbone.
+                min_log_var = -10.0
                 if key in ['aux', 'acl', 'critic']:
-                    # Min weight 0.05 -> 0.5 * exp(-log_var) >= 0.05 -> log_var <= ~2.3
-                    max_log_var = 2.3
+                    min_log_var = 0.69
                 
-                log_var = self.log_vars[i].clamp(min=-10.0, max=max_log_var)
+                log_var = self.log_vars[i].clamp(min=min_log_var, max=10.0)
                 
                 # Weight = 1 / (2 * exp(s))
                 # We use precision weighting

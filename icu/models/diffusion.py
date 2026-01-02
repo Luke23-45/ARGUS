@@ -52,6 +52,7 @@ from icu.models.components.geometric_projector import GeometricProjector
 from icu.models.components.temporal_sampler import TemporalSampler
 from icu.models.components.nth_encoder import NTHEncoderBlock
 from icu.models.components.sequence_aux_head import SequenceAuxHead
+from icu.models.components.alb_encoder import AsymmetricLatentBottleneck
 # from icu.models.components.loss_scaler import UncertaintyLossScaler (Removed: Scaling handled by Wrapper)
 
 # [PHASE 4-5] Agentic Evolution Components
@@ -1025,7 +1026,8 @@ class ICUUnifiedPlanner(nn.Module):
         self.cfg = cfg
         
         # Core Components
-        self.encoder = TemporalFusionEncoder(cfg)
+        base_encoder = TemporalFusionEncoder(cfg)
+        self.encoder = AsymmetricLatentBottleneck(base_encoder, input_dim=cfg.input_dim, d_model=cfg.d_model)
         self.backbone = DiffusionActionHead(cfg)
         self.scheduler = NoiseScheduler(cfg.timesteps)
         
@@ -1127,11 +1129,15 @@ class ICUUnifiedPlanner(nn.Module):
         # [v16.0] FIX: Disable unsafe padding inference. Fixed window dataset has no padding.
         padding_mask = batch.get("padding_mask", None) 
         
-        ctx_seq, global_ctx, ctx_mask = self.encoder(
+        out_alb = self.encoder(
             past_norm, static_norm, 
             imputation_mask=src_mask, 
             padding_mask=padding_mask # Successfully propagates to Attention
         )
+        ctx_seq = out_alb["ctx_planner"]
+        global_ctx = out_alb["global_planner"]
+        ctx_mask = out_alb["ctx_mask"]
+        # ctx_expert is available in out_alb["ctx_expert"] for the wrapper
         
         # 2. Forward Diffusion (add noise)
         B = past.shape[0]
@@ -1239,7 +1245,12 @@ class ICUUnifiedPlanner(nn.Module):
                 value_loss = masked_mse
         
         # Total loss (Value weight 0.5 is standard for AWR baselines)
-        total = diff_loss + self.cfg.aux_loss_scale * aux_loss + 0.5 * value_loss
+        # Handle broadcasting if reduction='none' (diff_loss is [B, T], aux_loss is [B])
+        aux_term = self.cfg.aux_loss_scale * aux_loss
+        if diff_loss.dim() > aux_loss.dim():
+            aux_term = aux_term.unsqueeze(1)
+            
+        total = diff_loss + aux_term + 0.5 * value_loss
         logs = {}
         
         # Compute aux_logits for return (needed by callbacks)
@@ -1303,11 +1314,14 @@ class ICUUnifiedPlanner(nn.Module):
              if src_mask.dim() == 3:
                  padding_mask = (src_mask.sum(dim=-1) == 0)
              
-        ctx_seq, global_ctx, ctx_mask = self.encoder(
+        out_alb = self.encoder(
             past_norm, static_norm, 
             imputation_mask=src_mask,
             padding_mask=padding_mask # [FIX] Pass padding mask
         )
+        ctx_seq = out_alb["ctx_planner"]
+        global_ctx = out_alb["global_planner"]
+        ctx_mask = out_alb["ctx_mask"]
         
         # 2. Initialize from pure noise
         x_t = torch.randn(B, self.cfg.pred_len, self.cfg.input_dim, device=past.device)
