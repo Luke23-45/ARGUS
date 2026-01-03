@@ -400,6 +400,19 @@ class ICUGeneralistWrapper(pl.LightningModule):
         new_gamma = self.horizon_scheduler.get_gamma(self.current_epoch)
         self.awr_calculator.gamma = new_gamma
         
+        # [v12.5.1 SOTA] AWR Beta Annealing (Broad Discovery -> Sharp Selection)
+        # Linear decay from 0.60 to 0.15 over 40 epochs
+        start_beta = 0.60
+        end_beta = 0.15
+        anneal_epochs = 40
+        if self.current_epoch < anneal_epochs:
+            frac = self.current_epoch / anneal_epochs
+            curr_beta = start_beta + (end_beta - start_beta) * frac
+        else:
+            curr_beta = end_beta
+            
+        self.awr_calculator.beta.fill_(curr_beta)
+        
         # [v4.2 SOTA Pillar 2 & 4] Synchronized Risk Warmup
         # Goal: Slowly introduce CVaR pessimism and Safety Envelope constraints.
         # Duration: 10 epochs for faster refinement cycle
@@ -1022,78 +1035,32 @@ class ICUGeneralistWrapper(pl.LightningModule):
     def _validate_clinical_sampling(self, batch: Dict[str, torch.Tensor]):
         """
         Generates full trajectories and validates them against clinical reality.
-        
-        This is the most clinically meaningful validation:
-        1. Generates future vitals using the model
-        2. Compares against ground truth (granular MSE)
-        3. Checks physiological plausibility (OOD Guardian)
-        4. Measures safety constraint violations
         """
-        # Take a subset to save compute (16 samples per batch)
         subset_size = min(16, batch["observed_data"].shape[0])
         subset = {k: v[:subset_size] for k, v in batch.items()}
         gt = subset["future_data"]
         
-        # Sample using the *Teacher* (EMA) for best generation quality
         with self.ema_teacher_context():
             with torch.no_grad():
-                if self.cfg.get("debug", False):
-                    try:
-                        pred = self.model.sample(subset)
-                    except Exception as e:
-                        logger.error(f"[DEBUG MODE] model.sample failed: {e}")
-                        logger.error(traceback.format_exc())
-                        return # Skip the rest of clinical validation for this batch
-                else:
-                    pred = self.model.sample(subset)
+                pred = self.model.sample(subset)
         
-        # A. Global MSE (Overall prediction quality)
-        # [ROBUSTNESS FIX] Last line of defense: filter infinite values to prevent telemetry corruption
         pred_safe = torch.nan_to_num(pred, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-1e9, 1e9)
         gt_safe = torch.nan_to_num(gt, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-1e9, 1e9)
         self.val_mse_global.update(pred_safe, gt_safe)
         
-        # B. Granular MSE by Clinical Category
-        # This helps identify which subsystem the model struggles with
-        
-        # Hemodynamic (indices 0-6): HR, MAP, Temp, SpO2, SBP, DBP, RespRate
-        # [FIX] Enforce contiguous memory layout for slices to prevent View/Stride errors in torchmetrics
         if pred.shape[-1] > 6:
-            self.val_mse_hemo.update(
-                pred_safe[..., :7].contiguous(), 
-                gt_safe[..., :7].contiguous()
-            )
-        
-        # Labs (indices 7-17): Metabolic panel
+            self.val_mse_hemo.update(pred_safe[..., :7].contiguous(), gt_safe[..., :7].contiguous())
         if pred.shape[-1] > 17:
-            self.val_mse_labs.update(
-                pred_safe[..., 7:18].contiguous(), 
-                gt_safe[..., 7:18].contiguous()
-            )
-        
-        # Electrolytes (indices 18-21): Na, K, Ca, Mg
+            self.val_mse_labs.update(pred_safe[..., 7:18].contiguous(), gt_safe[..., 7:18].contiguous())
         if pred.shape[-1] > 21:
-            self.val_mse_electrolytes.update(
-                pred_safe[..., 18:22].contiguous(), 
-                gt_safe[..., 18:22].contiguous()
-            )
+            self.val_mse_electrolytes.update(pred_safe[..., 18:22].contiguous(), gt_safe[..., 18:22].contiguous())
         
-        # C. Safety Check (The "Hard Deck")
-        # [v5.3.6 SOTA FIX] Unified Clinical Pipeline
-        # We pass raw clinical data directly. OODGuardian is forced to skip unit-heuristics
-        # to prevent misidentification during early training jitter.
         with torch.no_grad():
-            safety_results = self.safety_guardian.check_trajectories(
-                subset["observed_data"], 
-                pred, 
-                force_clinical=True
-            )
+            safety_results = self.safety_guardian.check_trajectories(subset["observed_data"], pred, force_clinical=True)
         
         self.val_ood_rate.update(safety_results["ood_rate"])
         self.val_safe_traj_count.update(safety_results["safe_count"])
         
-        # D. Physiological Constraint Violations
-        # Check how often predictions exceed the 2.5σ bounds
         with torch.no_grad():
             pred_norm, _ = self.model.normalize(pred, None)
             violations = (torch.abs(pred_norm) > 2.5).float().mean()
@@ -1108,12 +1075,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
         local_labels = torch.cat([x["label"] for x in self.validation_step_outputs]) if self.validation_step_outputs else torch.tensor([], device=self.device)
         
         if torch.distributed.is_initialized():
-             # Gather across all ranks for a true global threshold optimal
              world_size = torch.distributed.get_world_size()
              gathered_outputs = [None] * world_size
              torch.distributed.all_gather_object(gathered_outputs, self.validation_step_outputs)
-             
-             # Flatten gathered objects
              all_probs = torch.cat([torch.cat([x["prob"] for x in rank_out]) for rank_out in gathered_outputs if rank_out])
              all_labels = torch.cat([torch.cat([x["label"] for x in rank_out]) for rank_out in gathered_outputs if rank_out])
         else:
@@ -1137,30 +1101,32 @@ class ICUGeneralistWrapper(pl.LightningModule):
                     best_f2 = f2; opt_thresh = t.item()
             opt_f2 = best_f2
 
+        # [v12.5.1 SOTA] Synchronize Optimal Threshold across all GPUs
+        if torch.distributed.is_initialized():
+            threshold_tensor = torch.tensor([opt_thresh], device=self.device)
+            torch.distributed.all_reduce(threshold_tensor, op=torch.distributed.ReduceOp.SUM)
+            opt_thresh = (threshold_tensor / torch.distributed.get_world_size()).item()
+            
+        # Log calibrated Metrics
+        self.val_precision.threshold = opt_thresh
+        self.val_recall.threshold = opt_thresh
+        self.val_f1.threshold = opt_thresh
+            
         self.log_dict({
-            # Prediction Quality
             "val/mse_global": self.val_mse_global.compute(),
             "val/mse_hemo": self.val_mse_hemo.compute(),
             "val/mse_labs": self.val_mse_labs.compute(),
             "val/mse_electrolytes": self.val_mse_electrolytes.compute(),
-            
-            # Classification Metrics (Standard at 0.5)
             "val/sepsis_acc": self.val_acc_sepsis.compute(),
             "val/sepsis_auroc": self.val_auroc_sepsis.compute(),
             "val/sepsis_precision": self.val_precision.compute(),
             "val/sepsis_recall": self.val_recall.compute(),
             "val/sepsis_f1": self.val_f1.compute(),
-            
-            # [v4.2 SOTA] Calibrated clinical metrics
             "val/clinical_f2_opt": opt_f2,
             "val/clinical_threshold_opt": opt_thresh,
-            
-            # Calibration & Dynamics
             "val/ece": self.val_ece.compute(),
             "val/oe": self.val_oe.compute(),
             "val/explained_var": self.val_explained_var.compute(),
-            
-            # Safety Metrics
             "val/ood_rate_avg": self.val_ood_rate.compute(),
             "val/safe_trajectories_avg": self.val_safe_traj_count.compute(),
             "val/phys_violation_rate": self.val_phys_violation_rate.compute(),

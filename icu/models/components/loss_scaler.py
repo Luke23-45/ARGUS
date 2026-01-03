@@ -65,7 +65,7 @@ class UncertaintyLossScaler(nn.Module):
                 min_log_var = -10.0
                 max_log_var = 10.0
                 if key in ['aux', 'acl', 'critic', 'bgsl', 'tcb']:
-                    max_log_var = -0.69315 # Floor: Weight >= 1.0
+                    max_log_var = -0.69315 # [v12.5.1] Floor: Weight >= 1.0 (Prevents Generative Capture)
                 
                 # [ANCHOR GUARD] Diffusion (key='diffusion') remains un-capped (max=10.0)
                 log_var = self.log_vars[i].clamp(min=min_log_var, max=max_log_var)
