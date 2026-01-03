@@ -703,14 +703,22 @@ class ICUAdvantageCalculator(nn.Module):
         # Instead of clamping, we subtract the maximum to prevent overflow 
         # while preserving the exact probability distribution.
         with torch.no_grad():
-            # max_adv: Per-batch global maximum for numerical stability (Exp-Normalize trick)
+            # max_log_w: Per-batch global maximum for numerical stability (Exp-Normalize trick)
             max_log_w = scaled_adv.max()
             if dist.is_initialized():
                 dist.all_reduce(max_log_w, op=dist.ReduceOp.MAX)
         
+        # [SOTA FIX] Robust Log-Space Clamping
+        # Prevent underflow (exp(-inf) -> 0) and overflow (exp(inf) -> inf)
+        # We clamp the exponent to [-20, 5].
+        # -20 corresponds to exp(-20) ~= 2e-9 (negligible weight)
+        # +5 corresponds to exp(5) ~= 148 (capped later by max_weight anyway)
+        # This protects against FP16 instability in the exp() function.
+        log_weights = scaled_adv - max_log_w
+        log_weights = torch.clamp(log_weights, min=-20.0, max=5.0)
+        
         # weights = exp((A - max(A)) / beta)
-        # This ensures the maximum weight is always 1.0 (before normalization)
-        weights = torch.exp(scaled_adv - max_log_w)
+        weights = torch.exp(log_weights)
         
         # --- 5. Hard Clipping (Standard AWR practice) ---
         weights_clipped = torch.clamp(weights, max=self.max_weight)

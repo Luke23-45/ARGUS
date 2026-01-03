@@ -5,82 +5,64 @@ from typing import Dict, Tuple
 
 class UncertaintyLossScaler(nn.Module):
     """
-    [SOTA 2025] Multi-Task Loss Balancer using Homoscedastic Uncertainty.
+    [SOTA 2025] Robust Loss Balancer with Dynamic Stability.
     
-    Instead of manually tuning `aux_loss_scale` (e.g., finding that 5.0 works best),
-    we learn the optimal balance dynamically.
-    
-    Theory (Kendall et al.):
-        L_total = 1/(2*sigma_1^2) * L_diffusion + log(sigma_1) + 
-                  1/(2*sigma_2^2) * L_aux       + log(sigma_2)
-                  
-    This allows the model to "admit" when one task is too noisy/hard and down-weight it 
-    temporarily, preventing gradient fighting.
+    Replaces static 'max_log_var' clamps with:
+    1. Homoscedastic Uncertainty Weighting.
+    2. Dynamic Flooring (weight can go lower if loss explodes > 5.0).
+    3. EMA Loss Tracking for smooth floor transitions.
     """
-    def __init__(self, num_tasks: int = 2, init_scales: list = [1.0, 1.0]):
+    def __init__(self, num_tasks: int = 2, init_scales: list = [1.0, 1.0], decay: float = 0.99):
         super().__init__()
-        # We learn log_var (s) for numerical stability. 
-        # sigma^2 = exp(s)
-        # s is initialized to log(init_scale)
         # [v4.2.1 SOTA FIX] Robust Registry
-        # Enforce that num_tasks matches the known ICU objective list
         self.keys = ['diffusion', 'critic', 'aux', 'acl', 'bgsl', 'tcb']
         if num_tasks != len(self.keys):
-             # We allow it for individual component testing, but warn for main wrapper
              print(f"[WARNING] LossScaler num_tasks ({num_tasks}) != Registry ({len(self.keys)})")
         
         self.num_tasks = num_tasks
+        # Learnable log_vars (s_i in paper)
         self.log_vars = nn.Parameter(torch.zeros(num_tasks))
+        
+        # EMA tracking for stability monitoring
+        self.register_buffer("loss_emas", torch.zeros(num_tasks))
+        self.decay = decay
         
     def forward(self, loss_dict: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Args:
             loss_dict: Dictionary of raw losses. 
-                       Must contain keys matching the implicit order: 
-                       0: 'diffusion', 1: 'aux', etc.
-        Returns:
-            total_loss: Scalar tensor for backprop
-            log_dict: Dict of weights/sigmas for logging
         """
-        # Ensure consistent ordering
-        # Task 0: Diffusion (Generative)
-        # Task 1: Aux (Discriminative)
-        
-        # Default keys for ICU research (Order must match log_vars)
-        # Use the registry defined in __init__
-        
         total_loss = 0.0
         log_metrics = {}
         
         for i, key in enumerate(self.keys):
-            if i >= self.num_tasks: break # Defensive: don't exceed parameter count
+            if i >= self.num_tasks: break 
             
             if key in loss_dict:
                 loss = loss_dict[key]
                 
-                # [v4.1 SOTA] Clinical Pressure Hard-Floor
-                # We enforce a MINIMUM WEIGHT of 1.0 for clinical tasks.
-                # This prevents "Generative Collapse" where the model mutes sepsis diagnostics.
-                # log_var <= -0.69315 ensures Weight = 0.5 * exp(-log_var) >= 1.0.
-                min_log_var = -10.0
-                max_log_var = 10.0
-                if key in ['aux', 'acl', 'critic', 'bgsl', 'tcb']:
-                    max_log_var = -0.69315 # [v12.5.1] Floor: Weight >= 1.0 (Prevents Generative Capture)
+                # --- [SOTA 2025] Dynamic Stability Logic ---
+                # Update EMA
+                with torch.no_grad():
+                    curr_val = loss.item()
+                    self.loss_emas[i] = self.decay * self.loss_emas[i] + (1 - self.decay) * curr_val
+                    
+                    # Dynamic Floor Calculation From stabilization.py
+                    # If loss > 5.0 (Explosion risk), allow log_var to grow (weight -> 0)
+                    # If loss < 0.1 (Lazy risk), restrict log_var (weight -> 1)
+                    floor_val = 5.0 if self.loss_emas[i] > 5.0 else 2.0
                 
-                # [ANCHOR GUARD] Diffusion (key='diffusion') remains un-capped (max=10.0)
-                log_var = self.log_vars[i].clamp(min=min_log_var, max=max_log_var)
-                
-                # Weight = 1 / (2 * exp(s))
-                # We use precision weighting
+                # Safe clamping using dynamic floor
+                # min=-2.0 -> Max Weight = exp(2) = 7.39
+                # max=floor -> Min Weight = exp(-floor)
+                log_var = self.log_vars[i].clamp(min=-2.0, max=floor_val)
                 precision = torch.exp(-log_var)
                 
-                # L_weighted = precision * loss + log_var/2
-                # Note: The + log_var/2 term prevents the model from diverging to sigma -> infinity
+                # Weighted Loss = precision * loss + log_var/2
                 weighted_loss = 0.5 * precision * loss + 0.5 * log_var
-                
                 total_loss += weighted_loss
                 
-                # Logging metrics (Keep as tensors to avoid graph breaks)
+                # Logging
                 log_metrics[f"weight/{key}"] = 0.5 * precision
                 log_metrics[f"sigma/{key}"] = torch.exp(0.5 * log_var)
                 

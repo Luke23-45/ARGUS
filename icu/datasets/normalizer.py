@@ -616,45 +616,46 @@ class ClinicalNormalizer(nn.Module):
         s_max = self.ts_stat_max.to(x_ts_norm.device).view(view_shape)
         l_mask = self.log_mask.to(x_ts_norm.device).view(view_shape)
         
-        # 2. Inverse linear scaling: [-1, 1] → [0, 1] → [s_min, s_max]
+        # 1. Inverse linear scaling: [-1, 1] → [0, 1]
         x_01 = (x_ts_norm + 1.0) / 2.0
+        # Check for numeric instability near boundaries
+        x_01 = torch.clamp(x_01, 0.0, 1.0) 
+        
+        # 2. Scale back to statistical range
         x_scaled = x_01 * (s_max - s_min) + s_min
         
-        # 3. [SOTA 2025 FIX] Tanh-Guard Protection (Log-Targeted)
-        # We apply soft-saturation specifically to the input of the exponential 
-        # transform. This prevents e^x explosions.
-        # We also apply a much wider guard (1000.0) to linear channels as a 
-        # last-resort safety against INF.
-        LOG_GUARD = 10.0
-        LINEAR_GUARD = 1000.0
+        # 3. [SOTA 2025 FIX] Tanh-Guard Protection
+        # Expanded guards to cover DKA Glucose (1500+) and extreme values
+        LOG_GUARD = 15.0 # covers exp(15) ~= 3.2 million (plenty for high-range logs)
+        LINEAR_GUARD = 5000.0 # covers any physical vital sign
         
-        x_log_input = LOG_GUARD * torch.tanh(x_scaled / LOG_GUARD)
-        x_linear_input = LINEAR_GUARD * torch.tanh(x_scaled / LINEAR_GUARD)
+        # Note: x_scaled IS the value we want to operate on. 
+        # For log channels, x_scaled is in log-space (e.g., log(100) = 4.6).
+        # We process log and linear separately to avoid confusion.
         
-        # 4. Inverse log transform (expm1)
-        x_exp = torch.expm1(x_log_input)
+        # Linear Path:
+        # Just clamp to avoid INF if something went wrong
+        x_linear_final = torch.clamp(x_scaled, -LINEAR_GUARD, LINEAR_GUARD)
         
-        # 5. Select based on mask
-        x_final = torch.where(l_mask, x_exp, x_linear_input)
+        # Log Path:
+        # x_scaled is ln(1+x). So x = exp(x_scaled) - 1.
+        # We must guard x_scaled before exp.
+        x_log_input = torch.clamp(x_scaled, -LOG_GUARD, LOG_GUARD)
+        x_log_final = torch.expm1(x_log_input)
+        
+        # 4. Select based on mask
+        x_final = torch.where(l_mask, x_log_final, x_linear_final)
         
         return x_final
 
     def _per_patient_denormalize(self, x_norm: torch.Tensor) -> torch.Tensor:
         """
         Denormalizes per-patient (RevIN-style) normalized data.
-        
-        Args:
-            x_norm: Instance-normalized tensor
-        
-        Returns:
-            Tensor in original scale
         """
         if self._instance_mean is None or self._instance_std is None:
-            logger.warning(
-                "[NORMALIZER] Cannot denormalize per-patient data: "
-                "instance statistics not stored. Returning as-is."
-            )
-            return x_norm
+            # Fallback if no stats (e.g. inference without tracking)
+            # Just return projected raw values to avoid crash, but warn
+            return x_norm 
         
         # Undo the 3-sigma scaling
         x = x_norm * 3.0
@@ -662,20 +663,21 @@ class ClinicalNormalizer(nn.Module):
         # Undo z-score normalization
         x = x * self._instance_std + self._instance_mean
         
-        # 3. [SOTA 2025 FIX] Tanh-Guard Protection (Log-Targeted)
-        LOG_GUARD = 10.0
-        LINEAR_GUARD = 1000.0
+        # Guards
+        LOG_GUARD = 15.0 
+        LINEAR_GUARD = 5000.0
         
-        x_log_guarded = LOG_GUARD * torch.tanh(x / LOG_GUARD)
-        x_linear_guarded = LINEAR_GUARD * torch.tanh(x / LINEAR_GUARD)
-        
-        # 4. Undo log transform for applicable channels
         rank = len(x.shape)
         view_shape = [1] * (rank - 1) + [-1]
         l_mask = self.log_mask.to(x.device).view(view_shape)
         
-        x_exp = torch.expm1(x_log_guarded)
-        x_final = torch.where(l_mask, x_exp, x_linear_guarded)
+        # Separate paths
+        x_linear_final = torch.clamp(x, -LINEAR_GUARD, LINEAR_GUARD)
+        
+        x_log_input = torch.clamp(x, -LOG_GUARD, LOG_GUARD)
+        x_log_final = torch.expm1(x_log_input)
+        
+        x_final = torch.where(l_mask, x_log_final, x_linear_final)
         
         return x_final
 

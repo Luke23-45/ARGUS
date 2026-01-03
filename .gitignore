@@ -96,11 +96,11 @@ audit_physics_v20.json
 
 suggetion.md
 
-error.md
+
 sepsis_clinical_28/train_index.json
 sepsis_clinical_28/val_index.json
 report_logs.md
-# logs.md
+
 
 logs1.md
 # log_report.md
@@ -111,3 +111,9 @@ report_suggestions.md
 suggestions.md
 patches.md
 log.md
+
+working_23
+
+error.md
+logs.md
+verify_fix.py

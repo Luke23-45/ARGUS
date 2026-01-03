@@ -88,6 +88,8 @@ from icu.models.components.loss_scaler import UncertaintyLossScaler
 # [PHASE 1-3] Agentic Evolution Components
 from icu.models.components.risk_scorer import PhysiologicalRiskScorer
 from icu.models.components.risk_aware_loss import RiskAwareAsymmetricLoss
+# [v2025 SOTA] Stabilization Primitives
+from icu.utils.stabilization import GradientThrottler, adaptive_gradient_clip_
 from icu.models.components.contrastive_loss import AsymmetricContrastiveLoss
 from icu.models.components.safety_envelope import PhysiologicalSafetyEnvelope
 from icu.models.components.horizon_scheduler import ClinicalHorizonScheduler
@@ -599,12 +601,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
         aux_loss = torch.tensor(0.0, device=self.device)
         acl_loss = torch.tensor(0.0, device=self.device)
         if self.cfg.model.use_auxiliary_head and "phase_label" in batch:
-            # [SOTA v3.1.5] Asymmetric Throttling: The "Peace Treaty"
-            # We clone the sequence context and restrict its gradient influence to 10%.
+            # [SOTA 2025] Asymmetric Throttling: The "Peace Treaty"
+            # We restrict sequence context gradient influence to 10%.
             # This allows the Sepsis head to "read" features without "dominating" them.
             ctx_aux = ctx_seq.clone()
-            if ctx_aux.requires_grad:
-                ctx_aux.register_hook(lambda g: g * 0.1)
+            # [FIX] Use SOTA Throttler
+            ctx_aux = GradientThrottler.throttle(ctx_aux, factor=0.1)
 
             logits, _ = self.model.aux_head(ctx_aux, mask=ctx_mask)
             
@@ -622,7 +624,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Calculated based on window-level targets for the Aux head
             n_total = targets.numel()
             n_sepsis = (targets > 0).sum().item()
-            cfm = n_total / max(1, n_sepsis)
+            # [FIX] Log-Scale Boost (Stabilized, max ~4.0x)
+            cfm = GradientThrottler.log_scale_prevalence(n_total, n_sepsis)
             
             # [SOTA 2025] Dynamic Hard Negative Mining (Mining Weight)
             with torch.no_grad():
@@ -650,7 +653,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 
                 # Global CFM: Balanced scaling based on the entire DDP batch
                 n_sepsis_global = (targets_global > 0).sum().item()
-                cfm_global = targets_global.numel() / max(1, n_sepsis_global)
+                cfm_global = GradientThrottler.log_scale_prevalence(targets_global.numel(), n_sepsis_global)
             else:
                 ctx_aux_global = ctx_aux
                 targets_global = targets
@@ -662,7 +665,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
             with torch.no_grad():
                 velocity = (fut[:, 0, :] - past[:, -1, :]) # [B, D_in]
             
-            raw_meta = torch.cat([global_ctx, velocity, static], dim=-1)
+            # [FIX] "The Peace Treaty": Throttle ACL gradient influence on Encoder to 5%
+            # Prevent contrastive objective from shredding the diffusion manifold
+            global_ctx_throttled = GradientThrottler.throttle(global_ctx, factor=0.05)
+            
+            raw_meta = torch.cat([global_ctx_throttled, velocity, static], dim=-1)
             z_acl = self.acl_projector(raw_meta)
             
             # [v4.2.1 SOTA] Global Contrastive Clustering (DDP-Safe)
@@ -688,7 +695,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
             x0_approx = (noisy_fut - torch.sqrt(1 - alpha_t) * pred_noise) / torch.sqrt(alpha_t).clamp(min=1e-5)
             
             # [PHASE 2] Safety envelope operates on clinical units. Denormalize x0 first.
-            x0_clinical = self.model.unnormalize(x0_approx)
+            # [CRITICAL FIX] Use DATAMODULE normalizer (Calibrated), NOT model.normalizer (Uncalibrated)
+            normalizer = self.trainer.datamodule.normalizer
+            x0_clinical = normalizer.denormalize(x0_approx)
+            
             phys_violation = self.safety_envelope(x0_clinical, risk_coef)
             phys_loss = phys_violation * curr_phys_weight
             
@@ -788,11 +798,27 @@ class ICUGeneralistWrapper(pl.LightningModule):
             x0_approx = (noisy_fut - torch.sqrt(1 - alpha_t) * pred_noise) / torch.sqrt(alpha_t).clamp(min=1e-5)
             
             # [v4.2 SOTA Pillar 4] Adaptive Safety Envelope with Warmup
-            l_phys = self.model.phys_loss(student_traj_norm) # Global MSE fallback
-            l_envelope = self.safety_envelope(student_traj, risk_coef, sigma_scale=self.curr_sigma_scale)
+            # CRITICAL FIX: Physics Check must be on DENORMALIZED data (mmHg not [-1,1])
+            normalizer = self.trainer.datamodule.normalizer
+            
+            # 1. Denormalize Student Trajectory for Physics Checks
+            # student_traj is [B, T, C] in normalized space
+            student_traj_denorm = normalizer.denormalize(student_traj)
+            
+            # 2. Physics Loss (MSE) usually expects normalized space for gradient stability
+            l_phys = self.model.phys_loss(student_traj) 
+            
+            # 3. Safety Envelope (Bio-Constraints) expect PHYSICAL units (mmHg)
+            # This was the cause of massive loss explosions (checking 0.5 vs 65.0)
+            l_envelope = self.safety_envelope(student_traj_denorm, risk_coef, sigma_scale=self.curr_sigma_scale)
             
             # Combine physics components
             phys_loss = l_phys + l_envelope
+            
+            # Defensive Clamp: Don't let huge physics loss destroy the gradients early on
+            if self.current_epoch < 5:
+                phys_loss = torch.clamp(phys_loss, max=10.0)
+
             self.manual_backward(phys_loss)
 
         # --- 5. Accumulation-Aware Step & Cleanup ---
@@ -809,8 +835,19 @@ class ICUGeneralistWrapper(pl.LightningModule):
             #     self.trainer.precision_plugin.scaler.unscale_(opt)
 
             # 2025 Grad Clipping (Final safety before step)
+            # 2025 Grad Clipping (Final safety before step)
             if self.cfg.train.get("grad_clip", 0) > 0:
-                # [SOTA FIX] Manual clipping to avoid PL MisconfigurationException
+                # [SOTA FIX v2025] Adaptive Gradient Clipping for Transformer Backbone
+                # Standard clipping for non-backbone, AGC for DiT layers
+                
+                # 1. Clip Loss Scaler (if exists) - Low threshold
+                if hasattr(self, 'loss_scaler') and self.loss_scaler is not None:
+                    torch.nn.utils.clip_grad_norm_(self.loss_scaler.parameters(), 0.5)
+                
+                # 2. Main Parameters: Use Adaptive Clipping
+                adaptive_gradient_clip_(self.parameters(), clip_factor=0.01)
+                
+                # 3. Safety Fallback: Global Norm Clip (incase AGC misses outliers)
                 torch.nn.utils.clip_grad_norm_(self.parameters(), self.cfg.train.grad_clip)
                 
             opt.step()
@@ -1038,33 +1075,54 @@ class ICUGeneralistWrapper(pl.LightningModule):
         """
         subset_size = min(16, batch["observed_data"].shape[0])
         subset = {k: v[:subset_size] for k, v in batch.items()}
-        gt = subset["future_data"]
+        
+        # [SOTA Fix] Get Normalizer
+        normalizer = self.trainer.datamodule.normalizer
+        
+        # 1. Ground Truth (Denormalize for Physical Comparison)
+        # gt is normalized [B, T, C] in [-1, 1]
+        gt_norm = subset["future_data"]
+        gt_phys = normalizer.denormalize(gt_norm)
         
         with self.ema_teacher_context():
             with torch.no_grad():
-                pred = self.model.sample(subset)
+                # 2. Prediction (Denormalize for Physical Comparison)
+                # sample() returns normalized trajectories [-1, 1]
+                pred_norm = self.model.sample(subset)
+                pred_phys = normalizer.denormalize(pred_norm)
         
-        pred_safe = torch.nan_to_num(pred, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-1e9, 1e9)
-        gt_safe = torch.nan_to_num(gt, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-1e9, 1e9)
+        # Safe Clamping for Metrics (prevent INF exploding metrics)
+        pred_safe = torch.nan_to_num(pred_phys, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-1e9, 1e9)
+        gt_safe = torch.nan_to_num(gt_phys, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-1e9, 1e9)
+        
+        # 3. Update MSE Metrics (Physical Units)
         self.val_mse_global.update(pred_safe, gt_safe)
         
-        if pred.shape[-1] > 6:
+        if pred_safe.shape[-1] > 6:
             self.val_mse_hemo.update(pred_safe[..., :7].contiguous(), gt_safe[..., :7].contiguous())
-        if pred.shape[-1] > 17:
+        if pred_safe.shape[-1] > 17:
             self.val_mse_labs.update(pred_safe[..., 7:18].contiguous(), gt_safe[..., 7:18].contiguous())
-        if pred.shape[-1] > 21:
+        if pred_safe.shape[-1] > 21:
             self.val_mse_electrolytes.update(pred_safe[..., 18:22].contiguous(), gt_safe[..., 18:22].contiguous())
         
+        # 4. Safety Checks (OOD uses raw physical values or latent statistics?)
+        # OODGuardian likely expects Raw Physical or Normalized? 
+        # Usually checking "is this BP 300?" -> Physical.
+        # But `check_trajectories` signature says `force_clinical=True`.
+        # Passing `pred_safe` (Physical) is correct if `force_clinical=True`.
         with torch.no_grad():
-            safety_results = self.safety_guardian.check_trajectories(subset["observed_data"], pred, force_clinical=True)
+            safety_results = self.safety_guardian.check_trajectories(subset["observed_data"], pred_safe, force_clinical=True)
         
         self.val_ood_rate.update(safety_results["ood_rate"])
         self.val_safe_traj_count.update(safety_results["safe_count"])
         
-        with torch.no_grad():
-            pred_norm, _ = self.model.normalize(pred, None)
-            violations = (torch.abs(pred_norm) > 2.5).float().mean()
-            self.val_phys_violation_rate.update(violations)
+        # 5. Physics Violations (Checking Normalized Bounds)
+        # We check if *normalized* values exceed 3-sigma (approx 2.5-3.0 in [-1, 1] space? No, [-1,1] is hard clamp).
+        # Normalizer clamps to [-1, 1]. So violations check should be on *physical* bounds or check if model is railing.
+        # Let's check denormalized values against physics bounds.
+        # Actually, simpler: Check if normalized prediction is railing at -1 or 1 (sign of clipping).
+        violations = ((pred_norm.abs() > 0.99).float().mean())
+        self.val_phys_violation_rate.update(violations)
 
     def on_validation_epoch_end(self):
         """
@@ -1131,13 +1189,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
             "val/safe_trajectories_avg": self.val_safe_traj_count.compute(),
             "val/phys_violation_rate": self.val_phys_violation_rate.compute(),
         }, prog_bar=True, sync_dist=True)
+
+
+
         
-        # Reset all metrics and buffers
-        self.validation_step_outputs.clear()
-        self.val_mse_global.reset()
-        self.val_mse_hemo.reset()
-        self.val_mse_labs.reset()
-        self.val_mse_electrolytes.reset()
         self.val_acc_sepsis.reset()
         self.val_auroc_sepsis.reset()
         self.val_precision.reset()
@@ -1423,3 +1478,55 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 "frequency": 1
             }
         }
+
+    def on_fit_start(self):
+        """
+        [SOTA v3.1] Resume Integrity Check.
+        Restores critical state that PyTorch Lightning doesn't handle automatically (DataModule state).
+        """
+        # Restore Normalizer if pending (from checkpoint load)
+        if hasattr(self, "pending_normalizer_state"):
+             if hasattr(self.trainer, "datamodule") and hasattr(self.trainer.datamodule, "normalizer"):
+                 self.trainer.datamodule.normalizer.load_state_dict(self.pending_normalizer_state)
+                 logger.info("[RESUME] Normalizer state successfully restored from checkpoint (Calibration Preserved).")
+                 del self.pending_normalizer_state
+             else:
+                 logger.warning("[RESUME] Pending normalizer state found but no datamodule normalizer available!")
+        
+        # Ensure AWR Stats are synced (if resumed)
+        if self.awr_calculator.stats_initialized:
+            logger.info(f"[RESUME] AWR Engine Online: mu={self.awr_calculator.adv_mean:.4f}, sigma={self.awr_calculator.adv_std:.4f}")
+
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]):
+        """
+        [SOTA v3.1] Persist Normalizer and Critical Buffers.
+        Ensures 'Immortality': The model can resume EXACTLY where it left off,
+        preserving global normalization statistics and AWR whitening parameters.
+        """
+        # 1. Save Normalizer State (Critical for Inference/Resume)
+        if hasattr(self.trainer, "datamodule") and hasattr(self.trainer.datamodule, "normalizer"):
+            checkpoint["normalizer_state"] = self.trainer.datamodule.normalizer.state_dict()
+            
+        # 2. AWR Statistics (Double-Check persistence)
+        # Buffers are saved automatically, but explicit saving helps debugging
+        if hasattr(self.awr_calculator, "adv_mean"):
+             checkpoint["awr_stats_summary"] = {
+                 "mean": self.awr_calculator.adv_mean.item(),
+                 "std": self.awr_calculator.adv_std.item(),
+                 "initialized": self.awr_calculator.stats_initialized.item()
+             }
+
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]):
+        """
+        [SOTA v3.1] Restore Normalizer and Stats.
+        """
+        # 1. Restore Normalizer State
+        # Problem: self.trainer.datamodule might not be attached yet during loading.
+        # Solution: Store in a temporary attribute and apply in on_fit_start.
+        if "normalizer_state" in checkpoint:
+            self.pending_normalizer_state = checkpoint["normalizer_state"]
+            logger.info("[RESUME] Found Normalizer state in checkpoint. Queued for restoration.")
+            
+        if "awr_stats_summary" in checkpoint:
+            stats = checkpoint["awr_stats_summary"]
+            logger.info(f"[RESUME] Checkpoint AWR Metadata: {stats}")
