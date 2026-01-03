@@ -8,12 +8,12 @@ defaults:
 # --- Experiment Metadata ---
 run_name: "gen_v1_${now:%Y-%m-%d_%H-%M-%S}"
 seed: 42
-compile_model: true
-save_checkpoints: false
+compile_model: false
+save_checkpoints: true
 
 # --- Directory Paths ---
 output_dir: "outputs/phase1"           # Main output directory
-checkpoint_dir: "/content/drive/MyDrive/pda/icu/checkpoints"  # Where checkpoints are saved
+checkpoint_dir: "/content/checkpoints"  # Where checkpoints are saved
 log_dir: "/content/drive/MyDrive/pda/icu/logs/icu"         # Training logs directory
 backup_dir: null                        # Remote/backup directory
 resume_from: null             # Explicit checkpoint to resume from (optional)
@@ -70,7 +70,7 @@ train:
   horizon_ramp: 40
 
   # Debug Mode (Smoke Test)
-  debug_run: true
+  debug_run: false
   debug_limit_batches: 100
   debug_limit_val: 500
 
@@ -87,7 +87,7 @@ train:
   # - "full": Scans all trajectories (~5-10 min, best for final training)
   # - "sample": Random subset (~10-30 sec, best for testing)
   awr_calibration_mode: "sample" # full for whole population scan
-  awr_max_samples: 20000      # [STABILITY] Increased for Batch 2048
+  awr_max_samples: 60000      # [STABILITY] Increased for Batch 2048
   
   ema_decay: 0.999
   monitor: "val/clinical_auroc"
