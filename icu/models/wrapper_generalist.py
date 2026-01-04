@@ -695,8 +695,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
             x0_approx = (noisy_fut - torch.sqrt(1 - alpha_t) * pred_noise) / torch.sqrt(alpha_t).clamp(min=1e-5)
             
             # [PHASE 2] Safety envelope operates on clinical units. Denormalize x0 first.
-            # [CRITICAL FIX] Use DATAMODULE normalizer (Calibrated), NOT model.normalizer (Uncalibrated)
-            normalizer = self.trainer.datamodule.normalizer
+            # [CRITICAL FIX] Use MODEL normalizer (Calibrated)
+            normalizer = self.model.normalizer
             x0_clinical = normalizer.denormalize(x0_approx)
             
             phys_violation = self.safety_envelope(x0_clinical, risk_coef)
@@ -1077,19 +1077,20 @@ class ICUGeneralistWrapper(pl.LightningModule):
         subset = {k: v[:subset_size] for k, v in batch.items()}
         
         # [SOTA Fix] Get Normalizer
-        normalizer = self.trainer.datamodule.normalizer
+        normalizer = self.model.normalizer
         
-        # 1. Ground Truth (Denormalize for Physical Comparison)
-        # gt is normalized [B, T, C] in [-1, 1]
-        gt_norm = subset["future_data"]
-        gt_phys = normalizer.denormalize(gt_norm)
+        
+        # 1. Ground Truth (Already Physical from DataLoader)
+        # [SOTA FIX] DataLoader yields Raw Physical Data. Do NOT Denormalize.
+        gt_physical_raw = subset["future_data"]
+        gt_phys = gt_physical_raw
         
         with self.ema_teacher_context():
             with torch.no_grad():
-                # 2. Prediction (Denormalize for Physical Comparison)
-                # sample() returns normalized trajectories [-1, 1]
-                pred_norm = self.model.sample(subset)
-                pred_phys = normalizer.denormalize(pred_norm)
+                # 2. Prediction (Already Physical due to Diffusion.py unnormalize)
+                # [SOTA FIX]: model.sample() returns Physical Units. Do NOT Double Denormalize.
+                pred_physical_raw = self.model.sample(subset)
+                pred_phys = pred_physical_raw
         
         # Safe Clamping for Metrics (prevent INF exploding metrics)
         pred_safe = torch.nan_to_num(pred_phys, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-1e9, 1e9)
@@ -1117,11 +1118,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
         self.val_safe_traj_count.update(safety_results["safe_count"])
         
         # 5. Physics Violations (Checking Normalized Bounds)
-        # We check if *normalized* values exceed 3-sigma (approx 2.5-3.0 in [-1, 1] space? No, [-1,1] is hard clamp).
-        # Normalizer clamps to [-1, 1]. So violations check should be on *physical* bounds or check if model is railing.
-        # Let's check denormalized values against physics bounds.
-        # Actually, simpler: Check if normalized prediction is railing at -1 or 1 (sign of clipping).
-        violations = ((pred_norm.abs() > 0.99).float().mean())
+        # We must RE-NORMALIZE to check if the model is hitting the [-1, 1] clamp.
+        # [SOTA Fix] Check explicitly against Normalized Bounds
+        pred_norm_check = normalizer.normalize(pred_safe)[0] # Returns (norm, static) tuple -> take [0]
+        violations = ((pred_norm_check.abs() > 0.99).float().mean())
         self.val_phys_violation_rate.update(violations)
 
     def on_validation_epoch_end(self):
@@ -1260,7 +1260,31 @@ class ICUGeneralistWrapper(pl.LightningModule):
         1. Calibrate Normalizer (Deterministic file I/O → All Ranks).
         2. Whitening AWR Stats (Random Sampling → Rank 0 & Broadcast).
         3. Sync EMA shadow with calibrated normalizer.
+        [SOTA v8.0] Unified Initialization Strategy.
+        Handles both Fresh Calibration and Robust Resume Restoration.
         """
+        # =====================================================================
+        # 1. RESUME INTEGRITY CHECK (Priority 1)
+        # =====================================================================
+        # If we loaded from a checkpoint, we MUST restore state before doing anything else.
+        if hasattr(self, "pending_normalizer_state"):
+             if hasattr(self.model, "normalizer"):
+                 self.model.normalizer.load_state_dict(self.pending_normalizer_state)
+                 logger.info("✅ [RESUME] Normalizer state restored to Model (Calibration Preserved).")
+                 del self.pending_normalizer_state
+             else:
+                 logger.warning("⚠️ [RESUME] Pending normalizer state found but MODEL has no normalizer!")
+        
+        # Ensure AWR Stats are synced (if resumed, they are already in the buffer)
+        if self.awr_calculator.stats_initialized:
+             logger.info(f"✅ [RESUME] AWR Engine Online: mu={self.awr_calculator.adv_mean:.4f}, sigma={self.awr_calculator.adv_std:.4f}")
+
+        # =====================================================================
+        # 2. FRESH CALIBRATION (Priority 2)
+        # =====================================================================
+        # Only run if NOT restored and NOT calibrated.
+        # This prevents double-calibration or overwriting restored stats.
+        
         if not (hasattr(self.trainer, "datamodule") and self.trainer.datamodule):
             logger.warning("No DataModule found. Skipping stats fitting.")
             return
@@ -1268,11 +1292,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
         loader = self.trainer.datamodule.train_dataloader()
         dataset = loader.dataset
         
-        # --- 1. Normalizer Calibration (Run on ALL Ranks) ---
-        # Check if already calibrated (e.g. from checkpoint) to avoid jitter
-        if self.model.normalizer.is_calibrated > 0:
-            logger.info(f"[Rank {self.global_rank}] Normalizer already calibrated. Skipping Calibration.")
-        else:
+        # --- 1. Physics Normalizer Calibration ---
+        # [SOTA Fix] Check explicitly if model normalizer needs calibration
+        if hasattr(self.model, "normalizer") and not self.model.normalizer.is_calibrated.item():
             logger.info(f"[Rank {self.global_rank}] Calibrating Normalizer...")
             try:
                 index_path = getattr(dataset, "index_path", None)
@@ -1479,23 +1501,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             }
         }
 
-    def on_fit_start(self):
-        """
-        [SOTA v3.1] Resume Integrity Check.
-        Restores critical state that PyTorch Lightning doesn't handle automatically (DataModule state).
-        """
-        # Restore Normalizer if pending (from checkpoint load)
-        if hasattr(self, "pending_normalizer_state"):
-             if hasattr(self.trainer, "datamodule") and hasattr(self.trainer.datamodule, "normalizer"):
-                 self.trainer.datamodule.normalizer.load_state_dict(self.pending_normalizer_state)
-                 logger.info("[RESUME] Normalizer state successfully restored from checkpoint (Calibration Preserved).")
-                 del self.pending_normalizer_state
-             else:
-                 logger.warning("[RESUME] Pending normalizer state found but no datamodule normalizer available!")
-        
-        # Ensure AWR Stats are synced (if resumed)
-        if self.awr_calculator.stats_initialized:
-            logger.info(f"[RESUME] AWR Engine Online: mu={self.awr_calculator.adv_mean:.4f}, sigma={self.awr_calculator.adv_std:.4f}")
+
 
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]):
         """
@@ -1504,8 +1510,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
         preserving global normalization statistics and AWR whitening parameters.
         """
         # 1. Save Normalizer State (Critical for Inference/Resume)
-        if hasattr(self.trainer, "datamodule") and hasattr(self.trainer.datamodule, "normalizer"):
-            checkpoint["normalizer_state"] = self.trainer.datamodule.normalizer.state_dict()
+        # 1. Save Normalizer State (Critical for Inference/Resume)
+        if hasattr(self.model, "normalizer"):
+            checkpoint["normalizer_state"] = self.model.normalizer.state_dict()
             
         # 2. AWR Statistics (Double-Check persistence)
         # Buffers are saved automatically, but explicit saving helps debugging

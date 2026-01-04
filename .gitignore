@@ -76,7 +76,7 @@ deleted_files.txt
 .DS_Store
 Thumbs.db
 desktop.ini
-sepsis_clinical_28_raw
+
 
 
 .agent
@@ -88,7 +88,7 @@ data/
 ready/
 checkpoints/
 outputs/
-# sepsis_clinical_28
+sepsis_clinical_28
 run.bat
 
 apex_moar_v20.db
@@ -102,8 +102,8 @@ sepsis_clinical_28/val_index.json
 report_logs.md
 
 
-logs1.md
-# log_report.md
+
+log_report.md
 working
 
 report_v4_blueprint.md
@@ -113,7 +113,10 @@ patches.md
 log.md
 
 working_23
-
+verify_fix.py
 error.md
 logs.md
-verify_fix.py
+logs1.md
+sepsis_clinical_28_raw
+logs2.md
+iop

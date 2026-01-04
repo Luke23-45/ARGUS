@@ -29,7 +29,7 @@ model:
   n_layers: 8
   encoder_layers: 4
   ffn_dim_ratio: 4
-  dropout: 0.25      # [NERYVA-ALPHA] High generalization threshold from Trial 20
+  dropout: 0.12   # 0.25     # [NERYVA-ALPHA] High generalization threshold from Trial 20
   use_rope: true
   use_swiglu: true
   use_flash_attn: true
@@ -45,7 +45,7 @@ model:
 train:
   phase: "phase1"
   epochs: 100
-  batch_size: 256           # [v20.6] Increased update frequency for classification signal
+  batch_size: 384           # [v20.6] Increased update frequency for classification signal
   num_workers: 2
   lr: 1.5e-4                  # [NERYVA-ALPHA] Optimal tempo for sepsis innovation
   min_lr: 1e-6
@@ -57,20 +57,20 @@ train:
   aux_loss_scale: 0.45        # [v12.5.1] Boosted for Expert Visibility
   precision: "16-mixed"
   accumulate_grad_batches: 1  
-  log_every_n_steps: 10
+  log_every_n_steps: 50
   fused_optimizer: true       # [H100] Enable fused kernels 
   
   balancing_mode: "sota_2025" 
   uw_lr: 0.025                # Learning rate for uncertainty weights
   
   # Phase 3: Longitudinal Foresight (Agentic Convergence)
-  start_gamma: 0.92           # [v25.9 SOTA] Stabilized for Unleashed Run
-  end_gamma: 0.92             # [v25.9 SOTA] Parked at 12.5h for initial phase
+  start_gamma: 0.98        # [v25.9 SOTA] Stabilized for Unleashed Run
+  end_gamma: 0.98             # [v25.9 SOTA] Parked at 12.5h for initial phase
   horizon_warmup: 10
   horizon_ramp: 40
 
   # Debug Mode (Smoke Test)
-  debug_run: true
+  debug_run: false
   debug_limit_batches: 150
   debug_limit_val: 500
 
