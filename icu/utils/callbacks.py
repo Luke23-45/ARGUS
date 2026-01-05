@@ -653,6 +653,20 @@ def get_sota_callbacks(cfg: DictConfig) -> List[Callback]:
     )
     callbacks.append(saver_cb)
     
+    # [USER-REQUESTED] Latest Epoch Saver
+    # Saves strictly the current epoch, overwriting the previous one.
+    # Naming format: {project/run_name}-{epoch}
+    latest_ckpt_cb = ModelCheckpoint(
+        dirpath=save_dir,
+        filename=f"{cfg.run_name}-latest-epoch={{epoch:02d}}",
+        monitor=None, # Save based on timing (latest)
+        save_top_k=1, # Keep only 1 (delete previous)
+        every_n_epochs=1,
+        save_weights_only=False,
+        auto_insert_metric_name=False # Cleaner filenames
+    )
+    callbacks.append(latest_ckpt_cb)
+    
     # [BACKUP] Optional Remote Mirroring (Simple Copy)
     remote_dir = cfg.get("remote_dir", None)
     if remote_dir:

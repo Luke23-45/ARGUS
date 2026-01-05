@@ -278,7 +278,19 @@ class ICUGeneralistWrapper(pl.LightningModule):
         )
         # [v25.4 FIX] Initial Log-Var Reset: Start with balanced weights (sigma=1.0)
         if self.balancing_mode == "sota_2025":
-            nn.init.constant_(self.loss_scaler.log_vars, 0.0)
+            # [PHASE 1 FIX] Initialize with scale-aware log_vars to prevent aux starvation
+            # diffusion has ~10x higher loss than aux → needs higher σ (lower weight)
+            # aux has lower loss → lower σ (higher weight)
+            initial_log_vars = torch.tensor([
+                1.0,    # diffusion: Higher σ → lower weight
+                0.5,    # critic: Medium
+                -0.5,   # aux: Lower σ → HIGHER weight (boost sepsis learning)
+                0.0,    # acl
+                0.5,    # bgsl
+                0.5,    # tcb
+            ])
+            # Ensure device compatibility if loaded later
+            self.loss_scaler.log_vars.data.copy_(initial_log_vars)
         
         # =====================================================================
         # [NEW] AGENTIC EVOLUTION CORE (Phases 1-3)
@@ -605,8 +617,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # We restrict sequence context gradient influence to 10%.
             # This allows the Sepsis head to "read" features without "dominating" them.
             ctx_aux = ctx_seq.clone()
-            # [FIX] Use SOTA Throttler
-            ctx_aux = GradientThrottler.throttle(ctx_aux, factor=0.1)
+            ctx_aux = ctx_seq.clone()
+            # [PHASE 1 FIX] Unthrottle gradient flow (0.1 -> 0.5+)
+            # The previous 0.1 factor was mathematically suppressing the classifier's ability
+            # to shape the shared encoder features.
+            throttle_factor = self.cfg.train.get("aux_throttle_factor", 0.5)
+            ctx_aux = GradientThrottler.throttle(ctx_aux, factor=throttle_factor)
 
             logits, _ = self.model.aux_head(ctx_aux, mask=ctx_mask)
             
@@ -665,9 +681,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
             with torch.no_grad():
                 velocity = (fut[:, 0, :] - past[:, -1, :]) # [B, D_in]
             
-            # [FIX] "The Peace Treaty": Throttle ACL gradient influence on Encoder to 5%
-            # Prevent contrastive objective from shredding the diffusion manifold
-            global_ctx_throttled = GradientThrottler.throttle(global_ctx, factor=0.05)
+            # [PHASE 1 FIX] Unthrottle ACL to 30% (was 5%)
+            acl_factor = self.cfg.train.get("acl_throttle_factor", 0.3)
+            global_ctx_throttled = GradientThrottler.throttle(global_ctx, factor=acl_factor)
             
             raw_meta = torch.cat([global_ctx_throttled, velocity, static], dim=-1)
             z_acl = self.acl_projector(raw_meta)
@@ -1446,16 +1462,43 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # In ICUUnifiedPlanner, models are combined. 
             # We'll stick to a unified model LR but keep expert_state_head and loss_scaler separate.
             
+            # [PHASE 1 FIX] Task-Specific Learning Rates
+            # Sepsis head needs to learn faster (3x) to catch up with dominant diffusion gradients.
+            
+            # 1. Identify Aux Parameters
+            aux_params = list(self.model.aux_head.parameters()) if hasattr(self.model, 'aux_head') else []
+            aux_param_ids = {id(p) for p in aux_params}
+            
+            # 2. Identify ACL Parameters (boosted for discrimination)
+            acl_params = list(self.acl_projector.parameters())
+            acl_param_ids = {id(p) for p in acl_params}
+            
+            # 3. Identify Main Model Parameters (excluding Aux and ACL)
+            main_model_params = [
+                p for p in self.model.parameters() 
+                if id(p) not in aux_param_ids
+            ]
+            
+            aux_lr_mult = self.cfg.train.get("aux_lr_multiplier", 3.0)
+            
             optimizer_params = [
-                # 1. Main Planner Model (Backbone, Encoder, etc.)
-                {'params': self.model.parameters(), 'lr': self.cfg.train.lr, 'weight_decay': self.cfg.train.weight_decay},
-                # 2. Expert State Head (Risk Scorer)
+                # Group 1: Main Backbone (Standard LR)
+                {'params': main_model_params, 'lr': self.cfg.train.lr, 'weight_decay': self.cfg.train.weight_decay},
+                
+                # Group 2: Aux Head (Boosted LR)
+                {'params': aux_params, 'lr': self.cfg.train.lr * aux_lr_mult, 'weight_decay': self.cfg.train.weight_decay},
+                
+                # Group 3: Expert State Head (Standard LR)
                 {'params': self.expert_state_head.parameters(), 'lr': self.cfg.train.lr, 'weight_decay': self.cfg.train.weight_decay},
-                # 3. Uncertainty Scaler - High LR for rapid convergence
+                
+                # Group 4: ACL Projector (Boosted LR)
+                {'params': acl_params, 'lr': self.cfg.train.lr * aux_lr_mult, 'weight_decay': self.cfg.train.weight_decay},
+                
+                # Group 5: Uncertainty Scaler (Special LR)
                 {'params': self.loss_scaler.parameters(), 'lr': uw_lr, 'weight_decay': 0.0}
             ]
             
-            logger.info(f"Optimizer: Initialized with 3 param groups. Model LR: {self.cfg.train.lr:.2e}, Scaler LR: {uw_lr:.2e}")
+            logger.info(f"Optimizer: Initialized with {len(optimizer_params)} param groups. Model LR: {self.cfg.train.lr:.2e}, Scaler LR: {uw_lr:.2e}")
             
             base_optimizer = torch.optim.AdamW(
                 optimizer_params,
@@ -1464,6 +1507,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 betas=(0.9, 0.999),
                 fused=False
             )
+
+
         else:
             optimizer_params = [{"params": self.model.parameters()}]
             base_optimizer = torch.optim.AdamW(

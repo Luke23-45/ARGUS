@@ -9,14 +9,14 @@ defaults:
 run_name: "gen_v1_${now:%Y-%m-%d_%H-%M-%S}"
 seed: 42
 compile_model: false
-save_checkpoints: false
+save_checkpoints: true
 
 # --- Directory Paths ---
 output_dir: "outputs/phase1"           # Main output directory
 checkpoint_dir: "/content/icu/checkpoints"  # Where checkpoints are saved
 log_dir: "/content/icu/logs/"         # Training logs directory
 backup_dir: null                        # Remote/backup directory
-resume_from: null      # Explicit checkpoint to resume from (optional)
+resume_from: null     # Explicit checkpoint to resume from (optional)
 # "/content/drive/MyDrive/pda/models/checkpoints/icu_model-epoch=05-val/clinical_auroc=0.747.ckpt"          
 # --- Model Architecture (ICUUnifiedPlanner) ---
 model:
@@ -55,6 +55,9 @@ train:
 
   pos_weight: 34.85           # [NERYVA-ALPHA] Certified Sensitivity (Trial 10 + 20 Synthesis)
   aux_loss_scale: 0.45        # [v12.5.1] Boosted for Expert Visibility
+  aux_lr_multiplier: 3.0      # [PHASE 1 FIX] Boost aux head learning rate
+  aux_throttle_factor: 0.5    # [PHASE 1 FIX] Unthrottle aux gradients (was 0.1)
+  acl_throttle_factor: 0.3    # [PHASE 1 FIX] Unthrottle ACL gradients (was 0.05)
   precision: "16-mixed"
   accumulate_grad_batches: 1  
   log_every_n_steps: 50
