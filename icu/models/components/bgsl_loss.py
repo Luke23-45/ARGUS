@@ -45,18 +45,40 @@ class BGSLLoss(nn.Module):
 
     def state_loss_fn(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
-        [v4.0 PERFECT] Using LogSumExp stable ASL.
+        [v4.5 PERFECT] Robust ASL with Logit Clamping and Configurable Gamma.
         """
-        gamma_neg, gamma_pos, clip = 4.0, 1.0, 0.05
+        # 1. Safety Clamp (Prevent Inf/NaN in Sigmoid)
+        logits = logits.clamp(min=-15.0, max=15.0)
         
-        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none', pos_weight=torch.tensor([self.pos_weight], device=logits.device))
+        # 2. Use Configured Gamma
+        gamma_neg = self.gamma # Use self.gamma (usually 4.0)
+        gamma_pos = 1.0        # Constant for positive class focus
+        clip = 0.05
+        
+        # 3. Compute Probabilities
         probs = torch.sigmoid(logits)
         
+        # 4. Asymmetric Probability Shifting
+        # xs_pos: prob of being positive (when target=1)
+        # xs_neg: prob of being negative (when target=0)
         xs_pos = probs
-        xs_neg = (1.0 - probs + clip).clamp(max=1.0) if clip > 0 else (1.0 - probs)
+        xs_neg = (1.0 - probs + clip).clamp(max=1.0)
         
-        asl_w = torch.pow(1.0 - (xs_pos * targets + xs_neg * (1.0 - targets)), 
-                          gamma_pos * targets + gamma_neg * (1.0 - targets))
+        # 5. Weight Calculation
+        # ASL Weight = (1 - p_target) ^ gamma
+        # We handle both pos/neg cases in one tensor operation
+        # p_target = xs_pos * targets + xs_neg * (1 - targets)
+        p_target = xs_pos * targets + xs_neg * (1.0 - targets)
+        gamma_weight = gamma_pos * targets + gamma_neg * (1.0 - targets)
+        
+        asl_w = torch.pow(1.0 - p_target, gamma_weight)
+        
+        # 6. Base Loss
+        bce = F.binary_cross_entropy_with_logits(
+            logits, targets, 
+            reduction='none', 
+            pos_weight=torch.tensor([self.pos_weight], device=logits.device)
+        )
         
         return asl_w * bce
 
@@ -69,8 +91,13 @@ class BGSLLoss(nn.Module):
         mask: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
-        [v4.0 PERFECT] Triple Gradient Objective with Dynamic Balancing.
+        [v4.5 PERFECT] Triple Gradient Objective with Robust Numerics.
         """
+        # 0. Input Sanitization (Stop NaN propagation at the source)
+        if torch.isnan(pred_state).any() or torch.isinf(pred_state).any():
+             # If model outputs explode, we must clamp them to salvage the step
+             pred_state = pred_state.nan_to_num(nan=0.0, posinf=15.0, neginf=-15.0)
+        
         # --- 1. State Loss (Hard-Negative Aware ASL) ---
         l_state_unreduced = self.state_loss_fn(pred_state, true_state)
         
@@ -80,22 +107,23 @@ class BGSLLoss(nn.Module):
              critical_penalty = 1.0 + (risk_coef * 2.0)
              l_state_unreduced = l_state_unreduced * critical_penalty
 
-        # Masking: true = masked/padding, false = valid
+        # Masking: true = masked/padding
         if mask is not None:
-             # Logic change: mask 1 usually means PAD, so we use (~mask) to get valid elements
-             # But standard PyTorch masks sometimes use 1 for VALID. 
-             # APEX-MoE uses mask=1 for PAD/MASKED.
              l_state = (l_state_unreduced * (~mask).unsqueeze(-1)).sum() / ((~mask).sum() + 1e-8)
         else:
              l_state = l_state_unreduced.mean()
              
         # --- 2. Physiological Dynamics (Trend & Shock) ---
+        # Safe Sigmoid for Predictions
+        pred_prob = torch.sigmoid(pred_state.clamp(-15, 15))
+        
         slopes = past_vitals[:, 1:] - past_vitals[:, :-1]
         vit_velocity = slopes.abs().mean(dim=-1, keepdim=True) # [B, T-1, 1]
         surprise = torch.sigmoid(vit_velocity * 2.0).detach() + 0.5 # [B, T-1, 1]
         
         # Trend: Directional consistency
-        pred_slopes = pred_state[:, 1:] - pred_state[:, :-1]
+        # Use probabilities, not logits, for trend/shock loss (Stable Gradient)
+        pred_slopes = pred_prob[:, 1:] - pred_prob[:, :-1]
         true_slopes = true_state[:, 1:] - true_state[:, :-1]
         l_trend_unreduced = F.mse_loss(pred_slopes, true_slopes, reduction='none')
         
@@ -106,6 +134,7 @@ class BGSLLoss(nn.Module):
             l_trend = (l_trend_unreduced * surprise).mean()
         
         # Shock: Acceleration
+        # [Fix] Safe Division for num_shock
         accel_vitals = (slopes[:, 1:] - slopes[:, :-1]).abs().mean(dim=-1, keepdim=True)
         num_shock = accel_vitals / (vit_velocity[:, 1:].detach() + 0.1) 
         
@@ -119,11 +148,7 @@ class BGSLLoss(nn.Module):
         else:
             l_shock = (l_shock_unreduced * num_shock.detach()).mean()
         
-
-        # [AUDIT FIX] Removed Heuristic EMA.
-        # The heuristic was collapsing weights to zero when the classifier failed.
-        # We enforce constant physics supervision to prevent hallucination.
-        # Target: Trend=0.5, Shock=0.2 (Verified Clinical Baselines)
+        # Constant Physics Supervision
         if self.training:
             self.w_t.data.fill_(0.5)
             self.w_h.data.fill_(0.2)

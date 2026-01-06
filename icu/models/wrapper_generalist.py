@@ -754,11 +754,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
             pred_state = self.expert_state_head(ctx_expert) # [B, T, 1]
             
             # [v4.0 FIX] Proper expansion for sequence-level targets
-            # phase_label is [B]. We expand to [B, T, 1].
-            # [REFINEMENT] Prepare sequence-level inputs for BGSL (Phase 1)
-            # Alignment: BGSL expects T context derived from past_norm (T=24).
-            # We strip the static token (index 0) to align with physiological vitals.
-            true_state = batch["phase_label"].float().view(B, 1, 1).expand(-1, ctx_expert.size(1), 1)
+            # [v4.5 PERFECT] Prepare sequence-level binary targets for BGSL
+            # phase_label (0, 1, 2) MUST be mapped to [0, 1] for BCE.
+            # Otherwise, target=2.0 results in negative loss and -inf explosion.
+            # [FIX] target > 0 => Sepsis (True), 0 => Stable (False)
+            true_state_binary = (batch["phase_label"] > 0).float()
+            true_state = true_state_binary.view(B, 1, 1).expand(-1, ctx_expert.size(1), 1)
             
             bgsl_out = self.bgsl_loss(
                 pred_state[:, 1:], # [B, T, 1]

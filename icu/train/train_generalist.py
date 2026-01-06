@@ -521,19 +521,22 @@ def main(cfg: DictConfig):
         if is_main_process():
             logger.info("="*80)
             logger.info("[SUCCESS] Phase 1 Training Complete!")
-            logger.info(f"[BEST MODEL] {trainer.checkpoint_callback.best_model_path}")
-            logger.info(f"[BEST SCORE] val/sepsis_auroc = {trainer.checkpoint_callback.best_model_score:.4f}")
-            
-            # [BACKUP] Copy best model to backup_dir if configured
-            if cfg.get("backup_dir") and trainer.checkpoint_callback.best_model_path:
-                import shutil
-                best_path = Path(trainer.checkpoint_callback.best_model_path)
-                backup_path = Path(cfg.backup_dir) / best_path.name
-                try:
-                    shutil.copy2(best_path, backup_path)
-                    logger.info(f"[BACKUP] Successfully backed up best model to: {backup_path}")
-                except Exception as e:
-                    logger.error(f"[BACKUP] Failed to backup model: {e}")
+            if trainer.checkpoint_callback:
+                logger.info(f"[BEST MODEL] {trainer.checkpoint_callback.best_model_path}")
+                logger.info(f"[BEST SCORE] val/sepsis_auroc = {trainer.checkpoint_callback.best_model_score:.4f}")
+                
+                # [BACKUP] Copy best model to backup_dir if configured
+                if cfg.get("backup_dir") and trainer.checkpoint_callback.best_model_path:
+                    import shutil
+                    best_path = Path(trainer.checkpoint_callback.best_model_path)
+                    backup_path = Path(cfg.backup_dir) / best_path.name
+                    try:
+                        shutil.copy2(best_path, backup_path)
+                        logger.info(f"[BACKUP] Successfully backed up best model to: {backup_path}")
+                    except Exception as e:
+                        logger.error(f"[BACKUP] Failed to backup model: {e}")
+            else:
+                logger.warning("[INFO] Checkpointing disabled. No best model path available.")
 
             logger.info("="*80)
         

@@ -42,6 +42,10 @@ class UncertaintyLossScaler(nn.Module):
                 loss = loss_dict[key]
                 
                 # --- [SOTA 2025] Dynamic Stability Logic ---
+                # 0. Input Sanitization (Stop propagation)
+                # Unconditional nan_to_num handles both NaN and +/- Inf safely.
+                loss = torch.nan_to_num(loss, nan=0.0, posinf=100.0, neginf=0.0)
+                
                 # Update EMA
                 with torch.no_grad():
                     curr_val = loss.item()
