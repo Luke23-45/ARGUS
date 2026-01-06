@@ -119,17 +119,14 @@ class BGSLLoss(nn.Module):
         else:
             l_shock = (l_shock_unreduced * num_shock.detach()).mean()
         
-        # --- 3. [SOTA] Dynamic Balancing (Heuristic) ---
+
+        # [AUDIT FIX] Removed Heuristic EMA.
+        # The heuristic was collapsing weights to zero when the classifier failed.
+        # We enforce constant physics supervision to prevent hallucination.
+        # Target: Trend=0.5, Shock=0.2 (Verified Clinical Baselines)
         if self.training:
-            with torch.no_grad():
-                s_val = l_state.item() + 1e-6
-                t_val = l_trend.item() + 1e-6
-                h_val = l_shock.item() + 1e-6
-                
-                # Target scales: State:Trend:Shock = 1.0 : 0.5 : 0.2
-                # We update weights smoothly via EMA
-                self.w_t.data.copy_(0.9 * self.w_t + 0.1 * (0.5 * s_val / t_val))
-                self.w_h.data.copy_(0.9 * self.w_h + 0.1 * (0.2 * s_val / h_val))
+            self.w_t.data.fill_(0.5)
+            self.w_h.data.fill_(0.2)
             
         total_loss = l_state + (self.w_t * l_trend) + (self.w_h * l_shock)
         

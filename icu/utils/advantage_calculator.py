@@ -495,7 +495,7 @@ class ICUAdvantageCalculator(nn.Module):
                  # Assuming mask means "any feature valid"
                  rewards = rewards * src_mask.any(dim=-1).float()
 
-        return rewards
+        return rewards * 10.0
 
 
     # =========================================================================

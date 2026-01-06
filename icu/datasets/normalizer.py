@@ -249,6 +249,18 @@ class ClinicalNormalizer(nn.Module):
         # =====================================================================
         # 1. SCHEMA VALIDATION (Critical Safety Check)
         # =====================================================================
+        # [FIX] Robust Alias Mapping (Apply BEFORE validation)
+        # PhysioNet and some subsets use 'Bilirubin_total', we use 'Bilirubin'.
+        # We must normalize these names before the strict canonical check.
+        sanitized_names = []
+        for name in channel_names_ts:
+            if name == "Bilirubin_total":
+                sanitized_names.append("Bilirubin")
+            else:
+                sanitized_names.append(name)
+        
+        channel_names_ts = sanitized_names
+
         if len(channel_names_ts) != self.ts_channels:
             raise ValueError(
                 f"[CRITICAL] Channel count mismatch: "
@@ -258,8 +270,11 @@ class ClinicalNormalizer(nn.Module):
         # Verify order matches canonical to prevent silent column-swapping
         if channel_names_ts != CANONICAL_COLUMNS:
             logger.error("[CRITICAL] Input channel order does not match CANONICAL spec!")
-            logger.error(f"  Expected first 5: {CANONICAL_COLUMNS[:5]}")
-            logger.error(f"  Received first 5: {channel_names_ts[:5]}")
+            # [Debug] Show the first mismatch
+            for i, (exp, act) in enumerate(zip(CANONICAL_COLUMNS, channel_names_ts)):
+                if exp != act:
+                    logger.error(f"  Mismatch at index {i}: Expected '{exp}', Got '{act}'")
+                    break
             raise ValueError("Aborting calibration to prevent column-swapping errors.")
 
         logger.info(f"[NORMALIZER] Calibrating from {path}...")

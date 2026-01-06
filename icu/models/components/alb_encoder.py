@@ -164,19 +164,30 @@ class AsymmetricLatentBottleneck(nn.Module):
         # 3. Expert Manifold
         # Use full_mask (T+1) for bypass and sync to handle prepended static token
         ctx_sharp = self.bypass(past_norm, ctx_seq, mask=full_mask)
-        # ctx_sharp has length T (bypass strips static)
-        # ctx_planner has length T+1
-        # sync mask applies to keys (ctx_planner), so use full_mask (T+1)
-        ctx_synced = self.sync(ctx_sharp, ctx_planner, ctx_planner, mask=full_mask) 
+        # [v4.5 SOTA FIX] "The Structural Divorce" (Self-Attention)
+        # Structural Isolation:
+        # We allow the Expert Manifold to self-organize without being forced
+        # to align with the Smooth Planner manifold.
+        # ctx_sharp has length T+1 (Static + Temporal)
+        ctx_synced = self.sync(ctx_sharp, ctx_sharp, ctx_sharp, mask=full_mask) 
         ctx_expert = self.expert_proj(ctx_synced)
         
         if full_mask is not None:
              ctx_expert = ctx_expert.masked_fill(full_mask.unsqueeze(-1), 0.0)
         
+        # [v4.1 SOTA] Global Expert Summary (Max Pooling for Anomaly Detection)
+        # Planner uses Attention Pooling (Weighted Mean). Expert uses Max Pooling (Peak Detection).
+        # We pool over the temporal dimension (1:), ignoring the static token (0).
+        if ctx_expert.size(1) > 1:
+            global_expert = ctx_expert[:, 1:].max(dim=1)[0] # [B, D]
+        else:
+            global_expert = ctx_expert[:, 0] # Fallback
+            
         return {
             "ctx_planner": ctx_planner,
             "global_planner": global_planner,
             "ctx_expert": ctx_expert,
+            "global_expert": global_expert, # [NEW] For Critic/ACL
             "ctx_mask": full_mask # [v4.0 FIX] Propagate full (T+1) mask to backbone
         }
 

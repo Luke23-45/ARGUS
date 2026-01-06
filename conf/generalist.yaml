@@ -9,7 +9,7 @@ defaults:
 run_name: "gen_v1_${now:%Y-%m-%d_%H-%M-%S}"
 seed: 42
 compile_model: false
-save_checkpoints: true
+save_checkpoints: false
 
 # --- Directory Paths ---
 output_dir: "outputs/phase1"           # Main output directory
@@ -53,11 +53,8 @@ train:
   weight_decay: 1e-4
   grad_clip: 1.0
 
-  pos_weight: 34.85           # [NERYVA-ALPHA] Certified Sensitivity (Trial 10 + 20 Synthesis)
-  aux_loss_scale: 0.45        # [v12.5.1] Boosted for Expert Visibility
-  aux_lr_multiplier: 3.0      # [PHASE 1 FIX] Boost aux head learning rate
-  aux_throttle_factor: 0.5    # [PHASE 1 FIX] Unthrottle aux gradients (was 0.1)
-  acl_throttle_factor: 0.3    # [PHASE 1 FIX] Unthrottle ACL gradients (was 0.05)
+  pos_weight: 1.0             # [NERYVA-BETA] Reset to 1.0 (Handled by DynamicClassBalancer)
+  aux_loss_scale: 1.0         # [v12.6] Restored to 1.0 (No throttling needed with balanced weights)
   precision: "16-mixed"
   accumulate_grad_batches: 1  
   log_every_n_steps: 50
@@ -73,8 +70,8 @@ train:
   horizon_ramp: 40
 
   # Debug Mode (Smoke Test)
-  debug_run: false
-  debug_limit_batches: 150
+  debug_run: true
+  debug_limit_batches: 120
   debug_limit_val: 500
 
   

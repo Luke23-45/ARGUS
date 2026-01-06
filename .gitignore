@@ -120,3 +120,8 @@ logs1.md
 sepsis_clinical_28_raw
 logs2.md
 iop
+intro_video_project
+
+recursion__.txt
+verify_metadata_schema.py
+tests/verify_normalizer_fix.py

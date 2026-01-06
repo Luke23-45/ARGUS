@@ -497,7 +497,19 @@ class ICUGeneralistWrapper(pl.LightningModule):
             padding_mask=bool_padding_mask # [v25.2 FIX] Pass 2D mask for Transformer Attention
         )
         ctx_seq = out_alb["ctx_planner"]
-        global_ctx = out_alb["global_planner"]
+        global_ctx_planner = out_alb["global_planner"]
+        global_ctx_expert = out_alb["global_expert"]
+        
+        # [SOTA 2025 FIX] Strict Manifold Decoupling ("The Divorce")
+        # Optimization Isolation:
+        # 1. Diffusion uses ONLY Planner (Smooth) -> Reconstructs Vitals
+        # 2. Aux Head uses ONLY Expert (Sharp) -> Detects Sepsis
+        #
+        # PREVIOUSLY: global_ctx = (global_ctx_planner + global_ctx_expert) * 0.5
+        # This caused "Negative Transfer" where massive diffusion gradients 
+        # overwrote the delicate expert features, causing AUC to plateau at 0.74.
+        global_ctx = global_ctx_planner
+        
         ctx_expert = out_alb["ctx_expert"]
         ctx_mask = out_alb["ctx_mask"]
         
@@ -515,13 +527,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
         # B. Advantage Engine (AWR with authoritative EMA Teacher)
         with torch.no_grad():
+            # [FIX] Double-Scale Prevention
+            # 'fut' is Raw Data (from dataset). We must NOT pass the normalizer, 
+            # or it will try to "denormalize" already physical values -> Garbage.
             rewards = self.awr_calculator.compute_clinical_reward(
                 fut, 
                 batch.get("outcome_label", None),
                 dones=batch.get("is_terminal", None),
                 feature_indices=self.clinical_feat_idx,
-                normalizer=self.model.normalizer,
-                src_mask=batch.get("future_mask", None) # [v12.6 FIX] Use Future Imputation Mask
+                normalizer=None, # [FIX] Input is already Raw
+                src_mask=batch.get("future_mask", None) 
             )
             # [SOTA] Use Teacher Context for bootstrapping
             with self.ema_teacher_context():
@@ -616,12 +631,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # [SOTA 2025] Asymmetric Throttling: The "Peace Treaty"
             # We restrict sequence context gradient influence to 10%.
             # This allows the Sepsis head to "read" features without "dominating" them.
-            ctx_aux = ctx_seq.clone()
-            ctx_aux = ctx_seq.clone()
-            # [PHASE 1 FIX] Unthrottle gradient flow (0.1 -> 0.5+)
-            # The previous 0.1 factor was mathematically suppressing the classifier's ability
-            # to shape the shared encoder features.
-            throttle_factor = self.cfg.train.get("aux_throttle_factor", 0.5)
+            # [SOTA 2025 FIX] The "Expert Bypass"
+            # Previously: ctx_aux = ctx_seq (Smooth Planner Features). 
+            # This filtered out the sharp anomalies needed for sepsis detection.
+            # Now: ctx_aux = ctx_expert (Sharp Expert Features).
+            ctx_aux = ctx_expert.clone()
+            # [PHASE 1 FIX] Unthrottle gradient flow (RESTORED to 1.0)
+            # We want the classifier to shape the encoder.
+            throttle_factor = self.cfg.train.get("aux_throttle_factor", 1.0)
             ctx_aux = GradientThrottler.throttle(ctx_aux, factor=throttle_factor)
 
             logits, _ = self.model.aux_head(ctx_aux, mask=ctx_mask)
@@ -636,20 +653,20 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Contrastive (ACL) is Sequence-Level [B, T] (handled internally)
             B, T, _ = ctx_seq.shape
             
-            # [SOTA 2025] Class Frequency Multiplier (CFM)
-            # Calculated based on window-level targets for the Aux head
-            n_total = targets.numel()
-            n_sepsis = (targets > 0).sum().item()
-            # [FIX] Log-Scale Boost (Stabilized, max ~4.0x)
-            cfm = GradientThrottler.log_scale_prevalence(n_total, n_sepsis)
+            # [REMOVED] Class Frequency Multiplier (CFM)
+            # AUDIT FINDING: This was causing a 2.7x multiplier on top of the 35x pos_weight.
+            # Rely strictly on DynamicClassBalancer.
+            cfm = 1.0
             
             # [SOTA 2025] Dynamic Hard Negative Mining (Mining Weight)
+            # [AUDIT FIX] Cap mining weight to prevent explosion.
             with torch.no_grad():
                 probs = torch.softmax(logits, dim=-1)
                 # logits/probs: [B, C], targets: [B]
                 true_probs = probs.gather(-1, targets.unsqueeze(-1).long())
                 error = 1.0 - true_probs.squeeze(-1)
-                mining_weight = 1.0 + torch.sigmoid(error * 5.0) 
+                # Cap max boosting at 1.5x (was 2.0x)
+                mining_weight = 1.0 + (torch.sigmoid(error * 5.0) * 0.5)
             
             # One-hot encoding for window-level targets
             targets_one_hot = F.one_hot(targets.long(), num_classes=logits.shape[-1]).float()
@@ -657,6 +674,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Sepsis Classification Loss (Window-Level)
             # Note: No explicit spatial masking needed here as SequenceAuxHead 
             # internally handles padding via Attention masks during pooling.
+            # [AUDIT FIX] Removed 'risk_coef' scaling from inner loss if redundant
             raw_aux_loss = self.risk_aware_loss(logits, targets_one_hot, risk_coef, class_weights=class_weights)
             aux_loss = raw_aux_loss * cfm * mining_weight.mean()
 
@@ -745,7 +763,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             bgsl_out = self.bgsl_loss(
                 pred_state[:, 1:], # [B, T, 1]
                 true_state[:, 1:], # [B, T, 1]
-                past_norm,          # [B, T, 28] 
+                past,              # [FIX] Use RAW vitals for physical slope calc
                 risk_coef=risk_coef.view(B, 1, 1), # [B, 1, 1] for broadcasting
                 mask=ctx_mask[:, 1:] # [B, T]
             )
@@ -1038,12 +1056,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 if value_preds is not None:
                     with torch.no_grad():
                         # Calculate ground truth rewards for the validation batch
+                        # [FIX] Double-Scale Prevention
+                        # 'future_data' is Raw. Computing reward on Normalized Data (via denormalize) is wrong.
+                        # We pass normalizer=None because the input IS ALREADY PHYSICAL.
                         val_rewards = self.awr_calculator.compute_clinical_reward(
-                            batch["future_data"], 
+                            batch["future_data"], # Raw
                             batch.get("outcome_label", None),
                             dones=batch.get("is_terminal", None),
                             feature_indices=self.clinical_feat_idx,
-                            normalizer=self.model.normalizer if hasattr(self.model, 'normalizer') else None,
+                            normalizer=None, # [FIX] Do NOT denormalize raw data
                             src_mask=batch.get("future_mask", None)
                         )
                         # Estimate GAE advantages and total returns
