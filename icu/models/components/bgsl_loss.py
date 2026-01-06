@@ -21,7 +21,7 @@ from typing import Optional, Dict
 class BGSLLoss(nn.Module):
     def __init__(
         self, 
-        pos_weight: float = 10.0, 
+        pos_weight: float = 5.0, 
         gamma: float = 2.0,
         trend_coef: float = 1.0, 
         shock_coef: float = 2.0

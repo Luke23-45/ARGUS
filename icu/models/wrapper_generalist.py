@@ -349,7 +349,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         )
         
         # [v4.0 PERFECT] Manifold Projections
-        self.expert_state_head = nn.Linear(cfg.model.d_model, 1)
+        # [REMOVED] self.expert_state_head = nn.Linear(cfg.model.d_model, 1)
         
         # =====================================================================
         # 5. TRAINING TELEMETRY (Accumulated Metrics)
@@ -741,10 +741,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Also fixes a mask-safety bug by using the scalar 'diff_loss' variable 
             # (which correctly handles f_mask division from L613).
             loss_dict = {
-                'diffusion': diff_loss * 1e-3, # 7000 -> 7.0 (Mask-Safe)
-                'critic': critic_loss * 1e-1,  # 150 -> 15.0
-                'aux': aux_loss,               # Clinical Anchor (0.5)
-                'acl': acl_loss                # (1.5)
+                'diffusion': diff_loss,       # [v5.2] Scale Restored: 1.0 (Mask-Safe)
+                'critic': critic_loss,        # [v5.2] Scale Restored
+                'aux': aux_loss,              # Clinical Anchor (0.5)
+                'acl': acl_loss               # (1.5)
             }
             
             # [v4.0 PERFECT] Add BGSL and TCB to the balance
@@ -753,9 +753,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # However, for now, let's assume we use the window-level logits for state loss
             # and potentially expand SequenceAuxHead if we want sequence-level risk.
             
-            # [REFINEMENT] Extract sequence-level logits for BGSL (Phase 1)
-            # For perfect alignment, we call BGSL on ctx_expert
-            pred_state = self.expert_state_head(ctx_expert) # [B, T, 1]
+            # [v5.2] Manifold Sync: Use the SOTA SequenceAuxHead for BGSL supervision
+            # We call the aux_head with return_sequence=True to get [B, T, C]
+            logits_seq, _ = self.model.aux_head(ctx_expert, return_sequence=True)
+            
+            if logits_seq.shape[-1] > 1:
+                # [SOTA Alignment] Convert multi-class logits to a single "Sepsis Risk" logit
+                # Formula: logit(p_sepsis) = logsumexp(sepsis_channels) - logit(stable_channel)
+                pred_state = logits_seq[..., 1:].logsumexp(dim=-1, keepdim=True) - logits_seq[..., 0:1]
+            else:
+                pred_state = logits_seq
             
             # [v5.1 SOTA] Surgical Signal Preservation
             # 0.1 Smoothing: 1.0 -> 0.95, 0.0 -> 0.05
@@ -1150,13 +1157,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
         if pred_safe.shape[-1] > 21:
             self.val_mse_electrolytes.update(pred_safe[..., 18:22].contiguous(), gt_safe[..., 18:22].contiguous())
         
-        # 4. Safety Checks (OOD uses raw physical values or latent statistics?)
-        # OODGuardian likely expects Raw Physical or Normalized? 
-        # Usually checking "is this BP 300?" -> Physical.
-        # But `check_trajectories` signature says `force_clinical=True`.
-        # Passing `pred_safe` (Physical) is correct if `force_clinical=True`.
+        # 4. Safety Checks (OOD Guardian)
+        # [FIX v5.2] Unit Mismatch: OODGuardian expects clinical units for history too.
+        # We must denormalize history to prevent the permanent OOD=1.0 "Unit Trap".
         with torch.no_grad():
-            safety_results = self.safety_guardian.check_trajectories(subset["observed_data"], pred_safe, force_clinical=True)
+            hist_denorm = normalizer.denormalize(subset["observed_data"])
+            safety_results = self.safety_guardian.check_trajectories(hist_denorm, pred_safe, force_clinical=True)
         
         self.val_ood_rate.update(safety_results["ood_rate"])
         self.val_safe_traj_count.update(safety_results["safe_count"])
@@ -1515,9 +1521,6 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 
                 # Group 2: Aux Head (Boosted LR)
                 {'params': aux_params, 'lr': self.cfg.train.lr * aux_lr_mult, 'weight_decay': self.cfg.train.weight_decay},
-                
-                # Group 3: Expert State Head (Standard LR)
-                {'params': self.expert_state_head.parameters(), 'lr': self.cfg.train.lr, 'weight_decay': self.cfg.train.weight_decay},
                 
                 # Group 4: ACL Projector (Boosted LR)
                 {'params': acl_params, 'lr': self.cfg.train.lr * aux_lr_mult, 'weight_decay': self.cfg.train.weight_decay},

@@ -37,14 +37,14 @@ def run_deep_forensics():
         {'params': scaler.parameters(), 'lr': 0.025}                 # Scaler LR (High)
     ])
 
-    # 3. Task Scales (Forensic Evidence from logs2.md & reort.md)
+    # 3. Task Scales (Corrected Noise-Space units)
     scales = {
-        'diffusion': 7500.0, # High: MSE in clinical units (unnormalized)
-        'critic': 150.0,     # Mid: Advantage scaling
-        'aux': 0.5,          # Low: BCE with Sepsis (The victim)
-        'acl': 1.5,          # Mid: Contrastive
-        'bgsl': 1.0,         # Mid: Dynamics
-        'tcb': 2.0           # Mid: Buffer
+        'diffusion': 1.7,    # Corrected: Noise MSE is O(1)
+        'critic': 1.5,       # Adjusted
+        'aux': 0.5,          # Clinical Anchor
+        'acl': 1.5, 
+        'bgsl': 1.0, 
+        'tcb': 2.0
     }
     
     # 4. Simulation Loop (500 Steps = Approx 2-3 Epochs of clinical data)
@@ -61,7 +61,7 @@ def run_deep_forensics():
         
         # --- Task 2: Diffusion (The Dominator) ---
         # Goal: Reconstruct vitals
-        l_diff = (backbone @ head_diff).pow(2).sum() * (scales['diffusion'] * 1e-3) # SIMULATED PATCH
+        l_diff = (backbone @ head_diff).pow(2).sum() * (scales['diffusion']) # [v5.2] Corrected Scale
         
         # --- Static Tasks (Mock) ---
         l_others = {k: torch.tensor(v) for k, v in scales.items() if k not in ['diffusion', 'aux']}
@@ -137,7 +137,7 @@ def run_deep_forensics():
     print(f"3. Scaler Responsiveness: Weights converged to {history['w_diff'][-1]:.8f}")
     
     # Check if parity is achieved (Scaled Diff vs Sepsis)
-    current_pressure = history['w_diff'][-1].detach().item() * (scales['diffusion'] * 1e-3)
+    current_pressure = history['w_diff'][-1].detach().item() * (scales['diffusion'])
     sepsis_pressure = history['w_sepsis'][-1].detach().item() * scales['aux']
     print(f"   Scaled Diffusion Pressure: {current_pressure:.2f}")
     print(f"   Scaled Sepsis Pressure: {sepsis_pressure:.2f}")

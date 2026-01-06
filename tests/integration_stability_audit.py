@@ -112,7 +112,7 @@ def run_integration_audit():
     try:
         # Check requires_grad
         print(f"Backbone Parameter requires_grad: {next(wrapper.model.backbone.parameters()).requires_grad}")
-        print(f"Sepsis Head Parameter requires_grad: {wrapper.expert_state_head.weight.requires_grad}")
+        print(f"Aux Head Parameter requires_grad: {next(wrapper.model.aux_head.parameters()).requires_grad}")
         
         # [VITAL] Intercept manual_backward to inspect the loss
         captured_loss = []
@@ -169,15 +169,15 @@ def run_integration_audit():
     else:
         print("❌ FAILURE: Backbone has NO gradients!")
 
-    # Check Sepsis Head (The core restricted area)
-    # Note: expert_state_head is an instance attribute of wrapper
-    head_grad = wrapper.expert_state_head.weight.grad
-    if head_grad is not None:
-        print(f"Expert Head Grad Norm: {head_grad.norm():.6f}")
-        if head_grad.norm() > 0:
-             print("✅ SUCCESS: Sepsis Head has ACTIVE learning signal (Not Blinded).")
+    # Check Aux Head (The core synced manifold area)
+    aux_head_grads = [p.grad for p in wrapper.model.aux_head.parameters() if p.grad is not None]
+    if aux_head_grads:
+        total_aux_norm = torch.stack([g.norm() for g in aux_head_grads]).sum()
+        print(f"Aux Head (Sepsis) Total Grad Norm: {total_aux_norm:.6f}")
+        if total_aux_norm > 0:
+             print("✅ SUCCESS: Aux Head has ACTIVE learning signal (Manifold Sync Verified).")
     else:
-        print("❌ FAILURE: Sepsis Head has NO gradients!")
+        print("❌ FAILURE: Aux Head has NO gradients!")
 
     # 7. Coordinate Verification (Line-by-Line Code Proof)
     print("\n[Step 4] Line-by-Line Logic Verification...")

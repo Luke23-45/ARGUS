@@ -128,6 +128,5 @@ tests/verify_normalizer_fix.py
 analysis_report.md
 patches_snippit.md
 logs2.md
-reort.md
-report_scale_analysis.md
-search_report.md
+suggestion.md
+.gitignore

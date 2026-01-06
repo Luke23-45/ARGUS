@@ -192,7 +192,7 @@ class SequenceAuxHead(nn.Module):
         
         self.criterion = AsymmetricLoss(gamma_neg=4, gamma_pos=1)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, targets: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, targets: Optional[torch.Tensor] = None, return_sequence: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         B = x.shape[0]
         # 1. Prepend CLS
         cls_tokens = self.cls_token.expand(B, -1, -1)
@@ -209,15 +209,20 @@ class SequenceAuxHead(nn.Module):
         for block in self.blocks:
             x_seq = block(x_seq, mask=seq_mask)
         
-        # 4. Extract CLS
-        cls_out = x_seq[:, 0, :]
-        
-        # 5. Predict
-        logits = self.head(cls_out)
+        # 4. Predict
+        if return_sequence:
+            # Return per-step predictions for the original sequence [B, T, C]
+            # Skip the CLS token at index 0
+            seq_out = x_seq[:, 1:, :] 
+            logits = self.head(seq_out)
+        else:
+            # Standard CLS-based window prediction [B, C]
+            cls_out = x_seq[:, 0, :]
+            logits = self.head(cls_out)
         
         # 6. Loss
         loss = None
-        if targets is not None:
+        if targets is not None and not return_sequence:
             num_classes = logits.shape[-1]
             if num_classes > 1:
                 # Multi-Class: Expect Long indices, convert to One-Hot

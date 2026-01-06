@@ -1230,7 +1230,7 @@ class ICUUnifiedPlanner(nn.Module):
                 
                 # Note: SequenceAuxHead returns (logits, loss).
                 logits, sota_aux_loss = self.aux_head(
-                    ctx_seq, 
+                    out_alb["ctx_expert"], 
                     mask=ctx_mask, 
                     targets=batch["phase_label"].long() if batch["phase_label"] is not None else None
                 )
@@ -1251,7 +1251,7 @@ class ICUUnifiedPlanner(nn.Module):
             if self.cfg.use_auxiliary_head and "phase_label" in batch:
                 # Scaler handles reduction usually, but here we return scalar
                 logits, sota_aux_loss = self.aux_head(
-                    ctx_seq, 
+                    out_alb["ctx_expert"], 
                     mask=ctx_mask, 
                     targets=batch["phase_label"].long()
                 )
