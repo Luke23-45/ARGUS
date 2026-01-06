@@ -736,11 +736,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
             phys_violation = self.safety_envelope(x0_clinical, risk_coef)
             phys_loss = phys_violation * curr_phys_weight
             
+            # [v5.1.3 SOTA] Unit Normalization (The "Regime Alignment")
+            # Proactively scales major regression tasks into the [1.0, 15.0] range.
+            # Also fixes a mask-safety bug by using the scalar 'diff_loss' variable 
+            # (which correctly handles f_mask division from L613).
             loss_dict = {
-                'diffusion': (raw_diff_loss * weights_awr).mean(), # Removed: + phys_loss
-                'critic': critic_loss,
-                'aux': aux_loss,
-                'acl': acl_loss
+                'diffusion': diff_loss * 1e-3, # 7000 -> 7.0 (Mask-Safe)
+                'critic': critic_loss * 1e-1,  # 150 -> 15.0
+                'aux': aux_loss,               # Clinical Anchor (0.5)
+                'acl': acl_loss                # (1.5)
             }
             
             # [v4.0 PERFECT] Add BGSL and TCB to the balance
@@ -753,13 +757,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # For perfect alignment, we call BGSL on ctx_expert
             pred_state = self.expert_state_head(ctx_expert) # [B, T, 1]
             
-            # [v4.0 FIX] Proper expansion for sequence-level targets
-            # [v4.5 PERFECT] Prepare sequence-level binary targets for BGSL
-            # phase_label (0, 1, 2) MUST be mapped to [0, 1] for BCE.
-            # Otherwise, target=2.0 results in negative loss and -inf explosion.
-            # [FIX] target > 0 => Sepsis (True), 0 => Stable (False)
+            # [v5.1 SOTA] Surgical Signal Preservation
+            # 0.1 Smoothing: 1.0 -> 0.95, 0.0 -> 0.05
+            # Prevents Uncertainty Scaler singularity by keeping loss > 0.
+            ls_alpha = 0.1
             true_state_binary = (batch["phase_label"] > 0).float()
-            true_state = true_state_binary.view(B, 1, 1).expand(-1, ctx_expert.size(1), 1)
+            smoothed_target = true_state_binary * (1 - ls_alpha) + (ls_alpha / 2)
+            true_state = smoothed_target.view(B, 1, 1).expand(-1, ctx_expert.size(1), 1)
             
             bgsl_out = self.bgsl_loss(
                 pred_state[:, 1:], # [B, T, 1]
@@ -802,7 +806,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 logs.get('weight/diffusion', torch.tensor(1.0, device=self.device)), 
                 logs.get('weight/critic', torch.tensor(1.0, device=self.device)),
                 logs.get('weight/aux', torch.tensor(1.0, device=self.device)),
-                logs.get('weight/acl', torch.tensor(1.0, device=self.device))
+                logs.get('weight/acl', torch.tensor(1.0, device=self.device)),
+                logs.get('weight/bgsl', torch.tensor(1.0, device=self.device)),
+                logs.get('weight/tcb', torch.tensor(1.0, device=self.device))
             ]
             
         else:
@@ -875,9 +881,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 # [SOTA FIX v2025] Adaptive Gradient Clipping for Transformer Backbone
                 # Standard clipping for non-backbone, AGC for DiT layers
                 
-                # 1. Clip Loss Scaler (if exists) - Low threshold
+                # 1. Clip Loss Scaler (if exists) - Low threshold (SOTA: 0.1)
                 if hasattr(self, 'loss_scaler') and self.loss_scaler is not None:
-                    torch.nn.utils.clip_grad_norm_(self.loss_scaler.parameters(), 0.5)
+                    torch.nn.utils.clip_grad_norm_(self.loss_scaler.parameters(), 0.1)
                 
                 # 2. Main Parameters: Use Adaptive Clipping
                 adaptive_gradient_clip_(self.parameters(), clip_factor=0.01)

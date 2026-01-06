@@ -47,8 +47,8 @@ class BGSLLoss(nn.Module):
         """
         [v4.5 PERFECT] Robust ASL with Logit Clamping and Configurable Gamma.
         """
-        # 1. Safety Clamp (Prevent Inf/NaN in Sigmoid)
-        logits = logits.clamp(min=-15.0, max=15.0)
+        # [v5.1 SOTA] Removed hard-clamping to restore signal integrity. 
+        # Analytical stability is handled by BCEWithLogitsLoss.
         
         # 2. Use Configured Gamma
         gamma_neg = self.gamma # Use self.gamma (usually 4.0)
@@ -93,10 +93,8 @@ class BGSLLoss(nn.Module):
         """
         [v4.5 PERFECT] Triple Gradient Objective with Robust Numerics.
         """
-        # 0. Input Sanitization (Stop NaN propagation at the source)
-        if torch.isnan(pred_state).any() or torch.isinf(pred_state).any():
-             # If model outputs explode, we must clamp them to salvage the step
-             pred_state = pred_state.nan_to_num(nan=0.0, posinf=15.0, neginf=-15.0)
+        # [v5.1 SOTA] Removed activation-level sanitization.
+        # Smoothing and hierarchical clipping handle stability without blinding.
         
         # --- 1. State Loss (Hard-Negative Aware ASL) ---
         l_state_unreduced = self.state_loss_fn(pred_state, true_state)
@@ -113,9 +111,8 @@ class BGSLLoss(nn.Module):
         else:
              l_state = l_state_unreduced.mean()
              
-        # --- 2. Physiological Dynamics (Trend & Shock) ---
-        # Safe Sigmoid for Predictions
-        pred_prob = torch.sigmoid(pred_state.clamp(-15, 15))
+        # [v5.1 SOTA] Restored full probability signal
+        pred_prob = torch.sigmoid(pred_state)
         
         slopes = past_vitals[:, 1:] - past_vitals[:, :-1]
         vit_velocity = slopes.abs().mean(dim=-1, keepdim=True) # [B, T-1, 1]
