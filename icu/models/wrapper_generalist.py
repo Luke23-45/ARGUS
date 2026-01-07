@@ -529,108 +529,25 @@ class ICUGeneralistWrapper(pl.LightningModule):
         weighted_diff = diff_sq * self.model.importance_weights.view(1, 1, -1)
         raw_diff_loss = weighted_diff.mean(dim=2) # [B, T]
 
-        # B. Advantage Engine (AWR with authoritative EMA Teacher)
-        with torch.no_grad():
-            # [FIX] Double-Scale Prevention
-            # 'fut' is Raw Data (from dataset). We must NOT pass the normalizer, 
-            # or it will try to "denormalize" already physical values -> Garbage.
-            rewards = self.awr_calculator.compute_clinical_reward(
-                fut, 
-                batch.get("outcome_label", None),
-                dones=batch.get("is_terminal", None),
-                feature_indices=self.clinical_feat_idx,
-                normalizer=None, # [FIX] Input is already Raw
-                src_mask=batch.get("future_mask", None) 
-            )
-            # [SOTA] Use Teacher Context for bootstrapping
-            with self.ema_teacher_context():
-                out_teacher = self.model.encoder(
-                    past_norm, 
-                    static_norm, 
-                    imputation_mask=src_mask, 
-                    padding_mask=bool_padding_mask
-                )
-                teacher_seq = out_teacher["ctx_planner"]
-                teacher_global = out_teacher["global_planner"]
-                teacher_mask = out_teacher["ctx_mask"]
-                
-                # [v4.1 SOTA] Distributional Value (Expert Expectile Summary)
-                # We use the specialized summary for bootstrapping the RL engine.
-                target_values = self.model.value_head.get_expectile_summary(
-                    self.model.value_head(teacher_global)
-                )
-            
-            # [v12.7 SOTA FIX] Value-Head Bootstrapping
-            # If a window is truncated (not yet at end of stay), we bootstrap 
-            # from the last critic estimate. If terminal, we use zero.
-            is_truncated = batch.get("is_truncated", None)
-            if is_truncated is not None and is_truncated.any():
-                # [B, 1] bootstrap value from the last predicted value
-                # SOTA: This ensures Bellman backups don't treat window edges as episode ends.
-                bootstrap_value = target_values[:, -1:]
-            else:
-                bootstrap_value = None
-
-            # A(s, s') = r + gamma * V_teacher(s') - V_student(s)
-            with torch.no_grad():
-                # [v4.1 SOTA] Expert Expectile Summary for Student
-                student_values = self.model.value_head.get_expectile_summary(
-                    self.model.value_head(global_ctx)
-                ).detach()
-            
-            advantages = self.awr_calculator.compute_saw(
-                rewards, 
-                student_values=student_values,
-                teacher_values=target_values,
-                dones=batch.get("is_terminal", None),
-                bootstrap_value=bootstrap_value
-            )
-            returns = (advantages + student_values).detach()
-            
-            # [SOTA v3.1] Step-Level AWR with Padding Safety
-            f_mask = batch.get("future_mask")
-            if f_mask is not None:
-                if f_mask.dim() == 3: f_mask = f_mask.any(dim=-1)
-                f_mask = f_mask.float()
-            else:
-                f_mask = torch.ones_like(advantages, dtype=torch.float32)
-
-            # [2025 SOTA] High-Pressure AWR Weights (Global Pool: B*T clinical moments)
-            # Pass full [B, T] tensors to preserve step-level granularity.
-            weights_awr, diag = self.awr_calculator.calculate_weights(
-                advantages,
-                values=target_values,
-                rewards=returns,
-                mask=f_mask
-            )
-            
-            # Enforce Padding Safety & Global Normalization
-            # 1. Zero out weights for padding tokens
-            weights_awr = weights_awr * f_mask
-            # 2. Normalize by mean of VALID clinical moments across the entire batch
-            weights_awr = weights_awr / (weights_awr.sum() / (f_mask.sum() + 1e-8) + 1e-8)
-            
-            weights_awr_log = {"train/awr_ess": diag["ess"]}
-
-        # [SOTA v3.1] Masked Weighted Diffusion Loss
-        # Ensure padding doesn't poison the gradient or the loss reporting.
-        diff_loss = (raw_diff_loss * weights_awr * f_mask).sum() / (f_mask.sum() + 1e-8)
-        self.train_awr_ess.update(weights_awr_log.get("train/awr_ess", 0.0))
+        # B. Advantage Engine (DEFERRED to Fused Teacher Block)
+        # We process AWR logic later to allow "One-Pass" Teacher execution.
+        weights_awr_log = {}
         
         # C. Critic Task (SOTA IDC-25)
         # Replaced scalar MSE with Distributional Implicit Q-Learning (IQL-QR)
+        # We compute predictions here (Student Pass), but loss is deferred until
+        # after the Fused Teacher Block provides the 'returns' (targets).
         pred_values = self.model.value_head(global_ctx)
-        critic_loss = self.model.value_loss_fn(pred_values, returns)
         
-        # [v4.1.2] Distributional Explained Variance (Main Tracker)
-        with torch.no_grad():
-            self.train_explained_var.update(
-                self.model.value_loss_fn.compute_explained_variance(pred_values, returns)
-            )
-        
-        # D. Auxiliary Task (MoE / Sepsis Diagnostics)
+        # D. Task-Specific Component Computation (Initialization)
         aux_loss = torch.tensor(0.0, device=self.device)
         acl_loss = torch.tensor(0.0, device=self.device)
+        l_bgsl = torch.tensor(0.0, device=self.device)
+        l_tcb = torch.tensor(0.0, device=self.device)
+        # [v12.8.2 FIX] Synchronize with generalist.yaml (num_phases)
+        logits = torch.zeros((B, self.cfg.model.num_phases), device=self.device)
+        uncertainty = torch.ones((B, 1), device=self.device) # Vacuous by default
+        
         if self.cfg.model.use_auxiliary_head and "phase_label" in batch:
             # [SOTA 2025] Asymmetric Throttling: The "Peace Treaty"
             # We restrict sequence context gradient influence to 10%.
@@ -689,54 +606,138 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
             # [Point 6] Self-Supervised Clinical Priority (Teacher Anchoring)
             # Rationale: Prevents Student 'forgetting' during high-noise diffusion phases.
-            if self.ema is not None and self.current_epoch >= 2:
-                with self.ema_teacher_context():
-                    with torch.no_grad():
-                        teacher_aux = self.model.aux_head(ctx_aux, mask=ctx_mask)
-                        teacher_logits = teacher_aux["logits"]
-                
-                # Soft Anchor Loss (SOTA Distillation)
-                # Helps the student maintain the same risk manifold as the stable teacher
-                l_anchor = F.binary_cross_entropy_with_logits(logits, torch.sigmoid(teacher_logits))
-                aux_loss = aux_loss + 0.5 * l_anchor
+            # [Point 6] Fused Teacher Context (AWR + Anchoring)
+            # Optimization: We consolidate two context swaps into one to reduce PCIe overhead.
+        
+        # [FUSED TEACHER BLOCK]
+        # [FUSED TEACHER BLOCK]
+        # 1. Compute Rewards (Student-only, but needed for AWR)
+        # Inherently detached from graph as it uses raw data
+        rewards = self.awr_calculator.compute_clinical_reward(
+            fut, 
+            batch.get("outcome_label", None),
+            dones=batch.get("is_terminal", None),
+            feature_indices=self.clinical_feat_idx,
+            normalizer=None, 
+            src_mask=batch.get("future_mask", None) 
+        )
 
-            # [v4.1.2 SOTA FIX] Global Prevalence & Mask Parity
-            if torch.distributed.is_initialized():
-                from torch.distributed.nn.functional import all_gather
-                ctx_aux_global = torch.cat(all_gather(ctx_aux), dim=0)
-                targets_global = torch.cat(all_gather(targets.long()), dim=0)
-                mask_global = torch.cat(all_gather(ctx_mask), dim=0)
-                
-                # Global CFM: Balanced scaling based on the entire DDP batch
-                n_sepsis_global = (targets_global > 0).sum().item()
-                cfm_global = GradientThrottler.log_scale_prevalence(targets_global.numel(), n_sepsis_global)
-            else:
-                ctx_aux_global = ctx_aux
-                targets_global = targets
-                mask_global = ctx_mask
-                cfm_global = cfm
-
-            # D. Contrastive Sepsis Clustering (ACL+)
-            # [v4.2 SOTA Pillar 5] Inject Clinical Metadata (Velocity, Static)
+        # 2. Fused Teacher Execution (One Swap)
+        # [CRITICAL] Gradients must be strictly disabled for Teacher Forward Passes
+        with self.ema_teacher_context():
             with torch.no_grad():
-                velocity = (fut[:, 0, :] - past[:, -1, :]) # [B, D_in]
-            
-            # [PHASE 1 FIX] Unthrottle ACL to 30% (was 5%)
-            acl_factor = self.cfg.train.get("acl_throttle_factor", 0.3)
-            global_ctx_throttled = GradientThrottler.throttle(global_ctx, factor=acl_factor)
-            
-            raw_meta = torch.cat([global_ctx_throttled, velocity, static], dim=-1)
-            z_acl = self.acl_projector(raw_meta)
-            
-            # [v4.2.1 SOTA] Global Contrastive Clustering (DDP-Safe)
-            if torch.distributed.is_initialized():
-                from torch.distributed.nn.functional import all_gather
-                z_acl_global = torch.cat(all_gather(z_acl), dim=0)
-                targets_global_acl = torch.cat(all_gather(batch["phase_label"].long()), dim=0)
-                # Note: sepsis_acl handles local vs global internally if we pass gathered tensors
-                acl_loss = self.sepsis_acl(z_acl_global, targets_global_acl) * cfm_global
+                # A. Run Encoder (for AWR)
+                out_teacher = self.model.encoder(
+                    past_norm, 
+                    static_norm, 
+                    imputation_mask=src_mask, 
+                    padding_mask=bool_padding_mask
+                )
+                teacher_global = out_teacher["global_planner"]
+                target_values = self.model.value_head.get_expectile_summary(
+                     self.model.value_head(teacher_global)
+                )
+
+                # B. Run Anchor Head (if applicable)
+                teacher_logits = None
+                if self.cfg.model.use_auxiliary_head and "phase_label" in batch and self.ema is not None and self.current_epoch >= 2:
+                     teacher_aux = self.model.aux_head(ctx_aux, mask=ctx_mask)
+                     teacher_logits = teacher_aux["logits"]
+
+        # 3. Anchor Loss Injection (Gradient Allowed)
+        # Must be OUTSIDE no_grad so 'logits' (Student) gradients flow
+        if teacher_logits is not None:
+             l_anchor = F.binary_cross_entropy_with_logits(logits, torch.sigmoid(teacher_logits))
+             aux_loss = aux_loss + 0.5 * l_anchor
+
+        # 4. AWR Bootstrapping (Target Calculation - No Grad)
+        with torch.no_grad():
+            is_truncated = batch.get("is_truncated", None)
+            bootstrap_value = target_values[:, -1:] if (is_truncated is not None and is_truncated.any()) else None
+
+            # Student Values for SAW (Detached for Target generation)
+            student_values = self.model.value_head.get_expectile_summary(
+                self.model.value_head(global_ctx)
+            ).detach()
+
+            advantages = self.awr_calculator.compute_saw(
+                rewards, 
+                student_values=student_values,
+                teacher_values=target_values,
+                dones=batch.get("is_terminal", None),
+                bootstrap_value=bootstrap_value
+            )
+            returns = (advantages + student_values).detach()
+
+            # AWR Weights
+            f_mask = batch.get("future_mask")
+            if f_mask is not None:
+                if f_mask.dim() == 3: f_mask = f_mask.any(dim=-1)
+                f_mask = f_mask.float()
             else:
-                acl_loss = self.sepsis_acl(z_acl, batch["phase_label"]) * cfm_global
+                f_mask = torch.ones_like(advantages, dtype=torch.float32)
+
+            weights_awr, diag = self.awr_calculator.calculate_weights(
+                advantages, values=target_values, rewards=returns, mask=f_mask
+            )
+            
+            # Normalize Weights
+            weights_awr = weights_awr * f_mask
+            weights_awr = weights_awr / (weights_awr.sum() / (f_mask.sum() + 1e-8) + 1e-8)
+            weights_awr_log = {"train/awr_ess": diag["ess"]}
+        
+        # 5. Computed Weighted Diffusion Loss (Gradient Allowed)
+        # raw_diff_loss has gradients. weights_awr is detached.
+        diff_loss = (raw_diff_loss * weights_awr * f_mask).sum() / (f_mask.sum() + 1e-8)
+        self.train_awr_ess.update(weights_awr_log.get("train/awr_ess", 0.0))
+        
+        # 6. Critic Loss (Gradient Allowed)
+        # pred_values (L540) has gradients. returns is detached.
+        critic_loss = self.model.value_loss_fn(pred_values, returns)
+        
+        # Update Explained Variance (No Grad for Metric)
+        with torch.no_grad():
+            self.train_explained_var.update(
+                self.model.value_loss_fn.compute_explained_variance(pred_values, returns)
+            )
+
+        # [v4.1.2 SOTA FIX] Global Prevalence & Mask Parity
+        if torch.distributed.is_initialized():
+            from torch.distributed.nn.functional import all_gather
+            ctx_aux_global = torch.cat(all_gather(ctx_aux), dim=0)
+            targets_global = torch.cat(all_gather(targets.long()), dim=0)
+            mask_global = torch.cat(all_gather(ctx_mask), dim=0)
+            
+            # Global CFM: Balanced scaling based on the entire DDP batch
+            n_sepsis_global = (targets_global > 0).sum().item()
+            cfm_global = GradientThrottler.log_scale_prevalence(targets_global.numel(), n_sepsis_global)
+        else:
+            ctx_aux_global = ctx_aux
+            targets_global = targets
+            mask_global = ctx_mask
+            cfm_global = cfm
+
+        # D. Contrastive Sepsis Clustering (ACL+)
+        # [v4.2 SOTA Pillar 5] Inject Clinical Metadata (Velocity, Static)
+        with torch.no_grad():
+            velocity = (fut[:, 0, :] - past[:, -1, :]) # [B, D_in]
+        
+        # [PHASE 1 FIX] Unthrottle ACL to 30% (was 5%)
+        acl_factor = self.cfg.train.get("acl_throttle_factor", 0.3)
+        global_ctx_throttled = GradientThrottler.throttle(global_ctx, factor=acl_factor)
+        
+        raw_meta = torch.cat([global_ctx_throttled, velocity, static], dim=-1)
+        z_acl = self.acl_projector(raw_meta)
+        
+        # [v4.2.1 SOTA] Global Contrastive Clustering (DDP-Safe)
+        if torch.distributed.is_initialized():
+            from torch.distributed.nn.functional import all_gather
+            z_acl_global = torch.cat(all_gather(z_acl), dim=0)
+            targets_global_acl = torch.cat(all_gather(batch["phase_label"].long()), dim=0)
+            # Note: sepsis_acl handles local vs global internally if we pass gathered tensors
+            acl_loss = self.sepsis_acl(z_acl_global, targets_global_acl) * cfm_global
+        else:
+            acl_loss = self.sepsis_acl(z_acl, batch["phase_label"]) * cfm_global
 
 
         # --- 3. [DEPRECATED] SOTA Path: Gradient Scaling Hooks ---
@@ -882,15 +883,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
             x0_approx = (noisy_fut - torch.sqrt(1 - alpha_t) * pred_noise) / torch.sqrt(alpha_t).clamp(min=1e-5)
             
             # [v4.2 SOTA Pillar 4] Adaptive Safety Envelope with Warmup
-            # CRITICAL FIX: Physics Check must be on DENORMALIZED data (mmHg not [-1,1])
-            normalizer = self.trainer.datamodule.normalizer
+            # [PHASE 1 FIX] Restore x0_approx visibility for Physics Checks
+            normalizer = self.model.normalizer
             
             # 1. Denormalize Student Trajectory for Physics Checks
-            # student_traj is [B, T, C] in normalized space
-            student_traj_denorm = normalizer.denormalize(student_traj)
+            student_traj_denorm = normalizer.denormalize(x0_approx)
             
             # 2. Physics Loss (MSE) usually expects normalized space for gradient stability
-            l_phys = self.model.phys_loss(student_traj) 
+            l_phys = self.model.phys_loss(x0_approx) 
             
             # 3. Safety Envelope (Bio-Constraints) expect PHYSICAL units (mmHg)
             # This was the cause of massive loss explosions (checking 0.5 vs 65.0)
@@ -990,7 +990,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 "tcb_loss": l_tcb,
                 "awr_ess": diag["ess"],
                 "explained_var": ev,
-                "ood_score": out.get("aux_uncertainty", torch.tensor(0.0, device=self.device)),
+                "ood_score": uncertainty.mean(), # [FIX] Map to local variable
                 "curr_phys_weight": torch.as_tensor(curr_phys_weight, device=self.device).detach().clone(),
                 "w_aux": torch.as_tensor(task_weights[2], device=self.device).detach().clone(),
                 "lr": torch.as_tensor(self.optimizers().param_groups[0]["lr"], device=self.device).detach().clone()
