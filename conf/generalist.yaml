@@ -30,6 +30,7 @@ model:
   encoder_layers: 4
   ffn_dim_ratio: 4
   dropout: 0.12   # 0.25     # [NERYVA-ALPHA] High generalization threshold from Trial 20
+  stochastic_depth_prob: 0.1  # [SOTA] Deep Stochasticity for training 8+ layers
   use_rope: true
   use_swiglu: true
   use_flash_attn: true
