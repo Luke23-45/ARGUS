@@ -83,7 +83,7 @@ from icu.utils.metrics_advanced import (
 )
 from icu.utils.safety import OODGuardian
 from icu.utils.stability import ForensicStabilityAuditor
-from icu.models.components.loss_scaler import UncertaintyLossScaler
+from icu.models.components.loss_scaler import BayesianProjectedScaler
 
 # [PHASE 1-3] Agentic Evolution Components
 from icu.models.components.risk_scorer import PhysiologicalRiskScorer
@@ -235,8 +235,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Attaching to self instead of self.model to ensure safe device movement
             # and registration within the LightningModule, avoiding torch.compile issues.
             # [v4.0 FIX] Initialized with 6 tasks: [diffusion, critic, aux, acl, bgsl, tcb]
-            self.loss_scaler = UncertaintyLossScaler(num_tasks=6)
-            logger.info("Using Model's UncertaintyLossScaler for balancing (6 tasks).")
+            self.loss_scaler = BayesianProjectedScaler(num_tasks=6)
+            logger.info("Using Model's BayesianProjectedScaler for balancing (6 tasks).")
         
         # Authority check: EMACallback will attach here as self.ema
         self.ema = None 
@@ -405,7 +405,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
         self.register_buffer("_awr_stats_initialized", torch.tensor(False))
         self.validation_step_outputs = []
         
-        # [v4.2.1 SOTA] Dynamic Warmup Buffers
+        # [Point 5] Bayesian Moving Average Calibration
+        # Initialized to 0.5; will be updated via F2-opt during validation.
+        self.register_buffer("calibrated_threshold", torch.tensor(0.5))
+        self.threshold_ema_decay = 0.9 # Stable calibration over epochs
+        
         self.register_buffer("curr_tau", torch.tensor(0.5))
         self.register_buffer("curr_sigma_scale", torch.tensor(3.50))
 
@@ -641,7 +645,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
             throttle_factor = self.cfg.train.get("aux_throttle_factor", 1.0)
             ctx_aux = GradientThrottler.throttle(ctx_aux, factor=throttle_factor)
 
-            logits, _ = self.model.aux_head(ctx_aux, mask=ctx_mask)
+            aux_out = self.model.aux_head(ctx_aux, mask=ctx_mask)
+            logits = aux_out["logits"]
+            aux_loss_base = aux_out["loss"]
+            uncertainty = aux_out["uncertainty"]
             
             # [FIX 3] Integrate DynamicClassBalancer for imbalanced sepsis data
             targets = batch["phase_label"] # [B]
@@ -672,11 +679,26 @@ class ICUGeneralistWrapper(pl.LightningModule):
             targets_one_hot = F.one_hot(targets.long(), num_classes=logits.shape[-1]).float()
 
             # Sepsis Classification Loss (Window-Level)
-            # Note: No explicit spatial masking needed here as SequenceAuxHead 
-            # internally handles padding via Attention masks during pooling.
-            # [AUDIT FIX] Removed 'risk_coef' scaling from inner loss if redundant
-            raw_aux_loss = self.risk_aware_loss(logits, targets_one_hot, risk_coef, class_weights=class_weights)
-            aux_loss = raw_aux_loss * cfm * mining_weight.mean()
+            # Use the loss returned by SequenceAuxHead if available (which includes Asymmetric logic)
+            # and fallback to risk_aware_loss only if needed.
+            if aux_loss_base is not None:
+                aux_loss = aux_loss_base * cfm * mining_weight.mean()
+            else:
+                raw_aux_loss = self.risk_aware_loss(logits, targets_one_hot, risk_coef, class_weights=class_weights)
+                aux_loss = raw_aux_loss * cfm * mining_weight.mean()
+
+            # [Point 6] Self-Supervised Clinical Priority (Teacher Anchoring)
+            # Rationale: Prevents Student 'forgetting' during high-noise diffusion phases.
+            if self.ema is not None and self.current_epoch >= 2:
+                with self.ema_teacher_context():
+                    with torch.no_grad():
+                        teacher_aux = self.model.aux_head(ctx_aux, mask=ctx_mask)
+                        teacher_logits = teacher_aux["logits"]
+                
+                # Soft Anchor Loss (SOTA Distillation)
+                # Helps the student maintain the same risk manifold as the stable teacher
+                l_anchor = F.binary_cross_entropy_with_logits(logits, torch.sigmoid(teacher_logits))
+                aux_loss = aux_loss + 0.5 * l_anchor
 
             # [v4.1.2 SOTA FIX] Global Prevalence & Mask Parity
             if torch.distributed.is_initialized():
@@ -755,7 +777,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
             
             # [v5.2] Manifold Sync: Use the SOTA SequenceAuxHead for BGSL supervision
             # We call the aux_head with return_sequence=True to get [B, T, C]
-            logits_seq, _ = self.model.aux_head(ctx_expert, return_sequence=True)
+            aux_seq_out = self.model.aux_head(ctx_expert, return_sequence=True)
+            logits_seq = aux_seq_out["logits"]
             
             if logits_seq.shape[-1] > 1:
                 # [SOTA Alignment] Convert multi-class logits to a single "Sepsis Risk" logit
@@ -793,6 +816,19 @@ class ICUGeneralistWrapper(pl.LightningModule):
             )
             l_tcb = tcb_out["loss"]
 
+            # [Point 2] Adaptive Gradient Dynamics (Fan 2025)
+            # Rebalance Diffusion vs Sepsis to ensure clinical priority.
+            # Rationale: D=0.250 while A=0.006. We need to normalize their 'pull'.
+            with torch.no_grad():
+                # We use a moving average ratio to prevent gradient jitter
+                # If d_loss is 40x a_loss, we want alpha ~ 0.025
+                d_ema = self.loss_scaler.loss_emas[0] # diffusion is key 0
+                a_ema = self.loss_scaler.loss_emas[2] # aux is key 2
+                
+                # Adaptive Factor: Scales D down to A's regime
+                alpha = (a_ema / (d_ema + 1e-8)).clamp(0.001, 1.0)
+                
+            loss_dict['diffusion'] = diff_loss * alpha
             loss_dict['bgsl'] = l_bgsl
             loss_dict['tcb'] = l_tcb
 
@@ -900,6 +936,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 
             opt.step()
             opt.zero_grad()
+            
+            # [Point 1] Bayesian-PGD Parameter Projection
+            # Restores differentiability after optimizer step
+            if hasattr(self.loss_scaler, 'project_parameters'):
+                self.loss_scaler.project_parameters()
             sch = self.lr_schedulers()
             if sch is not None:
                 sch.step()
@@ -949,6 +990,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 "tcb_loss": l_tcb,
                 "awr_ess": diag["ess"],
                 "explained_var": ev,
+                "ood_score": out.get("aux_uncertainty", torch.tensor(0.0, device=self.device)),
                 "curr_phys_weight": torch.as_tensor(curr_phys_weight, device=self.device).detach().clone(),
                 "w_aux": torch.as_tensor(task_weights[2], device=self.device).detach().clone(),
                 "lr": torch.as_tensor(self.optimizers().param_groups[0]["lr"], device=self.device).detach().clone()
@@ -1196,9 +1238,20 @@ class ICUGeneralistWrapper(pl.LightningModule):
         if all_probs.numel() > 0:
             thresholds = torch.linspace(0.01, 0.99, 50)
             best_f2 = -1.0
+            
+            # [SOTA FIX] Handle multi-class probabilities for binary-style F2 calibration
+            # We treat class 1 and 2 as "Sepsis" (Positive)
+            if all_probs.dim() == 2 and all_probs.shape[1] >= 2:
+                # Sum probabilities of Pre-Shock (1) and Shock (2)
+                pos_probs = all_probs[:, 1:].sum(dim=1).clamp(0, 1)
+                pos_labels = (all_labels > 0).long()
+            else:
+                pos_probs = all_probs.view(-1)
+                pos_labels = all_labels.view(-1).long()
+
             for t in thresholds:
-                preds = (all_probs >= t).long()
-                all_l = all_labels.long()
+                preds = (pos_probs >= t).long()
+                all_l = pos_labels
                 tp = ((preds == 1) & (all_l == 1)).sum().item()
                 fp = ((preds == 1) & (all_l == 0)).sum().item()
                 fn = ((preds == 0) & (all_l == 1)).sum().item()
@@ -1209,16 +1262,26 @@ class ICUGeneralistWrapper(pl.LightningModule):
                     best_f2 = f2; opt_thresh = t.item()
             opt_f2 = best_f2
 
-        # [v12.5.1 SOTA] Synchronize Optimal Threshold across all GPUs
+        # [Point 5] Bayesian Moving Average Calibration
+        # Stabilizes the threshold across epochs and world GPUs
         if torch.distributed.is_initialized():
             threshold_tensor = torch.tensor([opt_thresh], device=self.device)
             torch.distributed.all_reduce(threshold_tensor, op=torch.distributed.ReduceOp.SUM)
             opt_thresh = (threshold_tensor / torch.distributed.get_world_size()).item()
             
-        # Log calibrated Metrics
-        self.val_precision.threshold = opt_thresh
-        self.val_recall.threshold = opt_thresh
-        self.val_f1.threshold = opt_thresh
+        # Apply EMA to the threshold
+        new_thresh = opt_thresh
+        prev_thresh = self.calibrated_threshold.item()
+        updated_thresh = (self.threshold_ema_decay * prev_thresh) + ((1 - self.threshold_ema_decay) * new_thresh)
+        self.calibrated_threshold.fill_(updated_thresh)
+        
+        # Use the CALIBRATED (EMA) threshold for metrics
+        final_thresh = self.calibrated_threshold.item()
+            
+        # Log calibrated Metrics using the Bayesian-stabilized threshold
+        self.val_precision.threshold = final_thresh
+        self.val_recall.threshold = final_thresh
+        self.val_f1.threshold = final_thresh
             
         self.log_dict({
             "val/mse_global": self.val_mse_global.compute(),
@@ -1231,7 +1294,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
             "val/sepsis_recall": self.val_recall.compute(),
             "val/sepsis_f1": self.val_f1.compute(),
             "val/clinical_f2_opt": opt_f2,
-            "val/clinical_threshold_opt": opt_thresh,
+            "val/clinical_threshold_opt": final_thresh,
+            "val/raw_threshold_epoch": opt_thresh,
             "val/ece": self.val_ece.compute(),
             "val/oe": self.val_oe.compute(),
             "val/explained_var": self.val_explained_var.compute(),
@@ -1491,7 +1555,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # 1. Configure Robust AdamW (Fused + Parameter Hygiene)
         if self.balancing_mode == "sota_2025":
             # [SOTA 2025] Parameter Groups
-            uw_lr = self.cfg.train.get("uw_lr", 0.025)
+            # [Point 1 FIX] Cooled Scaler LR (0.025 -> 0.005)
+            # Prevents 'Gaming' and 'Administrative Amnesia'
+            uw_lr = self.cfg.train.get("uw_lr", 0.005)
             # Use 5x lr for critic ONLY if we can isolate it. 
             # In ICUUnifiedPlanner, models are combined. 
             # We'll stick to a unified model LR but keep expert_state_head and loss_scaler separate.

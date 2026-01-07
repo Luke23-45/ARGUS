@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 class AsymmetricLoss(nn.Module):
     """
@@ -64,6 +64,23 @@ class SwiGLU(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear_act(x) * self.silu(self.linear_gate(x))
+
+class DropPath(nn.Module):
+    """
+    [v10.0] Stochastic Depth (DropPath) regularization.
+    """
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        return x.div(keep_prob) * random_tensor
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, d_model: int, max_seq_len: int = 5000):
@@ -137,33 +154,28 @@ class SotaTransformerBlock(nn.Module):
     """
     [2025 SOTA] Pre-RMSNorm + RoPE + SwiGLU Block.
     """
-    def __init__(self, d_model: int, n_heads: int):
+    def __init__(self, d_model: int, n_heads: int, drop_path_prob: float = 0.1):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
         self.attn = RoPEMultiheadAttention(d_model, n_heads)
         self.norm2 = RMSNorm(d_model)
-        self.ffn = SwiGLU(d_model, d_model) # FFN usually projects up?
-        # Standard Transformer FFN: d -> 4d -> d
-        # SwiGLU handles internal projection.
-        # Let's verify standard SwiGLU FFN: 
-        # Usually: Gate(d->4d), Val(d->4d) -> Output(4d->d)
-        # My SwiGLU(d, d) above is simple. Let's make a proper FFN wrapper.
         self.ffn_net = nn.Sequential(
-            SwiGLU(d_model, d_model * 4), # Expands to 4x
-            nn.Linear(d_model * 4, d_model) # Projects back
+            SwiGLU(d_model, d_model * 4), 
+            nn.Linear(d_model * 4, d_model)
         )
         self.dropout = nn.Dropout(0.1)
+        self.drop_path = DropPath(drop_path_prob) if drop_path_prob > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # 1. Pre-Norm Attention
         x_norm = self.norm1(x)
         attn_out, _ = self.attn(x_norm, x_norm, x_norm, key_padding_mask=mask)
-        x = x + self.dropout(attn_out)
+        x = x + self.drop_path(self.dropout(attn_out))
         
         # 2. Pre-Norm FFN (SwiGLU)
         x_norm = self.norm2(x)
         ffn_out = self.ffn_net(x_norm)
-        x = x + self.dropout(ffn_out)
+        x = x + self.drop_path(self.dropout(ffn_out))
         
         return x
 
@@ -172,14 +184,14 @@ class SequenceAuxHead(nn.Module):
     [Step 4] Sequence-Aware Classification Head - SOTA Version.
     Features: CLS Token, RoPE Attention, SwiGLU FFN, RMSNorm, Asymmetric Loss.
     """
-    def __init__(self, d_model: int, num_classes: int = 1, num_layers: int = 2, n_heads: int = 4):
+    def __init__(self, d_model: int, num_classes: int = 1, num_layers: int = 2, n_heads: int = 4, drop_path_prob: float = 0.1):
         super().__init__()
         self.d_model = d_model
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         
         # SOTA Stack
         self.blocks = nn.ModuleList([
-            SotaTransformerBlock(d_model, n_heads) for _ in range(num_layers)
+            SotaTransformerBlock(d_model, n_heads, drop_path_prob=drop_path_prob) for _ in range(num_layers)
         ])
         
         # Final Projection
@@ -192,7 +204,12 @@ class SequenceAuxHead(nn.Module):
         
         self.criterion = AsymmetricLoss(gamma_neg=4, gamma_pos=1)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, targets: Optional[torch.Tensor] = None, return_sequence: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, targets: Optional[torch.Tensor] = None, return_sequence: bool = False) -> Dict[str, torch.Tensor]:
+        """
+        [SOTA 2025] Evidential Forward Pass.
+        Returns:
+            Dict containing 'logits', 'alpha' (Dirichlet), 'uncertainty', and 'loss' (if targets)
+        """
         B = x.shape[0]
         # 1. Prepend CLS
         cls_tokens = self.cls_token.expand(B, -1, -1)
@@ -211,31 +228,40 @@ class SequenceAuxHead(nn.Module):
         
         # 4. Predict
         if return_sequence:
-            # Return per-step predictions for the original sequence [B, T, C]
-            # Skip the CLS token at index 0
             seq_out = x_seq[:, 1:, :] 
             logits = self.head(seq_out)
         else:
-            # Standard CLS-based window prediction [B, C]
             cls_out = x_seq[:, 0, :]
             logits = self.head(cls_out)
+        
+        # 5. [SOTA 2025] Evidential Deep Learning (EDL)
+        # alpha = evidence + 1. We use Softplus for evidence to ensure non-negativity.
+        evidence = F.softplus(logits)
+        alpha = evidence + 1
+        S = torch.sum(alpha, dim=-1, keepdim=True)
+        # Vacuous Uncertainty: Lower means the model is more confident in the distribution
+        uncertainty = logits.shape[-1] / S 
         
         # 6. Loss
         loss = None
         if targets is not None and not return_sequence:
             num_classes = logits.shape[-1]
             if num_classes > 1:
-                # Multi-Class: Expect Long indices, convert to One-Hot
-                if targets.ndim == 1 and (targets.dtype == torch.long or targets.dtype == torch.int):
-                    targets = F.one_hot(targets, num_classes=num_classes).float()
-                elif targets.ndim == 1:
-                     # Float but flat? Unsafe. Assume indices if >1 class.
-                     targets = F.one_hot(targets.long(), num_classes=num_classes).float()
-            else:
-                # Binary: [B] -> [B, 1]
+                # [SOTA FIX] Multi-Class One-Hot Conversion
                 if targets.ndim == 1:
-                    targets = targets.float().unsqueeze(-1)
+                    targets_oh = F.one_hot(targets.long(), num_classes=num_classes).float()
+                else:
+                    targets_oh = targets.float()
+            else:
+                targets_oh = targets.float().unsqueeze(-1) if targets.ndim == 1 else targets.float()
                     
-            loss = self.criterion(logits, targets)
+            # Use standard Asymmetric Loss on logits for now (discriminative performance)
+            # but keep alpha/uncertainty for OOD detection.
+            loss = self.criterion(logits, targets_oh)
             
-        return logits, loss
+        return {
+            "logits": logits,
+            "alpha": alpha,
+            "uncertainty": uncertainty,
+            "loss": loss
+        }

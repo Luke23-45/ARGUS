@@ -94,39 +94,12 @@ run.bat
 apex_moar_v20.db
 audit_physics_v20.json
 
-suggetion.md
 
 
-# sepsis_clinical_28/train_index.json
-# sepsis_clinical_28/val_index.json
-report_logs.md
+tests/
 
 
 
-log_report.md
-working
 
-report_v4_blueprint.md
-report_suggestions.md
-suggestions.md
-patches.md
-log.md
 
-working_23
-verify_fix.py
-error.md
-logs.md
-logs1.md
-# sepsis_clinical_28_raw
-# logs2.md
-iop
-intro_video_project
 
-recursion__.txt
-verify_metadata_schema.py
-tests/verify_normalizer_fix.py
-analysis_report.md
-patches_snippit.md
-logs2.md
-suggestion.md
-.gitignore

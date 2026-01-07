@@ -20,6 +20,23 @@ class SwiGLU(nn.Module):
         gate_path = self.linear_gate(x)
         return act_path * self.silu(gate_path)
 
+class DropPath(nn.Module):
+    """
+    [v10.0] Stochastic Depth (DropPath) regularization.
+    """
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        return x.div(keep_prob) * random_tensor
+
 class GatedResidualNetwork(nn.Module):
     """
     [TFT-Style] Gated Residual Network (GRN) with SwiGLU.
@@ -199,17 +216,18 @@ class NTHEncoderBlock(nn.Module):
     1. Processing: Gated Residual Network (SwiGLU) for feature extraction.
     2. Mixing: NTH Attention (Local + Global, RoPE) for temporal mixing.
     """
-    def __init__(self, d_model: int, n_heads: int, hidden_dim: int):
+    def __init__(self, d_model: int, n_heads: int, hidden_dim: int, drop_path_prob: float = 0.1):
         super().__init__()
         self.grn = GatedResidualNetwork(d_model, hidden_dim)
         self.attn = NTHAttention(d_model, n_heads)
+        self.drop_path = DropPath(drop_path_prob) if drop_path_prob > 0 else nn.Identity()
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # 1. Feature Processing (Time-distributed)
-        x = self.grn(x)
+        # 1. Feature Processing (Residual handled inside GRN, but we add DropPath for layer-level)
+        x = x + self.drop_path(self.grn(x) - x)
         
         # 2. Temporal Mixing
-        x = self.attn(x, mask=mask)
+        x = x + self.drop_path(self.attn(x, mask=mask) - x)
         
         return x

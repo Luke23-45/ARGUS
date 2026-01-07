@@ -513,7 +513,12 @@ class TemporalFusionEncoder(nn.Module):
         
         # Encoder Layers (NTH Architecture)
         self.layers = nn.ModuleList([
-            NTHEncoderBlock(cfg.d_model, cfg.n_heads, hidden_dim=cfg.d_model * 2) 
+            NTHEncoderBlock(
+                cfg.d_model, 
+                cfg.n_heads, 
+                hidden_dim=cfg.d_model * 2,
+                drop_path_prob=cfg.stochastic_depth_prob
+            ) 
             for _ in range(cfg.encoder_layers)
         ])
         
@@ -1064,7 +1069,8 @@ class ICUUnifiedPlanner(nn.Module):
                 # If num_phases=3 (Stable/Pre/Shock), it's multi-class.
                 # NTH SequenceAuxHead output shape is [B, num_classes].
                 num_layers=2,
-                n_heads=4
+                n_heads=4,
+                drop_path_prob=cfg.stochastic_depth_prob
             )
             
             
@@ -1229,18 +1235,19 @@ class ICUUnifiedPlanner(nn.Module):
                 # Targets: phase_label [B]
                 
                 # Note: SequenceAuxHead returns (logits, loss).
-                logits, sota_aux_loss = self.aux_head(
+                # [SOTA 2025] Evidential aux_head returns a Dict
+                aux_out = self.aux_head(
                     out_alb["ctx_expert"], 
                     mask=ctx_mask, 
                     targets=batch["phase_label"].long() if batch["phase_label"] is not None else None
                 )
+                logits = aux_out["logits"]
+                aux_loss = aux_out["loss"]
+                uncertainty = aux_out["uncertainty"]
                 
-                # If sota_aux_loss is returned, use it directly (includes Asymmetric Logic)
-                if sota_aux_loss is not None:
-                    aux_loss = sota_aux_loss 
-                else:
-                    # Fallback (shouldn't happen if targets provided)
-                    aux_loss = F.cross_entropy(logits, batch["phase_label"].long(), reduction='none')
+                if aux_loss is None:
+                    # Fallback for inference or missing targets
+                    aux_loss = torch.tensor(0.0, device=past.device)
             else:
                 aux_loss = torch.zeros(B, device=past.device)
         else:
@@ -1249,15 +1256,18 @@ class ICUUnifiedPlanner(nn.Module):
             weighted_diff = diff_sq * self.importance_weights.view(1, 1, -1)
             diff_loss = weighted_diff.mean()
             if self.cfg.use_auxiliary_head and "phase_label" in batch:
-                # Scaler handles reduction usually, but here we return scalar
-                logits, sota_aux_loss = self.aux_head(
+                aux_out = self.aux_head(
                     out_alb["ctx_expert"], 
                     mask=ctx_mask, 
                     targets=batch["phase_label"].long()
                 )
-                aux_loss = sota_aux_loss
+                logits = aux_out["logits"]
+                aux_loss = aux_out["loss"]
+                uncertainty = aux_out["uncertainty"]
             else:
+                logits = None
                 aux_loss = torch.tensor(0.0, device=past.device)
+                uncertainty = torch.tensor(0.0, device=past.device)
             
         # [v4.1 SOTA] Implicit Distributional Critic Pass
         # pred_val shape: [B, T_pred, N_quantiles]
@@ -1302,7 +1312,8 @@ class ICUUnifiedPlanner(nn.Module):
             "loss": total,
             "diffusion_loss": diff_loss,
             "aux_loss": aux_loss,
-            "aux_logits": aux_logits,
+            "aux_logits": logits,
+            "aux_uncertainty": uncertainty,
             "value_loss": value_loss,
             "pred_value": pred_val
         }

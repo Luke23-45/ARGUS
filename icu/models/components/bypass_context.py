@@ -125,10 +125,31 @@ class VolatilityAwareGate(nn.Module):
         g = self.sigmoid(semantic_gate + (delta * self.volatility_gate))
         return g
 
+class TCNBlock(nn.Module):
+    """[SOTA 2025] Temporal Convolutional Network for High-Frequency Vitals."""
+    def __init__(self, in_dim: int, out_dim: int, kernel_size: int = 3, dilation: int = 1):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation
+        self.conv = nn.utils.weight_norm(nn.Conv1d(
+            in_dim, out_dim, kernel_size, 
+            padding=padding, dilation=dilation
+        ))
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.1)
+        self.res = nn.Conv1d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, T]
+        out = self.conv(x)
+        # causal clipping
+        out = out[:, :, :-self.conv.padding[0]] if self.conv.padding[0] > 0 else out
+        out = self.relu(out)
+        out = self.dropout(out)
+        return out + self.res(x)
+
 class LateralBypass(nn.Module):
     def __init__(self, input_dim: int, d_model: int, hemo_dim: int = 7, labs_dim: int = 11, elec_dim: int = 4, static_dim: int = 6, dropout: float = 0.1):
         super().__init__()
-        # [v4.2.1 SOTA] Dynamic Groups
         self.hemo_dim = hemo_dim
         self.labs_dim = labs_dim
         self.elec_dim = elec_dim
@@ -138,6 +159,13 @@ class LateralBypass(nn.Module):
         self.labs_proj = nn.Linear(labs_dim, d_model // 4)
         self.elec_proj = nn.Linear(elec_dim, d_model // 4)
         self.other_proj = nn.Linear(static_dim, d_model // 4)
+        
+        # MEET-Sepsis TCN Branch (Endogenous Path)
+        self.tcn = nn.Sequential(
+            TCNBlock(d_model, d_model, kernel_size=3, dilation=1),
+            TCNBlock(d_model, d_model, kernel_size=3, dilation=2),
+            TCNBlock(d_model, d_model, kernel_size=3, dilation=4)
+        )
         
         self.group_gate = SymmetryGate(d_model)
         self.feat_extractor = ClinicalInceptionBlock(d_model, d_model, dropout=dropout)
@@ -180,8 +208,11 @@ class LateralBypass(nn.Module):
         # [SOTA] Gated multi-modal fusion
         z_raw = self.group_gate(z_raw)
         
-        # 2. Multi-Scale extraction [B, D, T] -> [B, T, D]
-        x_bypass_latent = self.feat_extractor(z_raw.transpose(1, 2)).transpose(1, 2)
+        # 2. Multi-Scale & TCN extraction [B, D, T] -> [B, T, D]
+        # Sharp path: Inception (Multi-scale) + TCN (Temporal Volatility)
+        x_inc = self.feat_extractor(z_raw.transpose(1, 2))
+        x_tcn = self.tcn(x_inc)
+        x_bypass_latent = x_tcn.transpose(1, 2)
         x_bypass_latent = self.dropout(x_bypass_latent)
         
         if temporal_mask is not None:
