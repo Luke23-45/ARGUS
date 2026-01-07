@@ -8,7 +8,7 @@ defaults:
 # --- Experiment Metadata ---
 run_name: "gen_v1_${now:%Y-%m-%d_%H-%M-%S}"
 seed: 42
-compile_model: true
+compile_model: false
 save_checkpoints: false
 
 # --- Directory Paths ---
@@ -90,6 +90,7 @@ train:
   awr_max_samples: 20000      # 60000 [STABILITY] Increased for Batch 2048
   
   ema_decay: 0.999
+  ema_update_every: 10        # [SOTA] Staggered updates to fix I/O bottleneck
   monitor: "val/clinical_auroc"
   patience: 10
 

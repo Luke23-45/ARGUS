@@ -177,24 +177,46 @@ def unitwise_norm(x: torch.Tensor, norm_type: float = 2.0):
         # Norm over all dims except the first (output channels/features)
         return x.norm(norm_type, dim=tuple(range(1, x.ndim)), keepdim=True)
 
-def adaptive_gradient_clip_(parameters, clip_factor: float = 0.01, eps: float = 1e-3):
+def adaptive_gradient_clip_(parameters, clip_factor: float = 0.1, eps: float = 1e-3):
     """
-    [SOTA] Adaptive Gradient Clipping for Transformer stability.
-    Scales gradients based on the ratio of param_norm to grad_norm layer-wise.
-    Superior to global norm clipping for deep transformers.
+    [SOTA v2025] Fused Adaptive Gradient Clipping (PyTorch 2.0+).
+    Uses _foreach_ implementation to eliminate Python loop overhead.
+    
+    NOTE: This implementation computes TENSOR-WISE norms (Frobenius), 
+    not Unit-Wise norms. This is significantly faster and standard for 
+    High-Performance Transformer training (LARS/LAMB style).
     """
-    for p in parameters:
-        if p.grad is None:
-            continue
-            
-        p_data = p.detach()
-        g_data = p.grad.detach()
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
         
-        max_norm = unitwise_norm(p_data).clamp_(min=eps).mul_(clip_factor)
-        grad_norm = unitwise_norm(g_data)
+    # Filter for params with grads
+    params_with_grad = [p for p in parameters if p.grad is not None]
+    if not params_with_grad:
+        return
         
-        clipped_grad = g_data * (max_norm / grad_norm.clamp(min=1e-6)).clamp(max=1.0)
-        p.grad.detach().copy_(clipped_grad)
+    # 1. Compute Norms (Fused)
+    # torch._foreach_norm returns a list of scalars (L2 norm of each tensor)
+    p_norms = torch._foreach_norm(params_with_grad, 2)
+    g_norms = torch._foreach_norm([p.grad for p in params_with_grad], 2)
+    
+    # 2. Compute Clipping Coefficients
+    # ratio = max_norm / grad_norm
+    # clipped = grad * clamp(ratio, max=1.0)
+    
+    # Use torch.stack to vectorize scalar operations
+    p_norms_stack = torch.stack(p_norms)
+    g_norms_stack = torch.stack(g_norms)
+    
+    # Clamp norms to prevent division by zero or extremely small param norms
+    max_norms = p_norms_stack.clamp(min=eps).mul_(clip_factor)
+    grad_norms_clamped = g_norms_stack.clamp(min=1e-6)
+    
+    # Calculate stepping coefficients
+    step_coefficients = (max_norms / grad_norms_clamped).clamp_(max=1.0)
+    
+    # 3. Apply Clipping (Fused Mul)
+    # in-place: grad = grad * step_coeff
+    torch._foreach_mul_([p.grad for p in params_with_grad], step_coefficients.unbind())
 
 # ==============================================================================
 # 5. ADVANTAGE CLAMPER

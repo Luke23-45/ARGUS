@@ -929,7 +929,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                     torch.nn.utils.clip_grad_norm_(self.loss_scaler.parameters(), 0.1)
                 
                 # 2. Main Parameters: Use Adaptive Clipping
-                adaptive_gradient_clip_(self.parameters(), clip_factor=0.01)
+                adaptive_gradient_clip_(self.parameters(), clip_factor=0.1)
                 
                 # 3. Safety Fallback: Global Norm Clip (incase AGC misses outliers)
                 torch.nn.utils.clip_grad_norm_(self.parameters(), self.cfg.train.grad_clip)
