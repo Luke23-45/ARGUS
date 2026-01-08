@@ -509,10 +509,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # 1. Diffusion uses ONLY Planner (Smooth) -> Reconstructs Vitals
         # 2. Aux Head uses ONLY Expert (Sharp) -> Detects Sepsis
         #
-        # PREVIOUSLY: global_ctx = (global_ctx_planner + global_ctx_expert) * 0.5
-        # This caused "Negative Transfer" where massive diffusion gradients 
-        # overwrote the delicate expert features, causing AUC to plateau at 0.74.
-        global_ctx = global_ctx_planner
+        # [v12.2 SOTA] Hybrid Divorce Protocol
+        # Diffusion (Planner) stays Decoupled to prevent reconstruction gradients 
+        # from "compensating" by distorting Expert signal.
+        # Critic/ACL/Teacher see Unified Context to restore Selective Pressure.
+        global_ctx_unified = (global_ctx_planner + global_ctx_expert).mul(0.5)
+        global_ctx = global_ctx_planner 
         
         ctx_expert = out_alb["ctx_expert"]
         ctx_mask = out_alb["ctx_mask"]
@@ -537,7 +539,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # Replaced scalar MSE with Distributional Implicit Q-Learning (IQL-QR)
         # We compute predictions here (Student Pass), but loss is deferred until
         # after the Fused Teacher Block provides the 'returns' (targets).
-        pred_values = self.model.value_head(global_ctx)
+        # C. Critic Task (SOTA IDC-25)
+        # [v12.2 SOTA] Use UNIFIED context for value prediction (Clinical Awareness)
+        pred_values = self.model.value_head(global_ctx_unified)
         
         # D. Task-Specific Component Computation (Initialization)
         aux_loss = torch.tensor(0.0, device=self.device)
@@ -633,9 +637,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
                     imputation_mask=src_mask, 
                     padding_mask=bool_padding_mask
                 )
+                # [v12.2 SOTA] Unified Context for Teacher Bootstrapping
                 teacher_global = out_teacher["global_planner"]
+                teacher_global_unified = (out_teacher["global_planner"] + out_teacher["global_expert"]).mul(0.5)
+                # [PATCH 5] Pass curr_tau to enable pessimistic bootstrapping
+                # Original: tau ramps from 0.5 to 0.7 at E5 but was never passed
+                # Evidence: get_expectile_summary uses tau=0.5 default
+                # Fix: Pass curr_tau.item() for proper pessimistic value estimation
                 target_values = self.model.value_head.get_expectile_summary(
-                     self.model.value_head(teacher_global)
+                     self.model.value_head(teacher_global_unified),
+                     tau=self.curr_tau.item()
                 )
 
                 # B. Run Anchor Head (if applicable)
@@ -656,8 +667,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
             bootstrap_value = target_values[:, -1:] if (is_truncated is not None and is_truncated.any()) else None
 
             # Student Values for SAW (Detached for Target generation)
+            # [v12.2 SOTA] Unified Context for SAW
+            # [PATCH 5 cont.] Also pass tau for student-teacher consistency
             student_values = self.model.value_head.get_expectile_summary(
-                self.model.value_head(global_ctx)
+                self.model.value_head(global_ctx_unified),
+                tau=self.curr_tau.item()
             ).detach()
 
             advantages = self.awr_calculator.compute_saw(
@@ -723,8 +737,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
             velocity = (fut[:, 0, :] - past[:, -1, :]) # [B, D_in]
         
         # [PHASE 1 FIX] Unthrottle ACL to 30% (was 5%)
+        # [v12.2 SOTA] Unified Context for Contrastive Clustering
         acl_factor = self.cfg.train.get("acl_throttle_factor", 0.3)
-        global_ctx_throttled = GradientThrottler.throttle(global_ctx, factor=acl_factor)
+        global_ctx_throttled = GradientThrottler.throttle(global_ctx_unified, factor=acl_factor)
         
         raw_meta = torch.cat([global_ctx_throttled, velocity, static], dim=-1)
         z_acl = self.acl_projector(raw_meta)
@@ -765,7 +780,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # (which correctly handles f_mask division from L613).
             loss_dict = {
                 'diffusion': diff_loss,       # [v5.2] Scale Restored: 1.0 (Mask-Safe)
-                'critic': critic_loss,        # [v5.2] Scale Restored
+                # [PATCH 2] Critic Pre-Scaling
+                # Original: V ranges 2.4-6.1 while D is ~0.3 (10x mismatch)
+                # Evidence: V dominance caused A to vanish and log_var_critic to go negative
+                # Fix: Pre-scale V to match D's regime (~0.4)
+                'critic': critic_loss * 0.1,
                 'aux': aux_loss,              # Clinical Anchor (0.5)
                 'acl': acl_loss               # (1.5)
             }
@@ -1579,7 +1598,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 if id(p) not in aux_param_ids
             ]
             
-            aux_lr_mult = self.cfg.train.get("aux_lr_multiplier", 3.0)
+            # [PATCH 4] Reduce LR Multiplier
+            # Original: 3.0x LR for aux/acl caused GN spikes to 16.9
+            # Evidence: Combined with fixed weights (1.5x), effective boost was ~4.5x
+            # Fix: Reduce to 1.5x for gentler learning
+            aux_lr_mult = self.cfg.train.get("aux_lr_multiplier", 1.5)
             
             optimizer_params = [
                 # Group 1: Main Backbone (Standard LR)

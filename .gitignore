@@ -94,12 +94,12 @@ run.bat
 apex_moar_v20.db
 audit_physics_v20.json
 
-
+legacy
 
 tests/
 
-
-
+working
+sepsis_clinical_28
 
 
 
@@ -107,6 +107,7 @@ error.md
 # verify_end_to_end_sota_v3.py
 icu/models/wrapper_generalist copy.py
 # patches_snippit_and_plan.md
-timing_report.md
+# timing_report.md
+# patches_snippet.md
+# logs_.md
 patches_snippet.md
-logs_.md

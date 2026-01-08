@@ -840,7 +840,7 @@ class ICUAdvantageCalculator(nn.Module):
                         
                         # [v12.8.2 SOTA FIX] Safe Tensor Assignment
                         new_max_weight_tensor = torch.as_tensor(
-                            new_max_weight, 
+                            target_clip, 
                             device=self.max_weight.device, 
                             dtype=self.max_weight.dtype
                         )

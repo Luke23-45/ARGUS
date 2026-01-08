@@ -163,7 +163,10 @@ class AsymmetricLatentBottleneck(nn.Module):
         
         # 3. Expert Manifold
         # Use full_mask (T+1) for bypass and sync to handle prepended static token
-        ctx_sharp = self.bypass(past_norm, ctx_seq, mask=full_mask)
+        # [v12.2 SOTA] Independent Gradient Divorce
+        # Detach Planner context to prevent "Gradient Compensation"
+        # Expert must learn its own features from raw_past via LateralBypass.
+        ctx_sharp = self.bypass(past_norm, ctx_seq.detach(), mask=full_mask)
         # [v4.5 SOTA FIX] "The Structural Divorce" (Self-Attention)
         # Structural Isolation:
         # We allow the Expert Manifold to self-organize without being forced

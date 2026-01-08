@@ -160,12 +160,10 @@ class LateralBypass(nn.Module):
         self.elec_proj = nn.Linear(elec_dim, d_model // 4)
         self.other_proj = nn.Linear(static_dim, d_model // 4)
         
-        # MEET-Sepsis TCN Branch (Endogenous Path)
-        self.tcn = nn.Sequential(
-            TCNBlock(d_model, d_model, kernel_size=3, dilation=1),
-            TCNBlock(d_model, d_model, kernel_size=3, dilation=2),
-            TCNBlock(d_model, d_model, kernel_size=3, dilation=4)
-        )
+        # [v4.5 OPTIMIZATION] Removed TCN Stack
+        # We rely solely on the ClinicalInceptionBlock for feature extraction.
+        # This restores v6 Legacy performance (4s/it) while keeping the bypass path.
+        self.tcn = nn.Identity()
         
         self.group_gate = SymmetryGate(d_model)
         self.feat_extractor = ClinicalInceptionBlock(d_model, d_model, dropout=dropout)

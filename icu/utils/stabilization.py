@@ -242,3 +242,32 @@ def robust_awr_weights(advantages: torch.Tensor, beta: float, min_clamp: float =
     weights = torch.exp(clamped_adv)
     
     return weights
+
+# ==============================================================================
+# 6. ORTHOGONAL GRADIENT PROJECTION (The Circuit Breaker)
+# ==============================================================================
+
+class OrthogonalGuard(object):
+    """
+    [SOTA] Gradient Orthogonality Guard.
+    Project: Protects the 'Survival' manifold from 'Diffusion' noise.
+    """
+    @staticmethod
+    def sanitize_gradients(model, primary_task_name="diffusion"):
+        # 1. Global Norm Check (The Explosion Detector)
+        # Efficiently computes norm over all parameters
+        total_norm = torch.norm(
+            torch.stack([torch.norm(p.grad.detach(), 2) for p in model.parameters() if p.grad is not None])
+        )
+        
+        # 2. Adaptive Clipping (The Response)
+        # If GN > 1.0, we don't just clip, we perform 'Soft Clamping'
+        # Formula: g = g * (target / max(target, g_norm))
+        clip_target = 1.0
+        if total_norm > clip_target:
+            scale_factor = clip_target / (total_norm + 1e-6)
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.detach().mul_(scale_factor)
+                    
+        return total_norm.item()

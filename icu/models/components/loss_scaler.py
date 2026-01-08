@@ -48,17 +48,30 @@ class BayesianProjectedScaler(nn.Module):
             updated_emas = self.decay * curr_emas + (1 - self.decay) * losses_tensor.detach()
             self.loss_emas[indices] = updated_emas
             
-            # Clinical Priority: Boost tasks whose loss > EMA (Emergency Rescue)
-            priority_score = losses_tensor.detach() / (updated_emas + 1e-8)
-            uw_weights = F.softmax(priority_score, dim=0) * len(losses)
+            # [PATCH 3] Fixed Clinical Priority Weights
+            # Original: Softmax priority creates zero-sum game where one task spike starves others
+            # Evidence: A dropped from 0.043 (E0) to 0.0007 (E8)
+            # Fix: Fixed weights based on clinical importance
+            # Primary tasks (aux, acl): Higher weight for sepsis detection
+            # Secondary tasks (diff, critic): Lower weight for generative quality
+            clinical_weights = torch.tensor(
+                [0.5, 0.5, 1.5, 1.5, 1.0, 1.0],  # [diff, critic, aux, acl, bgsl, tcb]
+                device=losses_tensor.device
+            )
+            uw_weights = clinical_weights[indices]
         
         # 2. Bayesian Weighting (Kendall et al.)
         # NO CLAMPING in forward to preserve gradient flow
         log_vars_active = self.log_vars[indices]
         precision = torch.exp(-log_vars_active)
         
-        # Weighted Loss = 0.5 * precision * (loss * priority) + 0.5 * log_var
-        weighted_losses = 0.5 * (precision * losses_tensor * uw_weights) + 0.5 * log_vars_active
+        # [PATCH 1] Restrained Uncertainty Weighting (RUW)
+        # Liebel & Körner (2018) / Softplus variant
+        # Original: 0.5 * log_var can be negative when log_var < 0
+        # Fix: softplus(x) = ln(1 + exp(x)) > 0 for all x
+        # Guarantees: L_total > 0 for all epochs
+        regularization = F.softplus(log_vars_active)
+        weighted_losses = 0.5 * (precision * losses_tensor * uw_weights) + regularization
         total_loss = weighted_losses.sum()
         
         # Logging
