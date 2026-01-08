@@ -166,7 +166,8 @@ class AsymmetricLatentBottleneck(nn.Module):
         # [v12.2 SOTA] Independent Gradient Divorce
         # Detach Planner context to prevent "Gradient Compensation"
         # Expert must learn its own features from raw_past via LateralBypass.
-        ctx_sharp = self.bypass(past_norm, ctx_seq.detach(), mask=full_mask)
+        # [v13.0 PATCH] Pass imputation_mask to bypass for mask-aware feature weighting
+        ctx_sharp = self.bypass(past_norm, ctx_seq.detach(), mask=full_mask, imputation_mask=imputation_mask)
         # [v4.5 SOTA FIX] "The Structural Divorce" (Self-Attention)
         # Structural Isolation:
         # We allow the Expert Manifold to self-organize without being forced

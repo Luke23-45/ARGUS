@@ -553,6 +553,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
         uncertainty = torch.ones((B, 1), device=self.device) # Vacuous by default
         
         if self.cfg.model.use_auxiliary_head and "phase_label" in batch:
+            # [v13.0 PATCH] Conditional Head Activation
+            # Problem: With 7.2% episode sepsis rate, ~93% of batches may have zero sepsis cases.
+            # Computing aux_loss on these batches adds noise without learning signal.
+            # Fix: Only compute full aux_loss when batch contains sepsis (phase_label > 0)
+            batch_has_sepsis = (batch["phase_label"] > 0).any().item()
+            
             # [SOTA 2025] Asymmetric Throttling: The "Peace Treaty"
             # We restrict sequence context gradient influence to 10%.
             # This allows the Sepsis head to "read" features without "dominating" them.
@@ -566,13 +572,21 @@ class ICUGeneralistWrapper(pl.LightningModule):
             throttle_factor = self.cfg.train.get("aux_throttle_factor", 1.0)
             ctx_aux = GradientThrottler.throttle(ctx_aux, factor=throttle_factor)
 
-            aux_out = self.model.aux_head(ctx_aux, mask=ctx_mask)
+            # [FIX 3] Integrate DynamicClassBalancer for imbalanced sepsis data
+            targets = batch["phase_label"] # [B]
+            
+            # [v14.0 PATCH] Pass targets and epoch for Evidential Loss
+            # This enables internal loss calculation in SequenceAuxHead
+            aux_out = self.model.aux_head(
+                ctx_aux, 
+                mask=ctx_mask, 
+                targets=targets,          # Enable internal loss
+                epoch_num=self.current_epoch # Enable KL annealing
+            )
             logits = aux_out["logits"]
             aux_loss_base = aux_out["loss"]
             uncertainty = aux_out["uncertainty"]
             
-            # [FIX 3] Integrate DynamicClassBalancer for imbalanced sepsis data
-            targets = batch["phase_label"] # [B]
             self.class_balancer.update(targets)
             class_weights = self.class_balancer.get_weights().to(self.device)
             
@@ -586,27 +600,39 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Rely strictly on DynamicClassBalancer.
             cfm = 1.0
             
-            # [SOTA 2025] Dynamic Hard Negative Mining (Mining Weight)
-            # [AUDIT FIX] Cap mining weight to prevent explosion.
-            with torch.no_grad():
-                probs = torch.softmax(logits, dim=-1)
-                # logits/probs: [B, C], targets: [B]
-                true_probs = probs.gather(-1, targets.unsqueeze(-1).long())
-                error = 1.0 - true_probs.squeeze(-1)
-                # Cap max boosting at 1.5x (was 2.0x)
-                mining_weight = 1.0 + (torch.sigmoid(error * 5.0) * 0.5)
-            
-            # One-hot encoding for window-level targets
-            targets_one_hot = F.one_hot(targets.long(), num_classes=logits.shape[-1]).float()
+            # [v13.0 PATCH] Conditional Gradient Flow
+            # Only compute meaningful aux_loss when batch has sepsis signal
+            if batch_has_sepsis:
+                # [SOTA 2025] Dynamic Hard Negative Mining (Mining Weight)
+                # [AUDIT FIX] Cap mining weight to prevent explosion.
+                with torch.no_grad():
+                    probs = torch.softmax(logits, dim=-1)
+                    # logits/probs: [B, C], targets: [B]
+                    true_probs = probs.gather(-1, targets.unsqueeze(-1).long())
+                    error = 1.0 - true_probs.squeeze(-1)
+                    # Cap max boosting at 1.5x (was 2.0x)
+                    mining_weight = 1.0 + (torch.sigmoid(error * 5.0) * 0.5)
+                
+                # One-hot encoding for window-level targets
+                targets_one_hot = F.one_hot(targets.long(), num_classes=logits.shape[-1]).float()
 
-            # Sepsis Classification Loss (Window-Level)
-            # Use the loss returned by SequenceAuxHead if available (which includes Asymmetric logic)
-            # and fallback to risk_aware_loss only if needed.
-            if aux_loss_base is not None:
-                aux_loss = aux_loss_base * cfm * mining_weight.mean()
+                # Sepsis Classification Loss (Window-Level)
+                # Use the loss returned by SequenceAuxHead if available (which includes Asymmetric logic)
+                # and fallback to risk_aware_loss only if needed.
+                if aux_loss_base is not None:
+                    aux_loss = aux_loss_base * cfm * mining_weight.mean()
+                else:
+                    raw_aux_loss = self.risk_aware_loss(logits, targets_one_hot, risk_coef, class_weights=class_weights)
+                    aux_loss = raw_aux_loss * cfm * mining_weight.mean()
             else:
-                raw_aux_loss = self.risk_aware_loss(logits, targets_one_hot, risk_coef, class_weights=class_weights)
-                aux_loss = raw_aux_loss * cfm * mining_weight.mean()
+                # [v13.0 PATCH] Zero-sepsis batch: Train to confidently predict "Stable"
+                # Instead of skipping entirely, use a small penalty for "confirming normality"
+                # This keeps gradients flowing but with reduced weight (0.1x)
+                targets_one_hot = F.one_hot(targets.long(), num_classes=logits.shape[-1]).float()
+                if aux_loss_base is not None:
+                    aux_loss = aux_loss_base * 0.1  # Reduced weight for zero-sepsis batches
+                else:
+                    aux_loss = self.risk_aware_loss(logits, targets_one_hot, risk_coef, class_weights=class_weights) * 0.1
 
             # [Point 6] Self-Supervised Clinical Priority (Teacher Anchoring)
             # Rationale: Prevents Student 'forgetting' during high-noise diffusion phases.

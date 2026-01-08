@@ -9,8 +9,13 @@ class AsymmetricLoss(nn.Module):
     Unlike Focal Loss which just handles down-weighting easy negatives,
     Asymmetric Loss allows us to explicitly PENALIZE False Negatives more than False Positives.
     Crucial for Sepsis: Missing a case (FN) is worse than a false alarm (FP).
+    
+    [v13.0 PATCH] Tuned gamma values based on data analysis:
+    - Data shows 98.24% normal, 1.76% sepsis at timestep level
+    - gamma_neg=6: Aggressively down-weight easy negatives (was 4)
+    - gamma_pos=0: Don't down-weight any positives - they're precious (was 1)
     """
-    def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-8, disable_torch_grad_focal_loss=True):
+    def __init__(self, gamma_neg=6, gamma_pos=0, clip=0.05, eps=1e-8, disable_torch_grad_focal_loss=True):
         super().__init__()
         self.gamma_neg = gamma_neg
         self.gamma_pos = gamma_pos
@@ -52,6 +57,60 @@ class AsymmetricLoss(nn.Module):
         else:
             loss = -(los_pos + los_neg)
             
+        return loss.mean()
+
+class EvidentialLoss(nn.Module):
+    """
+    [SOTA 2025] Evidential Loss (Type II Maximum Likelihood).
+    Minimizes the "Bayes Risk" with respect to the Dirichlet prior.
+    
+    Components:
+    1. Negative Log Likelihood (NLL): Fit the data.
+    2. KL Divergence: Regularize towards uniform distribution (vacuous prior) to prevent overconfidence.
+    """
+    def __init__(self, num_classes: int = 2, annealing_step: int = 10):
+        super().__init__()
+        self.num_classes = num_classes
+        self.annealing_step = annealing_step
+        self.epoch_num = 0
+
+    def forward(self, alpha: torch.Tensor, y: torch.Tensor, epoch_num: int = None) -> torch.Tensor:
+        """
+        alpha: [B, C] Dirichlet concentration parameters (alpha = evidence + 1)
+        y: [B, C] One-hot target labels
+        """
+        if epoch_num is not None:
+            self.epoch_num = epoch_num
+            
+        S = torch.sum(alpha, dim=1, keepdim=True)
+        
+        # 1. Expected Mean Squared Error (Risk)
+        # A = E[p] = alpha / S
+        # Loss = (y - A)^2 + Var(p)
+        A = alpha / S
+        m = alpha / S
+        
+        # Log Likelihood of the Dirichlet (Type 2 ML)
+        # L = sum( y * (log(S) - log(alpha)) )
+        nll = torch.sum(y * (torch.log(S) - torch.log(alpha)), dim=1, keepdim=True)
+        
+        # 2. KL Divergence Regularizer (Penalty for being confident but wrong)
+        # Drives distribution towards uniform Dirichlet [1, 1, ...] when evidence is low/wrong.
+        # annealed_weight = min(1, epoch / 10)
+        annealing_coef = min(1, max(self.epoch_num / self.annealing_step, 0))
+        
+        # KL(Dir(alpha) || Dir([1,1,...]))
+        # Approximate: alpha_tilde = y + (1-y)*alpha
+        alpha_tilde = y + (1 - y) * alpha
+        S_tilde = torch.sum(alpha_tilde, dim=1, keepdim=True)
+        
+        # KL term
+        kl = torch.lgamma(S_tilde) - torch.lgamma(torch.tensor(self.num_classes, device=alpha.device)) \
+             - torch.sum(torch.lgamma(alpha_tilde), dim=1, keepdim=True) \
+             + torch.sum((alpha_tilde - 1) * (torch.digamma(S_tilde) - torch.digamma(torch.tensor(self.num_classes, device=alpha.device))), dim=1, keepdim=True)
+             
+        # Combine
+        loss = nll + annealing_coef * kl
         return loss.mean()
 
 # --- Shared SOTA Components (Duplicated from nth_encoder.py for independence) ---
@@ -202,9 +261,14 @@ class SequenceAuxHead(nn.Module):
             nn.Linear(d_model, num_classes)
         )
         
-        self.criterion = AsymmetricLoss(gamma_neg=4, gamma_pos=1)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, targets: Optional[torch.Tensor] = None, return_sequence: bool = False) -> Dict[str, torch.Tensor]:
+        
+        # [v14.0 PATCH] Replaced AsymmetricLoss with EvidentialLoss
+        # This allows the model to output *uncertainty* alongside probability.
+        # Critical for safety when inputs are 90% imputed.
+        self.criterion = EvidentialLoss(num_classes=num_classes, annealing_step=10)
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, targets: Optional[torch.Tensor] = None, epoch_num: int = None, return_sequence: bool = False) -> Dict[str, torch.Tensor]:
         """
         [SOTA 2025] Evidential Forward Pass.
         Returns:
@@ -255,9 +319,10 @@ class SequenceAuxHead(nn.Module):
             else:
                 targets_oh = targets.float().unsqueeze(-1) if targets.ndim == 1 else targets.float()
                     
-            # Use standard Asymmetric Loss on logits for now (discriminative performance)
-            # but keep alpha/uncertainty for OOD detection.
-            loss = self.criterion(logits, targets_oh)
+            # [v14.0 PATCH] Use Evidential Loss on alphas
+            # We pass 'alpha' (Dirichlet params) instead of 'logits'
+            # Note: The loss needs the current epoch for KL annealing. 
+            loss = self.criterion(alpha, targets_oh, epoch_num=epoch_num)
             
         return {
             "logits": logits,

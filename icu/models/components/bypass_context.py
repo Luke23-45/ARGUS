@@ -155,10 +155,23 @@ class LateralBypass(nn.Module):
         self.elec_dim = elec_dim
         self.static_dim = static_dim
         
-        self.hemo_proj = nn.Linear(hemo_dim, d_model // 4)
-        self.labs_proj = nn.Linear(labs_dim, d_model // 4)
-        self.elec_proj = nn.Linear(elec_dim, d_model // 4)
-        self.other_proj = nn.Linear(static_dim, d_model // 4)
+        # [v13.0 PATCH] Sparsity-Aware Projection Dimensions
+        # Problem: Labs have 90%+ missing rate but got equal capacity as hemodynamics (10% missing)
+        # Fix: Allocate more capacity to reliable dense features, less to sparse imputed features
+        # Data Analysis Results (from data_analysis_report.md):
+        #   - Hemodynamic (HR, SpO2, MAP): ~10-15% missing -> 40% capacity (reliable)
+        #   - Labs (Lactate, WBC, etc.): ~90-98% missing -> 20% capacity (mostly imputed)
+        #   - Electrolytes: ~91-95% missing -> 15% capacity
+        #   - Static/Context: 0-38% missing -> 25% capacity
+        hemo_out_dim = int(d_model * 0.4)  # 40% for dense hemodynamics
+        labs_out_dim = int(d_model * 0.2)  # 20% for sparse labs
+        elec_out_dim = int(d_model * 0.15) # 15% for sparse electrolytes
+        other_out_dim = d_model - hemo_out_dim - labs_out_dim - elec_out_dim  # Remainder (~25%)
+        
+        self.hemo_proj = nn.Linear(hemo_dim, hemo_out_dim)
+        self.labs_proj = nn.Linear(labs_dim, labs_out_dim)
+        self.elec_proj = nn.Linear(elec_dim, elec_out_dim)
+        self.other_proj = nn.Linear(static_dim, other_out_dim)
         
         # [v4.5 OPTIMIZATION] Removed TCN Stack
         # We rely solely on the ClinicalInceptionBlock for feature extraction.
@@ -170,7 +183,16 @@ class LateralBypass(nn.Module):
         self.gate = VolatilityAwareGate(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, raw_past: torch.Tensor, encoder_ctx: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, raw_past: torch.Tensor, encoder_ctx: torch.Tensor, mask: Optional[torch.Tensor] = None, imputation_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        [v13.0 PATCH] Added imputation_mask parameter for mask-aware feature weighting.
+        
+        Args:
+            raw_past: [B, T, 28] - Raw clinical features (may include imputed values)
+            encoder_ctx: [B, T+1, D] - Encoder output (with static token prepended)
+            mask: [B, T+1] - Padding mask (True = pad, False = valid)
+            imputation_mask: [B, T, 28] - Imputation mask (1 = real measured, 0 = imputed)
+        """
         B, T, C = raw_past.shape
         L = encoder_ctx.shape[1]
         
@@ -197,10 +219,31 @@ class LateralBypass(nn.Module):
         idx_labs = self.hemo_dim + self.labs_dim
         idx_elec = self.hemo_dim + self.labs_dim + self.elec_dim
         
-        z_hemo = self.hemo_proj(raw_past[:, :, :idx_hemo])
-        z_labs = self.labs_proj(raw_past[:, :, idx_hemo:idx_labs])
-        z_elec = self.elec_proj(raw_past[:, :, idx_labs:idx_elec])
-        z_other = self.other_proj(raw_past[:, :, idx_elec:])
+        # Extract feature groups
+        hemo_features = raw_past[:, :, :idx_hemo]
+        labs_features = raw_past[:, :, idx_hemo:idx_labs]
+        elec_features = raw_past[:, :, idx_labs:idx_elec]
+        other_features = raw_past[:, :, idx_elec:]
+        
+        # [v13.0 PATCH] Mask-Weighted Feature Attenuation
+        # Problem: Model treats imputed values (Lactate=1.0 default) same as real measurements
+        # Fix: Attenuate imputed features by 50% to reduce their contribution
+        if imputation_mask is not None:
+            hemo_mask = imputation_mask[:, :, :idx_hemo]  # [B, T, 7]
+            labs_mask = imputation_mask[:, :, idx_hemo:idx_labs]  # [B, T, 11]
+            elec_mask = imputation_mask[:, :, idx_labs:idx_elec]  # [B, T, 4]
+            other_mask = imputation_mask[:, :, idx_elec:]  # [B, T, 6]
+            
+            # Attenuation: real values get full weight (1.0), imputed get 0.5
+            hemo_features = hemo_features * (0.5 + 0.5 * hemo_mask)
+            labs_features = labs_features * (0.5 + 0.5 * labs_mask)
+            elec_features = elec_features * (0.5 + 0.5 * elec_mask)
+            other_features = other_features * (0.5 + 0.5 * other_mask)
+        
+        z_hemo = self.hemo_proj(hemo_features)
+        z_labs = self.labs_proj(labs_features)
+        z_elec = self.elec_proj(elec_features)
+        z_other = self.other_proj(other_features)
         z_raw = torch.cat([z_hemo, z_labs, z_elec, z_other], dim=-1)
         
         # [SOTA] Gated multi-modal fusion
