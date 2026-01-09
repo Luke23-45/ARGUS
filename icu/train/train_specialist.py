@@ -73,7 +73,9 @@ def strict_mode_bypass_load(*args, **kwargs):
     kwargs['weights_only'] = False
     return _original_load(*args, **kwargs)
 torch.load = strict_mode_bypass_load
-logger.warning("[SECURITY] PyTorch 2.6+ strict mode disabled for checkpoint loading (Monkey-Patch active).")
+
+
+
 
 # Add project root to path
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -96,7 +98,7 @@ from icu.utils.train_utils import (
 
 # Initialize Script-Level Logger
 logger = logging.getLogger("APEX_Phase2_Specialist")
-
+logger.warning("[SECURITY] PyTorch 2.6+ strict mode disabled for checkpoint loading (Monkey-Patch active).")
 
 # =============================================================================
 # 1. ROBUST CHECKPOINT LOADER

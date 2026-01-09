@@ -98,7 +98,7 @@ legacy
 
 tests/
 
-working
+
 # sepsis_clinical_28
 
 verify_patches.py
@@ -106,13 +106,15 @@ verify_patches.py
 error.md
 # verify_end_to_end_sota_v3.py
 icu/models/wrapper_generalist copy.py
-# patches_snippit_and_plan.md
-# timing_report.md
-# patches_snippet.md
-# logs_.md
+patches_snippit_and_plan.md
+timing_report.md
+patches_snippet.md
+logs_.md
 patches_snippet.md
 logs.md
 suggestion.md
 patch_report.md
 .gitignore
 ui.md
+working
+error_1.md

@@ -100,6 +100,7 @@ from icu.models.components.safety_envelope import PhysiologicalSafetyEnvelope
 from icu.models.components.horizon_scheduler import ClinicalHorizonScheduler
 from icu.models.components.bgsl_loss import BGSLLoss
 from icu.models.components.temporal_buffer import TemporalContrastiveBuffer
+from icu.models.components.ghost_bank import SepsisGhostBank
 
 # Specialized Metric Collection
 from torchmetrics import MeanSquaredError, Accuracy, MeanMetric, AUROC, Precision, Recall, F1Score
@@ -353,6 +354,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
             temperature=cfg.train.get("tcb_temp", 0.07)
         )
         
+        # [v17.3 Hardened] Omega Ghost Protcol: Sepsis Ghost Bank
+        self.ghost_bank = SepsisGhostBank(
+            capacity=cfg.train.get("ghost_capacity", 256),
+            history_len=cfg.model.get("history_len", 24),
+            feature_dim=cfg.model.get("input_dim", 28),
+            latent_dim=cfg.model.get("d_model", 512),
+            similarity_threshold=cfg.train.get("ghost_sim_threshold", 0.98)
+        )
+        
+        
         # [v4.0 PERFECT] Manifold Projections
         # [REMOVED] self.expert_state_head = nn.Linear(cfg.model.d_model, 1)
         
@@ -493,48 +504,73 @@ class ICUGeneralistWrapper(pl.LightningModule):
         opt = self.optimizers()
         B = batch["observed_data"].size(0)
         
-        # --- 1. Forward Pass & Context Generation ---
+        # [v17.3] Omega Summoning: Constant Clinical Pressure
+        # Select 4 ghosts using a rank-agnostic global seed for DDP synchronization.
+        # [SOTA FIX] Avoid Python's hash() which is salted per-process.
+        # Formula: (Epoch * large_prime + Step) ensures deterministic parity across all GPUs.
+        ghost_seed = (self.current_epoch * 12345 + self.global_step) % (2**31)
+        num_ghosts = self.cfg.train.get("num_ghosts", 4)
+        ghost_batch = self.ghost_bank.sample(num_ghosts=num_ghosts, seed=ghost_seed)
+        
+        # Physically concatenate ghosts to the main batch
         past, fut, static = batch["observed_data"], batch["future_data"], batch["static_context"]
         src_mask = batch.get("src_mask", None)
-        past_norm, static_norm = self.model.normalize(past, static)
-        fut_norm, _ = self.model.normalize(fut, None)
+        
+        past_expanded = torch.cat([past, ghost_batch["vitals"]], dim=0)
+        # static expansion: repeat first static context or use zeros
+        ghost_static = torch.zeros(num_ghosts, static.size(1), device=self.device)
+        static_expanded = torch.cat([static, ghost_static], dim=0)
+        
+        # Norms
+        past_norm, static_norm = self.model.normalize(past_expanded, static_expanded)
+        fut_norm, _ = self.model.normalize(fut, None) # fut is not expanded (masked later)
+        
+        # Context Mask expansion
+        if src_mask is not None:
+            src_mask_expanded = torch.cat([src_mask, ghost_batch["masks"]], dim=0)
+        else:
+            src_mask_expanded = None
         
         # [PHASE 1] Dynamic Risk Scoring
         risk_coef = self.risk_scorer(past, self.clinical_feat_idx)
+        # Expand risk_coef for ghosts: high-priority clinical supervision
+        # Handle both 1D and 2D risk_coef for robustness
+        risk_shape = (num_ghosts, *risk_coef.shape[1:])
+        risk_coef_ghost = torch.ones(risk_shape, device=self.device) * 2.0
+        risk_coef_expanded = torch.cat([risk_coef, risk_coef_ghost], dim=0)
         
         # [v25.1 SAFETY FIX] Convert per-feature mask to per-timestep mask
         # src_mask: [B, T, 28] (0=Missing, 1=Valid)
         # padding_mask: [B, T] (True=Pad/Ignore, False=Keep/Attend)
-        if src_mask is not None:
+        if src_mask_expanded is not None:
             # A timestep is PADDED only if ALL features are missing (0)
-            bool_padding_mask = (src_mask.sum(dim=-1) == 0) # [B, T] Result is bool
+            bool_padding_mask = (src_mask_expanded.sum(dim=-1) == 0) # [B+G, T]
         else:
             bool_padding_mask = None
         
-        out_alb = self.model.encoder(
-            past_norm, 
-            static_norm, 
-            imputation_mask=src_mask,      # [v25.2 FIX] Pass 3D mask for Imputation Awareness
-            padding_mask=bool_padding_mask # [v25.2 FIX] Pass 2D mask for Transformer Attention
-        )
+        # Unified Encoder Pass [B+G]
+        # [v17.3] BN Guard: Protect foundation stats from ghost-induced shift
+        with self.frozen_stats():
+            out_alb = self.model.encoder(
+                past_norm, 
+                static_norm, 
+                imputation_mask=src_mask_expanded, 
+                padding_mask=bool_padding_mask
+            )
         ctx_seq = out_alb["ctx_planner"]
         global_ctx_planner = out_alb["global_planner"]
         global_ctx_expert = out_alb["global_expert"]
         
-        # [SOTA 2025 FIX] Strict Manifold Decoupling ("The Divorce")
-        # Optimization Isolation:
-        # 1. Diffusion uses ONLY Planner (Smooth) -> Reconstructs Vitals
-        # 2. Aux Head uses ONLY Expert (Sharp) -> Detects Sepsis
-        #
-        # [v12.2 SOTA] Hybrid Divorce Protocol
-        # Diffusion (Planner) stays Decoupled to prevent reconstruction gradients 
-        # from "compensating" by distorting Expert signal.
-        # Critic/ACL/Teacher see Unified Context to restore Selective Pressure.
+        # [v12.2 SOTA] Unified Context for Selective Pressure
         global_ctx_unified = (global_ctx_planner + global_ctx_expert).mul(0.5)
         global_ctx = global_ctx_planner 
         
         ctx_expert = out_alb["ctx_expert"]
         ctx_mask = out_alb["ctx_mask"]
+        
+        # Define Targets early
+        targets = batch["phase_label"] # [B]
+        targets_expanded = torch.cat([targets, ghost_batch["labels"]], dim=0) # [B+G]
         
         # --- 2. Per-Task Loss Component Computation ---
         
@@ -542,8 +578,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
         t = torch.randint(0, self.model.cfg.timesteps, (B,), device=self.device)
         noisy_fut, noise_eps = self.model.scheduler.add_noise(fut_norm, t)
         
-        # [v4.2 SOTA Pillar 3] Importance Weighted Diffusion Loss
-        pred_noise = self.model.backbone(noisy_fut, t, ctx_seq, global_ctx, ctx_mask)
+        # [v17.3 Surgical Mask] Diffusion only for main batch [0:B]
+        # Prevents "Historical Overfitting" where the model reconstruction logic
+        # drifts towards ghost pathologies.
+        pred_noise = self.model.backbone(noisy_fut, t, ctx_seq[:B], global_ctx[:B], ctx_mask[:B])
         diff_sq = (pred_noise - noise_eps) ** 2
         weighted_diff = diff_sq * self.model.importance_weights.view(1, 1, -1)
         raw_diff_loss = weighted_diff.mean(dim=2) # [B, T]
@@ -558,7 +596,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # after the Fused Teacher Block provides the 'returns' (targets).
         # C. Critic Task (SOTA IDC-25)
         # [v12.2 SOTA] Use UNIFIED context for value prediction (Clinical Awareness)
-        pred_values = self.model.value_head(global_ctx_unified)
+        # [v17.3 Surgical Mask] Critic only for main batch [0:B]
+        # Prevents selection pressure poisoning from historical extremes.
+        pred_values = self.model.value_head(global_ctx_unified[:B])
         
         # D. Task-Specific Component Computation (Initialization)
         aux_loss = torch.tensor(0.0, device=self.device)
@@ -587,7 +627,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             aux_out = self.model.aux_head(
                 ctx_aux, 
                 mask=ctx_mask, 
-                targets=targets,          
+                targets=targets_expanded, # [v17.3 FIX] Use expanded targets for [B+G] context
                 epoch_num=self.current_epoch 
             )
             logits = aux_out["logits"]
@@ -611,7 +651,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # [SOTA 2025] Shape Alignment
             # Classification (Aux Head) is Window-Level [B] via CLS Token
             # Contrastive (ACL) is Sequence-Level [B, T] (handled internally)
-            B, T, _ = ctx_seq.shape
+            B_exp, T_seq, _ = ctx_seq.shape
             cfm = 1.0
             
             # [PMS] MGP: Manifold Gradient Projection Hook
@@ -657,39 +697,45 @@ class ICUGeneralistWrapper(pl.LightningModule):
             if ctx_aux.requires_grad:
                 ctx_aux.register_hook(project_aux_against_fnd_ema)
             
-            # [v13.0 PATCH] Conditional Gradient Flow
-            # Only compute meaningful aux_loss when batch has sepsis signal
-            if batch_has_sepsis:
-                # [SOTA 2025] Dynamic Hard Negative Mining (Mining Weight)
-                # [AUDIT FIX] Cap mining weight to prevent explosion.
-                with torch.no_grad():
-                    probs = torch.softmax(logits, dim=-1)
-                    # logits/probs: [B, C], targets: [B]
-                    true_probs = probs.gather(-1, targets.unsqueeze(-1).long())
-                    error = 1.0 - true_probs.squeeze(-1)
-                    # Cap max boosting at 1.5x (was 2.0x)
-                    mining_weight = 1.0 + (torch.sigmoid(error * 5.0) * 0.5)
-                
-                # One-hot encoding for window-level targets
-                targets_one_hot = F.one_hot(targets.long(), num_classes=logits.shape[-1]).float()
+            # [v17.3] Omega Summoning: Constant Clinical Pressure
+            # Every batch now has sepsis signal via the Summoned Ghosts.
+            # We remove the 0.1x multiplier and train with full magnitude.
+            with torch.no_grad():
+                probs = torch.softmax(logits, dim=-1)
+                # logits/probs: [B+G, C], targets_expanded: [B+G]
+                true_probs = probs.gather(-1, targets_expanded.unsqueeze(-1).long())
+                error = 1.0 - true_probs.squeeze(-1)
+                # Cap max boosting at 1.5x
+                mining_weight = 1.0 + (torch.sigmoid(error * 5.0) * 0.5)
+            
+            # One-hot encoding for window-level targets
+            targets_one_hot = F.one_hot(targets_expanded.long(), num_classes=logits.shape[-1]).float()
 
-                # Sepsis Classification Loss (Window-Level)
-                # Use the loss returned by SequenceAuxHead if available (which includes Asymmetric logic)
-                # and fallback to risk_aware_loss only if needed.
-                if aux_loss_base is not None:
-                    aux_loss = aux_loss_base * cfm * mining_weight.mean()
-                else:
-                    raw_aux_loss = self.risk_aware_loss(logits, targets_one_hot, risk_coef, class_weights=class_weights)
-                    aux_loss = raw_aux_loss * cfm * mining_weight.mean()
+            # Sepsis Classification Loss (Unified [B+G])
+            # Ghosts provide the gradient floor to prevent 'Discovery Shock'.
+            if aux_loss_base is not None:
+                # aux_loss_base is [B+G] from SequenceAuxHead internal loss if updated
+                # But here it's already a scalar from the head. We rely on the head's loss.
+                aux_loss = aux_loss_base * cfm * mining_weight.mean()
             else:
-                # [v13.0 PATCH] Zero-sepsis batch: Train to confidently predict "Stable"
-                # Instead of skipping entirely, use a small penalty for "confirming normality"
-                # This keeps gradients flowing but with reduced weight (0.1x)
-                targets_one_hot = F.one_hot(targets.long(), num_classes=logits.shape[-1]).float()
-                if aux_loss_base is not None:
-                    aux_loss = aux_loss_base * 0.1  # Reduced weight for zero-sepsis batches
-                else:
-                    aux_loss = self.risk_aware_loss(logits, targets_one_hot, risk_coef, class_weights=class_weights) * 0.1
+                raw_aux_loss = self.risk_aware_loss(logits, targets_one_hot, risk_coef_expanded, class_weights=class_weights)
+                aux_loss = raw_aux_loss * cfm * mining_weight.mean()
+
+            # [v17.4 GIST-Q] Uncertainty-Weighted CGA
+            # Anchors the Expert Manifold to history, prioritising high-uncertainty (hard) cases.
+            if num_ghosts > 0 and ghost_batch["valid"].any():
+                ghost_latents_global = global_ctx_expert[B:]
+                ghost_anchors = ghost_batch["anchors"]
+                
+                # Compute per-ghost MSE and weight by stored uncertainty
+                # Reduces drift by more strongly anchoring 'harder' historical concepts.
+                ghost_mse = F.mse_loss(ghost_latents_global, ghost_anchors, reduction='none')
+                ghost_uncertainties = ghost_batch["uncertainties"].to(ghost_mse.device)
+                l_cga = (ghost_mse * ghost_uncertainties).mean()
+                
+                # Weighted at 0.5 to prevent manifold stiffness
+                aux_loss = aux_loss + 0.5 * l_cga
+                self.log("train/l_cga", l_cga, on_step=True)
 
             # [Point 6] Self-Supervised Clinical Priority (Teacher Anchoring)
             # Rationale: Prevents Student 'forgetting' during high-noise diffusion phases.
@@ -714,11 +760,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
         with self.ema_teacher_context():
             with torch.no_grad():
                 # A. Run Encoder (for AWR)
+                # [v17.3 Surgical Mask] Teacher only observes the real batch [0:B]
                 out_teacher = self.model.encoder(
-                    past_norm, 
-                    static_norm, 
+                    past_norm[:B], 
+                    static_norm[:B], 
                     imputation_mask=src_mask, 
-                    padding_mask=bool_padding_mask
+                    padding_mask=bool_padding_mask[:B] if bool_padding_mask is not None else None
                 )
                 # [v12.2 SOTA] Unified Context for Teacher Bootstrapping
                 teacher_global = out_teacher["global_planner"]
@@ -735,13 +782,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 # B. Run Anchor Head (if applicable)
                 teacher_logits = None
                 if self.cfg.model.use_auxiliary_head and "phase_label" in batch and self.ema is not None and self.current_epoch >= 2:
+                     # Unified teacher pass for [B+G]
                      teacher_aux = self.model.aux_head(ctx_aux, mask=ctx_mask)
-                     teacher_logits = teacher_aux["logits"]
+                     # Surgical Mask: Only anchor the fresh batch [0:B]
+                     teacher_logits = teacher_aux["logits"][:B]
 
         # 3. Anchor Loss Injection (Gradient Allowed)
         # Must be OUTSIDE no_grad so 'logits' (Student) gradients flow
         if teacher_logits is not None:
-             l_anchor = F.binary_cross_entropy_with_logits(logits, torch.sigmoid(teacher_logits))
+             # Surgical Mask: Only anchor Student representations for the main batch [0:B]
+             l_anchor = F.binary_cross_entropy_with_logits(logits[:B], torch.sigmoid(teacher_logits))
              aux_loss = aux_loss + 0.5 * l_anchor
 
         # 4. AWR Bootstrapping (Target Calculation - No Grad)
@@ -757,14 +807,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 tau=self.curr_tau.item()
             ).detach()
 
+            # [v17.3 Surgical Mask] RL inputs sliced to [0:B]
             advantages = self.awr_calculator.compute_saw(
                 rewards, 
-                student_values=student_values,
-                teacher_values=target_values,
+                student_values=student_values[:B],
+                teacher_values=target_values[:B],
                 dones=batch.get("is_terminal", None),
                 bootstrap_value=bootstrap_value
             )
-            returns = (advantages + student_values).detach()
+            # [v17.3 Surgical Mask] Returns restricted to fresh batch [0:B]
+            returns = (advantages + student_values[:B]).detach()
 
             # AWR Weights
             f_mask = batch.get("future_mask")
@@ -802,10 +854,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
         if torch.distributed.is_initialized():
             from torch.distributed.nn.functional import all_gather
             ctx_aux_global = torch.cat(all_gather(ctx_aux), dim=0)
-            targets_global = torch.cat(all_gather(targets.long()), dim=0)
+            # Use targets_expanded for global prevalence scaling
+            targets_global = torch.cat(all_gather(targets_expanded.long()), dim=0)
             mask_global = torch.cat(all_gather(ctx_mask), dim=0)
             
-            # Global CFM: Balanced scaling based on the entire DDP batch
+            # Global CFM: Balanced scaling based on the entire DDP batch (including ghosts)
             n_sepsis_global = (targets_global > 0).sum().item()
             cfm_global = GradientThrottler.log_scale_prevalence(targets_global.numel(), n_sepsis_global)
         else:
@@ -818,24 +871,29 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # [v4.2 SOTA Pillar 5] Inject Clinical Metadata (Velocity, Static)
         with torch.no_grad():
             velocity = (fut[:, 0, :] - past[:, -1, :]) # [B, D_in]
+            # [v17.4] Metadata Expansion: Pad ghosts with zeros to match B+G batch
+            # Rationale: Ghosts are historical, their 'future velocity' is not in the current context.
+            vel_ghost = torch.zeros(num_ghosts, velocity.size(1), device=self.device)
+            velocity_expanded = torch.cat([velocity, vel_ghost], dim=0)
         
         # [PHASE 1 FIX] Unthrottle ACL to 30% (was 5%)
         # [v12.2 SOTA] Unified Context for Contrastive Clustering
         acl_factor = self.cfg.train.get("acl_throttle_factor", 0.3)
         global_ctx_throttled = GradientThrottler.throttle(global_ctx_unified, factor=acl_factor)
         
-        raw_meta = torch.cat([global_ctx_throttled, velocity, static], dim=-1)
+        # Use expanded metadata to match [B+G] context
+        raw_meta = torch.cat([global_ctx_throttled, velocity_expanded, static_expanded], dim=-1)
         z_acl = self.acl_projector(raw_meta)
         
         # [v4.2.1 SOTA] Global Contrastive Clustering (DDP-Safe)
         if torch.distributed.is_initialized():
             from torch.distributed.nn.functional import all_gather
+            # ACL + CGA: Use full B+G batch for specialist clustering
             z_acl_global = torch.cat(all_gather(z_acl), dim=0)
-            targets_global_acl = torch.cat(all_gather(batch["phase_label"].long()), dim=0)
-            # Note: sepsis_acl handles local vs global internally if we pass gathered tensors
+            targets_global_acl = torch.cat(all_gather(targets_expanded.long()), dim=0)
             acl_loss = self.sepsis_acl(z_acl_global, targets_global_acl) * cfm_global
         else:
-            acl_loss = self.sepsis_acl(z_acl, batch["phase_label"]) * cfm_global
+            acl_loss = self.sepsis_acl(z_acl, targets_expanded) * cfm_global
 
 
         # --- 3. [DEPRECATED] SOTA Path: Gradient Scaling Hooks ---
@@ -898,12 +956,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
             smoothed_target = true_state_binary * (1 - ls_alpha) + (ls_alpha / 2)
             true_state = smoothed_target.view(B, 1, 1).expand(-1, ctx_expert.size(1), 1)
             
+            # [v17.4] Surgical Forensic Fix: BGSL restricted to real batch [0:B]
+            # Rationale: BGSL computes physical slopes which are not available for Ghosts.
             bgsl_out = self.bgsl_loss(
-                pred_state[:, 1:], # [B, T, 1]
-                true_state[:, 1:], # [B, T, 1]
-                past,              # [FIX] Use RAW vitals for physical slope calc
-                risk_coef=risk_coef.view(B, 1, 1), # [B, 1, 1] for broadcasting
-                mask=ctx_mask[:, 1:] # [B, T]
+                pred_state[:B, 1:], # [B, T, 1]
+                true_state[:, 1:],  # [B, T, 1]
+                past,               # [B, T, D] (Original batch)
+                risk_coef=risk_coef.view(B, 1, 1), 
+                mask=ctx_mask[:B, 1:] # [B, T]
             )
             l_bgsl = bgsl_out["loss"]
             
@@ -913,9 +973,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Use stable trajectories (label=0) as negative candidates for the bank
             is_negative = (batch["phase_label"] == 0)
             tcb_out = self.tcb_buffer(
-                global_ctx,           # Student Query
-                teacher_global,       # Teacher Positive
-                enqueue_mask=is_negative 
+                global_ctx[:B],       # [v17.4 FIX] Student Query sliced to [B] to match Teacher
+                teacher_global,       # Teacher Positive [B]
+                enqueue_mask=is_negative # [B]
             )
             l_tcb = tcb_out["loss"]
 
@@ -929,7 +989,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 a_ema = self.loss_scaler.loss_emas[2] # aux is key 2
                 
                 # Adaptive Factor: Scales D down to A's regime
-                alpha = (a_ema / (d_ema + 1e-8)).clamp(0.001, 1.0)
+                # [v17.4 Hardened] Alpha Guard: Prevent foundation gradient collapse
+                # Floor raised to 0.15 to ensure constant clinical pressure during early training.
+                alpha = (a_ema / (d_ema + 1e-8)).clamp(0.15, 1.0)
                 
             loss_dict['diffusion'] = diff_loss * alpha
             loss_dict['bgsl'] = l_bgsl
@@ -1052,6 +1114,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
             opt.step()
             opt.zero_grad()
             
+            # [v17.3 Hardened] Dead Teacher Fix: Update Target Network
+            # Restores RL convergence by keeping teacher targets dynamic.
+            if self.ema is not None:
+                self.ema.update(self.model)
+            
             # [Point 1] Bayesian-PGD Parameter Projection
             # Restores differentiability after optimizer step
             if hasattr(self.loss_scaler, 'project_parameters'):
@@ -1087,6 +1154,49 @@ class ICUGeneralistWrapper(pl.LightningModule):
             self.train_awr_ess.update(diag["ess"])
             self.train_explained_var.update(ev)
             
+            # [v17.3 Hardened] Distributed DAB Sync
+            # Rationale: All ranks MUST have identical banks to ensure "Harmonic Summoning" 
+            # (where seed-based sampling yields the exact same ghosts across all GPUs).
+            sepsis_mask = (targets > 0) # Only store main batch [0:B]
+            
+            if torch.distributed.is_initialized():
+                from torch.distributed.nn.functional import all_gather
+                # Object-based gathering is safer for variable-length discovered sepsis cases
+                local_discoveries = []
+                if sepsis_mask.any():
+                    for i in torch.where(sepsis_mask)[0]:
+                        local_discoveries.append({
+                            "vitals": past[i].detach().cpu(),
+                            "masks": src_mask[i].detach().cpu() if src_mask is not None else torch.ones_like(past[i]).cpu(),
+                            "labels": targets[i].detach().cpu(),
+                            "latents": global_ctx_expert[i].detach().cpu(),
+                            "uncertainty": uncertainty[i].detach().cpu()
+                        })
+                
+                # Gather across all ranks
+                world_discoveries = [None] * torch.distributed.get_world_size()
+                torch.distributed.all_gather_object(world_discoveries, local_discoveries)
+                
+                # Flatten and update on all ranks
+                for rank_list in world_discoveries:
+                    for item in rank_list:
+                        self.ghost_bank.update(
+                            vitals=item["vitals"].unsqueeze(0).to(self.device),
+                            masks=item["masks"].unsqueeze(0).to(self.device),
+                            labels=item["labels"].unsqueeze(0).to(self.device),
+                            latents=item["latents"].unsqueeze(0).to(self.device),
+                            uncertainties=item["uncertainty"].unsqueeze(0).to(self.device)
+                        )
+            else:
+                if sepsis_mask.any():
+                    self.ghost_bank.update(
+                        vitals=past[sepsis_mask],
+                        masks=src_mask[sepsis_mask] if src_mask is not None else torch.ones_like(past[sepsis_mask]),
+                        labels=targets[sepsis_mask],
+                        latents=global_ctx_expert[:B][sepsis_mask], # Experts latent anchors
+                        uncertainties=uncertainty[:B][sepsis_mask] # [v17.4 FIX] Slice uncertainty to [B]
+                    )
+            
             # Global Rank 0 Logging (SOTA: Pass objects, not .compute(), to avoid sync bottleneck)
             # [TELEMETRY] Primary Metrics (Visible in Progress Bar)
             # Use detached scalars (.item()) for the progress bar to ensure immediate visibility.
@@ -1098,14 +1208,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 "total_loss": total_loss,
                 "diff_loss": diff_loss,
                 "critic_loss": critic_loss,
+                "l_cga": l_cga if 'l_cga' in locals() else 0.0,
                 "phys_loss": phys_loss,
-                "aux_loss": aux_loss,
                 "acl_loss": acl_loss,
                 "bgsl_loss": l_bgsl,
                 "tcb_loss": l_tcb,
                 "awr_ess": diag["ess"],
                 "explained_var": ev,
-                "ood_score": uncertainty.mean(), # [FIX] Map to local variable
+                "ood_score": uncertainty[:B].mean(), # [FIX] Map to local variable, slice to main batch
                 "curr_phys_weight": torch.as_tensor(curr_phys_weight, device=self.device).detach().clone(),
                 "w_aux": torch.as_tensor(task_weights[2], device=self.device).detach().clone(),
                 "lr": torch.as_tensor(self.optimizers().param_groups[0]["lr"], device=self.device).detach().clone()
@@ -1482,6 +1592,26 @@ class ICUGeneralistWrapper(pl.LightningModule):
         if hasattr(self, 'ema') and self.ema is not None:
             return self.ema.swap()
         return contextlib.nullcontext()
+
+    @contextlib.contextmanager
+    def frozen_stats(self):
+        """
+        [v17.3] BN Correlation Guard.
+        Ensures ghosts in the expanded batch do NOT poison the running statistics
+         of the Shared Foundation's Batch Normalization layers.
+        """
+        original_momentums = {}
+        # Synchronized SyncBatchNorm requires care in multi-GPU settings
+        for name, module in self.model.named_modules():
+             if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.SyncBatchNorm)):
+                  original_momentums[name] = module.momentum
+                  module.momentum = 0.0
+        try:
+             yield
+        finally:
+             for name, module in self.model.named_modules():
+                  if name in original_momentums:
+                       module.momentum = original_momentums[name]
 
     def on_fit_start(self):
         """
