@@ -89,7 +89,12 @@ from icu.models.components.loss_scaler import BayesianProjectedScaler
 from icu.models.components.risk_scorer import PhysiologicalRiskScorer
 from icu.models.components.risk_aware_loss import RiskAwareAsymmetricLoss
 # [v2025 SOTA] Stabilization Primitives
-from icu.utils.stabilization import GradientThrottler, adaptive_gradient_clip_
+from icu.utils.stabilization import (
+    GradientThrottler, 
+    adaptive_gradient_clip_,
+    LinearManifoldSentinel,
+    OrthogonalGuard
+)
 from icu.models.components.contrastive_loss import AsymmetricContrastiveLoss
 from icu.models.components.safety_envelope import PhysiologicalSafetyEnvelope
 from icu.models.components.horizon_scheduler import ClinicalHorizonScheduler
@@ -412,6 +417,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
         
         self.register_buffer("curr_tau", torch.tensor(0.5))
         self.register_buffer("curr_sigma_scale", torch.tensor(3.50))
+        
+        # [PMS] Manifold Stability Monitoring
+        self.register_buffer("grad_norm_ema", torch.tensor(1.0))
+        self.grad_ema_decay = 0.95
+        
+        # [PMS] MGP: EMA Foundation Gradient Storage for projection
+        # Flattened size based on encoder hidden dim (e.g., 512, 1024)
+        # We will initialize this lazily in training_step
+        self._fnd_grad_ema = None 
 
     def on_train_epoch_start(self):
         """[Phase 3/4] Update AWR Horizon and SOTA v4.2 Warmup."""
@@ -433,23 +447,26 @@ class ICUGeneralistWrapper(pl.LightningModule):
         
         # [v4.2 SOTA Pillar 2 & 4] Synchronized Risk Warmup
         # Goal: Slowly introduce CVaR pessimism and Safety Envelope constraints.
-        # Duration: 10 epochs for faster refinement cycle
-        ramp_epochs = 10.0
-        progress = min(1.0, self.current_epoch / ramp_epochs)
         
-        # Tau: 0.5 (Mean) -> 0.7 (Bottom 25% Expectile)
-        # Starting in Epoch 5 (User Directive)
-        if self.current_epoch >= 5:
-            tau_progress = min(1.0, (self.current_epoch - 5) / ramp_epochs)
-            self.curr_tau.fill_(0.5 + (0.7 - 0.5) * tau_progress)
+        # [PMS] SCS: Synchronized Curriculum Smoothing
+        # We check the 'Manifold Health' (Gradient Variance).
+        # If the brain is in 'Shock' (Norm > 5.0), we freeze the ramp.
+        if self.grad_norm_ema > 5.0:
+            logger.warning(f"[PMS] Manifold Shock Detected (GN={self.grad_norm_ema:.2f}). Freezing Curriculum Ramp.")
+            # Keep current tau and sigma_scale (No increment)
+            pass 
         else:
-            self.curr_tau.fill_(0.5)
-        
-        # Sigma Scale: 3.5 (Soft Start) -> 2.5 (Clinical Hard Deck)
-        # Ramping over 15 epochs for maximum stability
-        sigma_ramp_epochs = 15.0
-        sigma_progress = min(1.0, self.current_epoch / sigma_ramp_epochs)
-        self.curr_sigma_scale.fill_(3.50 - (3.50 - 2.50) * sigma_progress)
+            ramp_epochs = 10.0
+            if self.current_epoch >= 5:
+                tau_progress = min(1.0, (self.current_epoch - 5) / ramp_epochs)
+                self.curr_tau.fill_(0.5 + (0.7 - 0.5) * tau_progress)
+            else:
+                self.curr_tau.fill_(0.5)
+            
+            # Ramping sigma over 15 epochs
+            sigma_ramp_epochs = 15.0
+            sigma_progress = min(1.0, self.current_epoch / sigma_ramp_epochs)
+            self.curr_sigma_scale.fill_(3.50 - (3.50 - 2.50) * sigma_progress)
         
         logger.info(f"[Epoch {self.current_epoch}] Agentic Foresight: Gamma={new_gamma:.4f} "
                     f"| Tau={self.curr_tau:.2f} | SigmaScale={self.curr_sigma_scale:.2f}")
@@ -559,33 +576,34 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Fix: Only compute full aux_loss when batch contains sepsis (phase_label > 0)
             batch_has_sepsis = (batch["phase_label"] > 0).any().item()
             
-            # [SOTA 2025] Asymmetric Throttling: The "Peace Treaty"
-            # We restrict sequence context gradient influence to 10%.
-            # This allows the Sepsis head to "read" features without "dominating" them.
-            # [SOTA 2025 FIX] The "Expert Bypass"
-            # Previously: ctx_aux = ctx_seq (Smooth Planner Features). 
-            # This filtered out the sharp anomalies needed for sepsis detection.
-            # Now: ctx_aux = ctx_expert (Sharp Expert Features).
+            # [PMS] DAT: Dynamic Adaptive Throttling
+            # "Head First, Brain Second" - Guard the encoder when the head is guessing.
             ctx_aux = ctx_expert.clone()
-            # [PHASE 1 FIX] Unthrottle gradient flow (RESTORED to 1.0)
-            # We want the classifier to shape the encoder.
-            throttle_factor = self.cfg.train.get("aux_throttle_factor", 1.0)
-            ctx_aux = GradientThrottler.throttle(ctx_aux, factor=throttle_factor)
-
-            # [FIX 3] Integrate DynamicClassBalancer for imbalanced sepsis data
-            targets = batch["phase_label"] # [B]
             
-            # [v14.0 PATCH] Pass targets and epoch for Evidential Loss
-            # This enables internal loss calculation in SequenceAuxHead
+            # [FIX] Define targets before evidential forward pass
+            targets = batch["phase_label"] # [B]
+
+            # Forward pass to get current competence (Uncertainty)
             aux_out = self.model.aux_head(
                 ctx_aux, 
                 mask=ctx_mask, 
-                targets=targets,          # Enable internal loss
-                epoch_num=self.current_epoch # Enable KL annealing
+                targets=targets,          
+                epoch_num=self.current_epoch 
             )
             logits = aux_out["logits"]
             aux_loss_base = aux_out["loss"]
-            uncertainty = aux_out["uncertainty"]
+            uncertainty = aux_out["uncertainty"] # [B, 1]
+            
+            # Use detachment to compute trust factor (Cybernetic Control Gate)
+            u_avg = uncertainty.detach().mean()
+            # Trust Factor: 1.0 (Confident) -> 0.1 (Panic)
+            trust_factor = (1.0 - (u_avg * 0.9)).clamp(min=0.1, max=1.0).item()
+            
+            # Surgical Hook: Scopes gradients only for the shared connection
+            if ctx_aux.requires_grad:
+                ctx_aux.register_hook(lambda grad: grad * trust_factor)
+            
+            self.log("train/pms_trust_factor", trust_factor, on_step=True, prog_bar=True)
             
             self.class_balancer.update(targets)
             class_weights = self.class_balancer.get_weights().to(self.device)
@@ -594,11 +612,50 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Classification (Aux Head) is Window-Level [B] via CLS Token
             # Contrastive (ACL) is Sequence-Level [B, T] (handled internally)
             B, T, _ = ctx_seq.shape
-            
-            # [REMOVED] Class Frequency Multiplier (CFM)
-            # AUDIT FINDING: This was causing a 2.7x multiplier on top of the 35x pos_weight.
-            # Rely strictly on DynamicClassBalancer.
             cfm = 1.0
+            
+            # [PMS] MGP: Manifold Gradient Projection Hook
+            # We protect the 'Planner' (Foundation) from 'Expert' (Aux) noise.
+            # We use an EMA of the foundation gradient to prevent task interference.
+            
+            def pms_manifold_guard(grad):
+                # 1. Capture/Update Foundation EMA (if this is the planner branch)
+                # Note: In PyTorch backward, this hook might run at different times.
+                # We identify branches by their gradient shape or context.
+                return grad
+
+            # Correct Implementation: Multi-Branch Projection
+            # We must identify which branch is which.
+            def project_aux_against_fnd_ema(grad_aux):
+                # grad_aux: [B, T, D] or [B, D]
+                if self._fnd_grad_ema is not None:
+                    # [PMS] Shape-Invariant Projection
+                    # We project the aux gradient against the stable foundation direction
+                    return LinearManifoldSentinel.project(grad_aux, self._fnd_grad_ema)
+                return grad_aux
+
+            def update_fnd_ema(grad_fnd):
+                # grad_fnd: [B, T, D]
+                with torch.no_grad():
+                    # Compute the 'Representative Direction' (Average over B and T)
+                    # This makes the EMA shape-invariant.
+                    if grad_fnd.dim() == 3:
+                        dir_fnd = grad_fnd.mean(dim=(0, 1)) # [D]
+                    else:
+                        dir_fnd = grad_fnd.mean(dim=0) # [D]
+                        
+                    if self._fnd_grad_ema is None:
+                        self._fnd_grad_ema = dir_fnd.detach().clone()
+                    else:
+                        self._fnd_grad_ema = self._fnd_grad_ema.to(grad_fnd.device)
+                        self._fnd_grad_ema.mul_(0.9).add_(dir_fnd.detach(), alpha=0.1)
+                return grad_fnd
+
+            if ctx_seq.requires_grad:
+                ctx_seq.register_hook(update_fnd_ema)
+            
+            if ctx_aux.requires_grad:
+                ctx_aux.register_hook(project_aux_against_fnd_ema)
             
             # [v13.0 PATCH] Conditional Gradient Flow
             # Only compute meaningful aux_loss when batch has sepsis signal
@@ -888,6 +945,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Single Backward Pass
             self.manual_backward(total_loss)
             
+            # [PMS] SCS: Manifold Health Monitoring
+            with torch.no_grad():
+                # Efficiently compute total gradient norm
+                total_norm = OrthogonalGuard.sanitize_gradients(self.model)
+                self.grad_norm_ema = self.grad_ema_decay * self.grad_norm_ema + (1 - self.grad_ema_decay) * total_norm
+                self.log("train/manifold_norm_ema", self.grad_norm_ema, on_step=True, prog_bar=True)
+            
             gn_loss = torch.tensor(0.0, device=self.device)
             
             # Weights for logging (Sigmas)
@@ -949,6 +1013,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 phys_loss = torch.clamp(phys_loss, max=10.0)
 
             self.manual_backward(phys_loss)
+            
+            # [PMS] SCS: Physics Manifold Monitoring
+            with torch.no_grad():
+                phys_norm = OrthogonalGuard.sanitize_gradients(self.model)
+                self.grad_norm_ema = self.grad_ema_decay * self.grad_norm_ema + (1 - self.grad_ema_decay) * phys_norm
 
         # --- 5. Accumulation-Aware Step & Cleanup ---
         # [SOTA 2025] Manually manage accumulation for precise DDP synchronization
@@ -956,12 +1025,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
         acc_batches = self.trainer.accumulate_grad_batches
         if (batch_idx + 1) % acc_batches == 0:
             # [SOTA FIX] Manual unscaling required for AdamW (especially with fused or complex states)
-            if self.trainer.precision_plugin.scaler is not None:
-                self.trainer.precision_plugin.scaler.unscale_(opt)
+            scaler = getattr(self.trainer.precision_plugin, "scaler", None)
+            if scaler is not None:
+                scaler.unscale_(opt)
             # [SOTA FIX] Manual unscaling required for fused=True AdamW in 16-mixed precision
             # This line is redundant if the previous one handles it. Keeping one for clarity.
-            # if self.trainer.precision_plugin.scaler is not None:
-            #     self.trainer.precision_plugin.scaler.unscale_(opt)
+            # if scaler is not None:
+            #     scaler.unscale_(opt)
 
             # 2025 Grad Clipping (Final safety before step)
             # 2025 Grad Clipping (Final safety before step)

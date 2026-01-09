@@ -88,5 +88,20 @@ class BayesianProjectedScaler(nn.Module):
         """
         [SOTA] Parameter Projection Hook.
         Must be called after optimizer.step() to prevent 'Dead Zones'.
+        
+        PMS Extension: Enforces Clinical Ranking Constraint (PRUW).
+        We guarantee that Sepsis uncertainty (aux) never exceeds Diffusion uncertainty,
+        ensuring that the Sepsis task always maintains its priority signal.
         """
+        # 1. Standard Bayesian Boundary Projection
         self.log_vars.clamp_(min=-2.0, max=5.0)
+        
+        # 2. [PRUW] Clinical Ranking Enforcement
+        # Keys: ['diffusion', 'critic', 'aux', 'acl', 'bgsl', 'tcb']
+        # indices: diff=0, aux=2, acl=3
+        diff_log_var = self.log_vars[0]
+        
+        # Sepsis tasks (aux, acl) must be at least as certain as the foundation
+        # log_var_aux <= log_var_diff
+        self.log_vars[2].clamp_(max=diff_log_var.item())
+        self.log_vars[3].clamp_(max=diff_log_var.item())

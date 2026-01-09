@@ -99,7 +99,7 @@ legacy
 tests/
 
 working
-sepsis_clinical_28
+# sepsis_clinical_28
 
 verify_patches.py
 
@@ -111,3 +111,8 @@ icu/models/wrapper_generalist copy.py
 # patches_snippet.md
 # logs_.md
 patches_snippet.md
+logs.md
+suggestion.md
+patch_report.md
+.gitignore
+ui.md

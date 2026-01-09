@@ -105,7 +105,7 @@ train:
   acl_centroid_reg: 0.05      # [v12.5.1] Higher to prevent contrastive collapse
   
   # Risk-Aware Asymmetric Loss
-  asl_gamma_neg: 4.0          # Sepsis focusing weight
+  asl_gamma_neg: 2.0          # [SOTA OPTIMIZED] Reduced from 4.0/6.0 based on AUROC sweep (v2.0 improves sensitivity)
   asl_gamma_pos: 1.0          # Standard focusing
   risk_multiplier: 2.0        # Red-Zone penalty scale
   

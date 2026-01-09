@@ -101,6 +101,43 @@ class GradientThrottler:
             return tensor
         return tensor
 
+class LinearManifoldSentinel:
+    """
+    [PMS] Manifold Gradient Projection (MGP).
+    Projects auxiliary gradients to be non-conflicting with the foundation.
+    """
+    @staticmethod
+    def project(grad_aux: torch.Tensor, grad_foundation: torch.Tensor) -> torch.Tensor:
+        """
+        Calculates the PCGrad projection of grad_aux onto the normal of grad_foundation.
+        
+        PMS Modification: 
+        Supports grad_foundation as a 'Directional Vector' [D] while grad_aux is [..., D].
+        This ensures shape-invariance across variable batch/sequences.
+        """
+        # 1. Flatten both to handle potential shape mismatches in dot product
+        # If grad_foundation is a directional vector [D], we project every vector 
+        # in grad_aux against it.
+        
+        # Calculate dot product across the last dimension (Feature Dim)
+        # dot = sum(grad_aux * grad_foundation)
+        dot = (grad_aux * grad_foundation).sum(dim=-1, keepdim=True) # [..., 1]
+        
+        # Only project if conflict detected (dot < 0)
+        # We use a mask for efficiency
+        conflict_mask = (dot < 0)
+        
+        if conflict_mask.any():
+            mag_fnd = (grad_foundation * grad_foundation).sum() + 1e-8
+            proj = (dot / mag_fnd) * grad_foundation
+            
+            # Apply only to conflicting components
+            new_grad = grad_aux.clone()
+            new_grad[conflict_mask.expand_as(grad_aux)] = (grad_aux - proj)[conflict_mask.expand_as(grad_aux)]
+            return new_grad
+        
+        return grad_aux
+
     @staticmethod
     def log_scale_prevalence(n_total: int, n_target: int) -> float:
         """

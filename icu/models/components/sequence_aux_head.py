@@ -261,6 +261,27 @@ class SequenceAuxHead(nn.Module):
             nn.Linear(d_model, num_classes)
         )
         
+        # [v15.0 SOTA] Prior-Aware Initialization
+        # Constraint: Sepsis prevalence is 1.76%.
+        # Standard init assumes 50/50 (binary) or Uniform (multi-class), causing massive initial gradient shock.
+        # Fix: Hardcode bias to log(odds) of prevalence.
+        final_layer = self.head[-1]
+        
+        # Standard logic for Imbalanced Classification (Works for Softmax/Sigmoid and EDL)
+        # Target: P(Sepsis) approx 0.0176
+        bias_val = -4.02 # log(0.0176 / 0.9824)
+        
+        if num_classes > 1:
+            # Multi-class Case (Stable vs Pre-Shock vs Shock)
+            # Class 0 (Stable) is dominant (~98%) -> Bias 0 (Reference)
+            # Classes > 0 are rare (~2%) -> Bias -4.02
+            nn.init.zeros_(final_layer.bias)
+            with torch.no_grad():
+                final_layer.bias[1:].fill_(bias_val)
+        else:
+            # Binary Case
+            nn.init.constant_(final_layer.bias, bias_val)
+        
 
         
         # [v14.0 PATCH] Replaced AsymmetricLoss with EvidentialLoss

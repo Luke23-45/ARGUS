@@ -1413,15 +1413,13 @@ class ICUUnifiedPlanner(nn.Module):
                 # Prevents one patient's artifact from suppressing the batch
                 grad_norm = grad.norm(dim=(1, 2), keepdim=True)
                 
-                # 2. USE GRAD_NORM HERE: Normalize the gradient
-                # This ensures the steering 'direction' is preserved but magnitude is controlled
+                # [SOTA 2025] Directional Preservation
+                # We normalize the gradient to unit norm to preserve the 'Clinical Intent'.
+                # We then apply the guidance scale. No element-wise clamping is performed
+                # as it distorts the manifold trajectory.
                 grad = grad / (grad_norm + 1e-8)
-                
-                # 3. USE CLAMP: Final safety guard against high-frequency noise
-                # Since the grad is now normalized to ~1.0, a clamp of 0.1 is very safe
-                grad = torch.clamp(grad, -0.1, 0.1) 
                     
-                # 4. Apply steering using the scaled, normalized, and clamped gradient
+                # 4. Apply steering using the normalized gradient
                 # x_t = x_t - (Force * Direction)
                 x_t = x_t - self.cfg.physics_guidance_scale * grad.detach()
 
