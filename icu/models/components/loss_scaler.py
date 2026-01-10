@@ -39,13 +39,25 @@ class BayesianProjectedScaler(nn.Module):
             return torch.tensor(0.0, device=next(self.parameters()).device), {}
 
         losses_tensor = torch.stack(losses)
+        
+        # [SOTA 2025] DDP Loss Synchronization
+        # Rationale: Ensures that all ranks compute identical uncertainty weights (Precision).
+        # Prevents "Rank Divergence" where different GPUs disagree on task priority.
+        if torch.distributed.is_initialized() and self.training:
+            # Clone to avoid affecting the original loss graph on the local rank
+            sync_losses = losses_tensor.detach().clone()
+            torch.distributed.all_reduce(sync_losses, op=torch.distributed.ReduceOp.SUM)
+            avg_losses = sync_losses / torch.distributed.get_world_size()
+        else:
+            avg_losses = losses_tensor.detach()
+
         indices = torch.tensor([idx for idx, _ in active_keys], device=losses_tensor.device)
         
         # 1. Soft Optimal Uncertainty Weighting (UW-SO)
-        # Update EMA
+        # Update EMA using global average losses
         with torch.no_grad():
             curr_emas = self.loss_emas[indices]
-            updated_emas = self.decay * curr_emas + (1 - self.decay) * losses_tensor.detach()
+            updated_emas = self.decay * curr_emas + (1 - self.decay) * avg_losses
             self.loss_emas[indices] = updated_emas
             
             # [PATCH 3] Fixed Clinical Priority Weights

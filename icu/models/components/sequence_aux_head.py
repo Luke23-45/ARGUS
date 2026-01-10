@@ -105,9 +105,11 @@ class EvidentialLoss(nn.Module):
         S_tilde = torch.sum(alpha_tilde, dim=1, keepdim=True)
         
         # KL term
-        kl = torch.lgamma(S_tilde) - torch.lgamma(torch.tensor(self.num_classes, device=alpha.device)) \
+        # KL term: KL(Dir(alpha_tilde) || Dir(1))
+        # Correct Formula: log(Gamma(S_tilde)/Gamma(K)) - sum(log(Gamma(alpha_tilde))) + sum((alpha_tilde - 1) * (digamma(alpha_tilde) - digamma(S_tilde)))
+        kl = torch.lgamma(S_tilde) - torch.lgamma(torch.tensor(self.num_classes, dtype=alpha.dtype, device=alpha.device)) \
              - torch.sum(torch.lgamma(alpha_tilde), dim=1, keepdim=True) \
-             + torch.sum((alpha_tilde - 1) * (torch.digamma(S_tilde) - torch.digamma(torch.tensor(self.num_classes, device=alpha.device))), dim=1, keepdim=True)
+             + torch.sum((alpha_tilde - 1) * (torch.digamma(alpha_tilde) - torch.digamma(S_tilde)), dim=1, keepdim=True)
              
         # Combine
         loss = nll + annealing_coef * kl

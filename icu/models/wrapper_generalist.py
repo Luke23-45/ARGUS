@@ -179,6 +179,11 @@ class DynamicClassBalancer(nn.Module):
         else:
             y = y.long()
             b_counts = torch.bincount(y, minlength=self.num_classes).float()
+            
+            # [SOTA 2025] DDP Global Sync
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(b_counts, op=torch.distributed.ReduceOp.SUM)
+            
             new_counts = self.beta * self.counts + (1 - self.beta) * b_counts
             self.counts.copy_(new_counts)
 
@@ -265,9 +270,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # =====================================================================
         self.gradnorm = None
         if self.balancing_mode == "legacy_surgical" or True: # [v25.7] Force enable for ACL expansion
-            # GradNorm dynamically weights [Diffusion, Critic, Sepsis-Clf, Sepsis-ACL]
+            # GradNorm dynamically weights [Diffusion, Critic, Aux, ACL, BGSL, TCB]
             self.gradnorm = GradNormBalancer(
-                num_tasks=4, 
+                num_tasks=6, 
                 shared_params=self.model.encoder.parameters(),
                 alpha=cfg.train.get("gradnorm_alpha", 1.5)
             ).to(self.device)
@@ -494,10 +499,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
     # =========================================================================
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
-        """
-        [2025 SOTA] Manual Multi-Task Training Loop.
-        Orchestrates CAGrad, GradNorm, and EMA-Teacher Distillation.
-        """
+        # [v20.0 VERIFICATION MARKER]
+        print(f"DEBUG: training_step hit (balancing_mode={self.balancing_mode})")
         if not batch or "observed_data" not in batch:
             return
         
@@ -510,7 +513,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # Formula: (Epoch * large_prime + Step) ensures deterministic parity across all GPUs.
         ghost_seed = (self.current_epoch * 12345 + self.global_step) % (2**31)
         num_ghosts = self.cfg.train.get("num_ghosts", 4)
-        ghost_batch = self.ghost_bank.sample(num_ghosts=num_ghosts, seed=ghost_seed)
+        mixup_alpha = self.cfg.train.get("ghost_mixup_alpha", 0.0)
+        ghost_batch = self.ghost_bank.sample(
+            num_ghosts=num_ghosts, 
+            seed=ghost_seed, 
+            mixup_alpha=mixup_alpha,
+            uncertainty_weighted=True
+        )
         
         # Physically concatenate ghosts to the main batch
         past, fut, static = batch["observed_data"], batch["future_data"], batch["static_context"]
@@ -578,10 +587,33 @@ class ICUGeneralistWrapper(pl.LightningModule):
         t = torch.randint(0, self.model.cfg.timesteps, (B,), device=self.device)
         noisy_fut, noise_eps = self.model.scheduler.add_noise(fut_norm, t)
         
-        # [v17.3 Surgical Mask] Diffusion only for main batch [0:B]
-        # Prevents "Historical Overfitting" where the model reconstruction logic
-        # drifts towards ghost pathologies.
-        pred_noise = self.model.backbone(noisy_fut, t, ctx_seq[:B], global_ctx[:B], ctx_mask[:B])
+        # [v12.1] Two-Pass Self-Conditioning ("Analog Bits")
+        # Rationale: Training the model to fix its own generation errors.
+        # Implemented manually here to allow precise masking in Phase 1.
+        self_cond = None
+        if self.model.cfg.use_self_conditioning:
+            self_cond = torch.zeros_like(noisy_fut)
+            
+            # 50% probability of using a preliminary x0 estimate
+            if torch.rand(1).item() < 0.5:
+                # IMPORTANT: Pass 1 is strictly NO_GRAD to preserve memory
+                with torch.no_grad():
+                    # Pass 1: "Guess" noisy epsilon
+                    guess_eps = self.model.backbone(
+                        noisy_fut, t, ctx_seq[:B], global_ctx[:B], ctx_mask[:B], self_cond=self_cond
+                    )
+                    # Reconstruct x0 estimate (Analog Bits reconstruction)
+                    alpha_bar = self.model.scheduler.alphas_cumprod[t][:, None, None]
+                    sqrt_alpha_clamped = torch.sqrt(alpha_bar).clamp(min=1e-3)
+                    guess_x0 = (noisy_fut - torch.sqrt(1 - alpha_bar) * guess_eps) / sqrt_alpha_clamped
+                    
+                    # Manifold Constraint (Dynamic Thresholding)
+                    # Prevents outlier conditioning from exploding the search space
+                    self_cond = self.model.governance(guess_x0).detach()
+
+        # Pass 2: Final Denoising with Conditioning (Gradient Path)
+        pred_noise = self.model.backbone(noisy_fut, t, ctx_seq[:B], global_ctx[:B], ctx_mask[:B], self_cond=self_cond)
+        
         diff_sq = (pred_noise - noise_eps) ** 2
         weighted_diff = diff_sq * self.model.importance_weights.view(1, 1, -1)
         raw_diff_loss = weighted_diff.mean(dim=2) # [B, T]
@@ -731,11 +763,21 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 # Reduces drift by more strongly anchoring 'harder' historical concepts.
                 ghost_mse = F.mse_loss(ghost_latents_global, ghost_anchors, reduction='none')
                 ghost_uncertainties = ghost_batch["uncertainties"].to(ghost_mse.device)
-                l_cga = (ghost_mse * ghost_uncertainties).mean()
                 
-                # Weighted at 0.5 to prevent manifold stiffness
+                # [v18.0 SOTA] Dynamic CGA Adaptation
+                # Rationale: If the model is highly uncertain (Discovery Phase), we 
+                # INCREASE anchoring to prevent manifold collapse.
+                with torch.no_grad():
+                    curr_uncertainty = uncertainty[:B].mean().clamp(0.1, 1.0)
+                    # Adaptive multiplier: [0.5, 1.5]
+                    cga_mult = 0.5 + curr_uncertainty 
+                
+                l_cga = (ghost_mse * ghost_uncertainties).mean() * cga_mult
+                
+                # Weighted at base 0.5 to prevent manifold stiffness
                 aux_loss = aux_loss + 0.5 * l_cga
                 self.log("train/l_cga", l_cga, on_step=True)
+                self.log("bank/cga_adapt_mult", cga_mult, on_step=True)
 
             # [Point 6] Self-Supervised Clinical Priority (Teacher Anchoring)
             # Rationale: Prevents Student 'forgetting' during high-noise diffusion phases.
@@ -791,7 +833,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # Must be OUTSIDE no_grad so 'logits' (Student) gradients flow
         if teacher_logits is not None:
              # Surgical Mask: Only anchor Student representations for the main batch [0:B]
-             l_anchor = F.binary_cross_entropy_with_logits(logits[:B], torch.sigmoid(teacher_logits))
+             # [v20.1 SOTA FIX] Precise Multiclass Anchoring
+             # BCE on independent logits is unstable for multiclass. 
+             # We use MSE on probabilities (Softmax) for smooth representative alignment.
+             l_anchor = F.mse_loss(torch.softmax(logits[:B], dim=-1), torch.softmax(teacher_logits, dim=-1))
              aux_loss = aux_loss + 0.5 * l_anchor
 
         # 4. AWR Bootstrapping (Target Calculation - No Grad)
@@ -893,7 +938,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             targets_global_acl = torch.cat(all_gather(targets_expanded.long()), dim=0)
             acl_loss = self.sepsis_acl(z_acl_global, targets_global_acl) * cfm_global
         else:
-            acl_loss = self.sepsis_acl(z_acl, targets_expanded) * cfm_global
+            acl_loss = self.sepsis_acl(z_acl, targets_expanded.long()) * cfm_global
 
 
         # --- 3. [DEPRECATED] SOTA Path: Gradient Scaling Hooks ---
@@ -967,16 +1012,42 @@ class ICUGeneralistWrapper(pl.LightningModule):
             )
             l_bgsl = bgsl_out["loss"]
             
-            # [v4.0 PERFECT] Contrastive Buffer Update
-            # Use current expert representations as queries (Student)
-            # Use teacher representations as positive keys (MoCo style)
-            # Use stable trajectories (label=0) as negative candidates for the bank
-            is_negative = (batch["phase_label"] == 0)
-            tcb_out = self.tcb_buffer(
-                global_ctx[:B],       # [v17.4 FIX] Student Query sliced to [B] to match Teacher
-                teacher_global,       # Teacher Positive [B]
-                enqueue_mask=is_negative # [B]
-            )
+            # [v20.0] Cross-Manifold Synergy (Ghost-TCB Bonding)
+            # Rationale: DDP Parallelization for Contrastive Memory
+            # We gather expert latents across all ranks to provide a massive 
+            # negative pool for every GPU.
+            tcb_q = torch.cat([global_ctx[:B], global_ctx_expert[B:]], dim=0)
+            tcb_k = torch.cat([teacher_global, ghost_batch["anchors"]], dim=0)
+
+            if torch.distributed.is_initialized():
+                from torch.distributed.nn.functional import all_gather
+                # 1. Gather queries and keys for global contrastive loss
+                # This makes the InfoNCE loss equivalent to world_size * batch_size
+                tcb_q_global = torch.cat(all_gather(tcb_q), dim=0)
+                tcb_k_global = torch.cat(all_gather(tcb_k), dim=0)
+                
+                # 2. Gather negative mask
+                is_negative = (batch["phase_label"] == 0)
+                ghost_neg_mask = torch.zeros(num_ghosts, dtype=torch.bool, device=self.device)
+                tcb_enqueue_mask_local = torch.cat([is_negative, ghost_neg_mask], dim=0)
+                # Pack bool into float for gathering
+                tcb_enqueue_mask_global = torch.cat(all_gather(tcb_enqueue_mask_local.float()), dim=0).bool()
+                
+                tcb_out = self.tcb_buffer(
+                    tcb_q_global, 
+                    tcb_k_global, 
+                    enqueue_mask=tcb_enqueue_mask_global
+                )
+            else:
+                is_negative = (batch["phase_label"] == 0)
+                ghost_neg_mask = torch.zeros(num_ghosts, dtype=torch.bool, device=self.device)
+                tcb_enqueue_mask = torch.cat([is_negative, ghost_neg_mask], dim=0)
+                
+                tcb_out = self.tcb_buffer(
+                    tcb_q, 
+                    tcb_k, 
+                    enqueue_mask=tcb_enqueue_mask
+                )
             l_tcb = tcb_out["loss"]
 
             # [Point 2] Adaptive Gradient Dynamics (Fan 2025)
@@ -1002,10 +1073,53 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Task balancing should be stable from __init__ (6 tasks).
             scaled_total, logs = self.loss_scaler(loss_dict)
             
-            total_loss = scaled_total + phys_loss
+            # [Point 3] SOTA A-GEM Parity (2025 Hardening)
+            # Rationale: l_ref must be EXACTLY scaled by the uncertainty weight 
+            # to ensure that l_batch + l_ref = total_loss for the gradient projection.
+            w_aux = logs.get('weight/aux', 1.0)
+            l_ref = (w_aux * 0.5 * l_cga) if 'l_cga' in locals() else None
             
-            # Single Backward Pass
-            self.manual_backward(total_loss)
+            total_loss = scaled_total + phys_loss
+            l_batch = total_loss - (l_ref if l_ref is not None else 0.0)
+
+            if l_ref is not None and l_ref.grad_fn is not None:
+                # A. Ghost Pass (Reference)
+                # Protects the Clinical Memory Manifold
+                opt.zero_grad()
+                self.manual_backward(l_ref, retain_graph=True)
+                
+                # Capture Reference Gradients for the Diagnostic Path
+                # Includes: Encoder, ALB, Aux Head, ACL Projector.
+                # Excludes: Backbone (Diffusion Planner), Scheduler, Loss Scaler.
+                g_ref = {}
+                for name, p in self.named_parameters():
+                    if p.grad is not None and not any(k in name for k in ["backbone", "scheduler", "loss_scaler"]):
+                        g_ref[name] = p.grad.clone()
+                        p.grad.zero_()
+                
+                print(f"DEBUG: A-GEM Ghost Pass (GradFn: {l_ref.grad_fn}) captured {len(g_ref)} diagnostic grads")
+                
+                # B. Batch Pass
+                self.manual_backward(l_batch)
+                
+                batch_grad_count = sum(1 for name, p in self.named_parameters() if p.grad is not None and not any(k in name for k in ["backbone", "scheduler", "loss_scaler"]))
+                print(f"DEBUG: A-GEM Batch Pass (GradFn: {l_batch.grad_fn}) produced {batch_grad_count} diagnostic grads")
+                
+                # C. [SOTA] A-GEM Projection
+                with torch.no_grad():
+                    proj_count = 0
+                    for name, p in self.named_parameters():
+                        if name in g_ref and p.grad is not None:
+                            dot_prod = torch.sum(p.grad * g_ref[name])
+                            if dot_prod < 0:
+                                ref_norm_sq = torch.sum(g_ref[name] * g_ref[name]) + 1e-8
+                                p.grad.sub_(g_ref[name], alpha=dot_prod / ref_norm_sq)
+                                proj_count += 1
+                            p.grad.add_(g_ref[name])
+                    print(f"DEBUG: A-GEM Projection applied to {proj_count}/{len(g_ref)} diagnostic layers")
+            else:
+                print("DEBUG: A-GEM Fallback (Single Pass)")
+                self.manual_backward(total_loss)
             
             # [PMS] SCS: Manifold Health Monitoring
             with torch.no_grad():
@@ -1029,7 +1143,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
         else:
             # [Legacy Surgical] Multi-Pass CAGrad + GradNorm
             diff_loss_unweighted = (raw_diff_loss * weights_awr).mean()
-            primary_losses = torch.stack([diff_loss_unweighted, critic_loss, aux_loss, acl_loss])
+            primary_losses = torch.stack([
+                diff_loss_unweighted, 
+                critic_loss, 
+                aux_loss, 
+                acl_loss,
+                bgsl_loss["loss"],
+                tcb_loss["loss"]
+            ])
             gn_loss, task_weights = self.gradnorm.update(primary_losses)
             
             # 2. Weighted losses for CAGrad surgery
@@ -1125,7 +1246,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 self.loss_scaler.project_parameters()
             sch = self.lr_schedulers()
             if sch is not None:
-                sch.step()
+                if isinstance(sch, list):
+                    for s in sch: s.step()
+                else:
+                    sch.step()
             
             # GradNorm Optimizer Step (Legacy Only)
             if self.balancing_mode == "legacy_surgical":
@@ -1216,12 +1340,21 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 "awr_ess": diag["ess"],
                 "explained_var": ev,
                 "ood_score": uncertainty[:B].mean(), # [FIX] Map to local variable, slice to main batch
+                "bank_size": self.ghost_bank.size.float(),
                 "curr_phys_weight": torch.as_tensor(curr_phys_weight, device=self.device).detach().clone(),
                 "w_aux": torch.as_tensor(task_weights[2], device=self.device).detach().clone(),
                 "lr": torch.as_tensor(self.optimizers().param_groups[0]["lr"], device=self.device).detach().clone()
             }, on_step=True, on_epoch=False, prog_bar=True)
 
             # [TELEMETRY] Detailed Diagnostics (WandB Only)
+            with torch.no_grad():
+                bank_unc = self.ghost_bank.uncertainties[:self.ghost_bank.size].mean() if self.ghost_bank.size > 0 else 0.0
+                manifold_drift = 0.0
+                if self.ghost_bank.size > 0:
+                    # Drift = 1 - sim(Prototype, BatchExpertAvg)
+                    batch_expert_avg = F.normalize(global_ctx_expert[:B].mean(dim=0, keepdim=True), dim=1)
+                    manifold_drift = 1.0 - torch.matmul(batch_expert_avg, self.ghost_bank.prototype_ema.T).item()
+
             self.log_dict({
                 "train/loss_critic": self.train_loss_critic,
                 "train/loss_aux": self.train_loss_aux,
@@ -1232,6 +1365,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 "train/loss_gradnorm": self.train_loss_gradnorm,
                 "train/explained_var": self.train_explained_var,
                 "train/awr_ess": self.train_awr_ess,
+                "train/bank_avg_uncertainty": bank_unc,
+                "train/manifold_drift": manifold_drift,
                 "train/weight_diff": task_weights[0],
                 "train/weight_critic": task_weights[1],
                 "train/weight_aux": task_weights[2],
@@ -1262,6 +1397,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
         self.train_loss_critic.reset()
         self.train_loss_phys.reset()
         self.train_loss_aux.reset()
+        self.train_loss_acl.reset()
+        self.train_loss_bgsl.reset()
+        self.train_loss_tcb.reset()
+        self.train_loss_gradnorm.reset()
         self.train_awr_ess.reset()
         self.train_explained_var.reset()
 

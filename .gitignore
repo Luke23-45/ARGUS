@@ -104,7 +104,7 @@ tests/
 verify_patches.py
 
 error.md
-# verify_end_to_end_sota_v3.py
+verify_end_to_end_sota_v3.py
 icu/models/wrapper_generalist copy.py
 patches_snippit_and_plan.md
 timing_report.md
@@ -117,4 +117,5 @@ patch_report.md
 .gitignore
 ui.md
 working
+icu/models/wrapper_generalist copy 2.py
 error_1.md

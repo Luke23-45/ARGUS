@@ -293,9 +293,10 @@ class OrthogonalGuard(object):
     def sanitize_gradients(model, primary_task_name="diffusion"):
         # 1. Global Norm Check (The Explosion Detector)
         # Efficiently computes norm over all parameters
-        total_norm = torch.norm(
-            torch.stack([torch.norm(p.grad.detach(), 2) for p in model.parameters() if p.grad is not None])
-        )
+        grads = [torch.norm(p.grad.detach(), 2) for p in model.parameters() if p.grad is not None]
+        if not grads:
+            return 0.0
+        total_norm = torch.norm(torch.stack(grads))
         
         # 2. Adaptive Clipping (The Response)
         # If GN > 1.0, we don't just clip, we perform 'Soft Clamping'

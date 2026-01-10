@@ -95,7 +95,13 @@ class TemporalContrastiveBuffer(nn.Module):
         # 2. [SOTA 2025] Uniformity Regularization (Wang & Isola)
         # Penalizes collapse in the buffer.
         sample_size = min(128, self.capacity)
-        subset = self.queue[torch.randperm(self.capacity)[:sample_size]]
+        # [SOTA FIX] Deterministic Uniformity Sampling (DDP Parity)
+        # We need a generator to ensure all ranks pick the same subset
+        if not hasattr(self, '_rng'):
+             self._rng = torch.Generator(device=self.queue.device)
+             self._rng.manual_seed(42) # Fixed seed is fine for uniformity
+        
+        subset = self.queue[torch.randperm(self.capacity, generator=self._rng)[:sample_size]]
         sim_matrix = torch.matmul(subset, subset.t())
         uniformity_loss = torch.log(torch.exp(sim_matrix).mean() + 1e-6)
         
