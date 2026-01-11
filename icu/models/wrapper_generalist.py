@@ -1062,11 +1062,36 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 # Adaptive Factor: Scales D down to A's regime
                 # [v17.4 Hardened] Alpha Guard: Prevent foundation gradient collapse
                 # Floor raised to 0.15 to ensure constant clinical pressure during early training.
-                alpha = (a_ema / (d_ema + 1e-8)).clamp(0.15, 1.0)
+                # [v21.0 FIX] Inverted Gradient Dynamics
+                # Previous 'Alpha' logic suppressed the Foundation (Diff Loss) to match the Expert (Aux Loss).
+                # This caused "Foundation Collapse" and the 0.82 AUROC Wall.
+                # NEW LOGIC: We scale the EXPERT UP to match the Foundation.
+                # Result: Foundation gets full gradients (1.0), Expert gets amplified gradients (Beta).
                 
-            loss_dict['diffusion'] = diff_loss * alpha
-            loss_dict['bgsl'] = l_bgsl
-            loss_dict['tcb'] = l_tcb
+                # Beta = How much bigger is Diffusion than Aux? (e.g., 0.25 / 0.006 = ~40x)
+                # We clamp beta to prevent massive explosions in early training.
+                beta = (d_ema / (a_ema + 1e-8)).clamp(1.0, 50.0)
+                
+                # [v21.0 FIX] Proactive Gradient Cool-Down
+                # If the manifold is shocking (GN > 5.0), we throttle the Expert to preventing breaking the backbone.
+                is_shocking = (self.grad_norm_ema > 5.0)
+                cool_down = 0.5 if is_shocking else 1.0
+                
+            loss_dict['diffusion'] = diff_loss # Foundation is UNTOUCHED
+            
+            # Scale Expert Tasks UP (Beta) and Cool DOWN if shocking
+            # We apply this to all 'Expert' tasks
+            adaptive_scale = beta * cool_down
+            
+            # Update dictionary with scaled losses
+            # Note: We must update the tensor values so loss_scaler sees the scaled magnitude
+            # but we track the original 'aux_loss' in logs for readability.
+            loss_dict['aux'] = aux_loss * adaptive_scale
+            loss_dict['acl'] = acl_loss * adaptive_scale
+            loss_dict['bgsl'] = l_bgsl * adaptive_scale
+            # tcb is usually close to diffusion magnitude, so we leave it or scale slightly?
+            # Let's align tcb to diffusion too if needed, but usually it's robust.
+            loss_dict['tcb'] = l_tcb * cool_down # Just cool down, no beta need (TCB is ~5.0)
 
             # [SOTA 2025] Exclusive Uncertainty Scaling
             # phys_loss is a hard constraint (Curriculum), not aleatoric noise.
@@ -1985,6 +2010,20 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 if id(p) not in aux_param_ids
             ]
             
+            # [v24.0 SOTA] Linear Scaling Rule (Goyal et al.)
+            # Rationale: When scaling batch size (Z8=120 -> 500), we must scale LR
+            # to preserve convergence velocity.
+            # Effective Batch Size = BatchPerGPU * Devices * Accumulation
+            eff_batch_size =  self.trainer.datamodule.batch_size * self.trainer.num_devices * self.trainer.accumulate_grad_batches
+            
+            # Scaling Factor: Reference batch size 256
+            # If batch=500, scale=~2.0x. If batch=120, scale=~0.5x.
+            lr_scale = eff_batch_size / 256.0
+            
+            # Apply scaling to base LR
+            base_lr = self.cfg.train.lr * lr_scale
+            logger.info(f"✅ [Linear Scaling Rule] Effective Batch Size: {eff_batch_size}. Scaling LR by {lr_scale:.2f}x -> {base_lr:.2e}")
+
             # [PATCH 4] Reduce LR Multiplier
             # Original: 3.0x LR for aux/acl caused GN spikes to 16.9
             # Evidence: Combined with fixed weights (1.5x), effective boost was ~4.5x
@@ -1993,23 +2032,24 @@ class ICUGeneralistWrapper(pl.LightningModule):
             
             optimizer_params = [
                 # Group 1: Main Backbone (Standard LR)
-                {'params': main_model_params, 'lr': self.cfg.train.lr, 'weight_decay': self.cfg.train.weight_decay},
+                {'params': main_model_params, 'lr': base_lr, 'weight_decay': self.cfg.train.weight_decay},
                 
                 # Group 2: Aux Head (Boosted LR)
-                {'params': aux_params, 'lr': self.cfg.train.lr * aux_lr_mult, 'weight_decay': self.cfg.train.weight_decay},
+                {'params': aux_params, 'lr': base_lr * aux_lr_mult, 'weight_decay': self.cfg.train.weight_decay},
                 
                 # Group 4: ACL Projector (Boosted LR)
-                {'params': acl_params, 'lr': self.cfg.train.lr * aux_lr_mult, 'weight_decay': self.cfg.train.weight_decay},
+                {'params': acl_params, 'lr': base_lr * aux_lr_mult, 'weight_decay': self.cfg.train.weight_decay},
                 
                 # Group 5: Uncertainty Scaler (Special LR)
+                # Scaler needs to be slow and steady, usually independent of batch size scaling
                 {'params': self.loss_scaler.parameters(), 'lr': uw_lr, 'weight_decay': 0.0}
             ]
             
-            logger.info(f"Optimizer: Initialized with {len(optimizer_params)} param groups. Model LR: {self.cfg.train.lr:.2e}, Scaler LR: {uw_lr:.2e}")
+            logger.info(f"Optimizer: Initialized with {len(optimizer_params)} param groups. Model LR: {base_lr:.2e}, Scaler LR: {uw_lr:.2e}")
             
             base_optimizer = torch.optim.AdamW(
                 optimizer_params,
-                lr=self.cfg.train.lr,
+                lr=base_lr,
                 weight_decay=self.cfg.train.weight_decay,
                 betas=(0.9, 0.999),
                 fused=False

@@ -60,16 +60,11 @@ class BayesianProjectedScaler(nn.Module):
             updated_emas = self.decay * curr_emas + (1 - self.decay) * avg_losses
             self.loss_emas[indices] = updated_emas
             
-            # [PATCH 3] Fixed Clinical Priority Weights
-            # Original: Softmax priority creates zero-sum game where one task spike starves others
-            # Evidence: A dropped from 0.043 (E0) to 0.0007 (E8)
-            # Fix: Fixed weights based on clinical importance
-            # Primary tasks (aux, acl): Higher weight for sepsis detection
-            # Secondary tasks (diff, critic): Lower weight for generative quality
-            clinical_weights = torch.tensor(
-                [0.5, 0.5, 1.5, 1.5, 1.0, 1.0],  # [diff, critic, aux, acl, bgsl, tcb]
-                device=losses_tensor.device
-            )
+            # [v23.0 PATCH] Neutralized Static Weights (Freedom of Uncertainty)
+            # Rationale: "Double Scaling" (Beta + 1.5x) was causing gradient explosions (Z9 E11).
+            # Fix: Set all weights to 1.0. Let the Adaptive Beta in wrapper_generalist handle the
+            # magnitude balancing, and let Bayesian Scaler handle the noise balancing.
+            clinical_weights = torch.ones(self.num_tasks, device=losses_tensor.device)
             uw_weights = clinical_weights[indices]
         
         # 2. Bayesian Weighting (Kendall et al.)
@@ -108,12 +103,10 @@ class BayesianProjectedScaler(nn.Module):
         # 1. Standard Bayesian Boundary Projection
         self.log_vars.clamp_(min=-2.0, max=5.0)
         
-        # 2. [PRUW] Clinical Ranking Enforcement
-        # Keys: ['diffusion', 'critic', 'aux', 'acl', 'bgsl', 'tcb']
-        # indices: diff=0, aux=2, acl=3
-        diff_log_var = self.log_vars[0]
-        
-        # Sepsis tasks (aux, acl) must be at least as certain as the foundation
-        # log_var_aux <= log_var_diff
-        self.log_vars[2].clamp_(max=diff_log_var.item())
-        self.log_vars[3].clamp_(max=diff_log_var.item())
+        # 2. [v23.0 PATCH] PRUW Clamp REMOVED
+        # Rationale: The "Confidence Trap". Clamping aux_log_var <= diff_log_var forced the model
+        # to be "overconfident" about sepsis even on hard cases, leading to Manifold Shocks.
+        # Fix: Allowed the Sepsis Head to be uncertain.
+        # self.log_vars[2].clamp_(max=diff_log_var.item())  <-- DELETED
+        # self.log_vars[3].clamp_(max=diff_log_var.item())  <-- DELETED
+        pass

@@ -68,7 +68,7 @@ class EvidentialLoss(nn.Module):
     1. Negative Log Likelihood (NLL): Fit the data.
     2. KL Divergence: Regularize towards uniform distribution (vacuous prior) to prevent overconfidence.
     """
-    def __init__(self, num_classes: int = 2, annealing_step: int = 10):
+    def __init__(self, num_classes: int = 2, annealing_step: int = 25):
         super().__init__()
         self.num_classes = num_classes
         self.annealing_step = annealing_step

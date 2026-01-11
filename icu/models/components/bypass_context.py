@@ -158,14 +158,14 @@ class LateralBypass(nn.Module):
         # [v13.0 PATCH] Sparsity-Aware Projection Dimensions
         # Problem: Labs have 90%+ missing rate but got equal capacity as hemodynamics (10% missing)
         # Fix: Allocate more capacity to reliable dense features, less to sparse imputed features
-        # Data Analysis Results (from data_analysis_report.md):
-        #   - Hemodynamic (HR, SpO2, MAP): ~10-15% missing -> 40% capacity (reliable)
-        #   - Labs (Lactate, WBC, etc.): ~90-98% missing -> 20% capacity (mostly imputed)
+        # Data Analysis Results (from Architectural_Capacity_Analysis.md):
+        #   - Hemodynamic (HR, SpO2, MAP): Allocated 30% (was 40% - Overprovisioned)
+        #   - Labs (Lactate, WBC, etc.): Allocated 30% (was 20% - The "Lactate Choke")
         #   - Electrolytes: ~91-95% missing -> 15% capacity
         #   - Static/Context: 0-38% missing -> 25% capacity
-        hemo_out_dim = int(d_model * 0.4)  # 40% for dense hemodynamics
-        labs_out_dim = int(d_model * 0.2)  # 20% for sparse labs
-        elec_out_dim = int(d_model * 0.15) # 15% for sparse electrolytes
+        hemo_out_dim = int(d_model * 0.30)  # [v22.0] Balanced to 30%
+        labs_out_dim = int(d_model * 0.30)  # [v22.0] Unleashed to 30%
+        elec_out_dim = int(d_model * 0.15) # 15%
         other_out_dim = d_model - hemo_out_dim - labs_out_dim - elec_out_dim  # Remainder (~25%)
         
         self.hemo_proj = nn.Linear(hemo_dim, hemo_out_dim)

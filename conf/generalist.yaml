@@ -72,7 +72,7 @@ train:
 
   # Debug Mode (Smoke Test)
   debug_run: true
-  debug_limit_batches: 120
+  debug_limit_batches: 250
   debug_limit_val: 500
 
   
