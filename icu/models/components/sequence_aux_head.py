@@ -94,10 +94,41 @@ class EvidentialLoss(nn.Module):
         # L = sum( y * (log(S) - log(alpha)) )
         nll = torch.sum(y * (torch.log(S) - torch.log(alpha)), dim=1, keepdim=True)
         
+        # [SOTA 2026] Dynamic Class Balancing (Effective Number of Samples)
+        # We calculate weights *per batch* to handle local skew in small batches,
+        # or use global stats if available. Here we use batch-local for robustness.
+        # Logic: If batch is 492:8, we need to upweight the 8 significantly.
+        with torch.no_grad():
+             # Check if y is one-hot or indices
+             if y.shape == alpha.shape:
+                 # One-hot: sum columns to get counts
+                 class_counts = y.sum(dim=0)
+             else:
+                 # Indices: bincount
+                 class_counts = torch.bincount(y.view(-1), minlength=self.num_classes).float()
+            
+             # [SOTA] CB Loss Formula: (1 - beta) / (1 - beta^n)
+             # Beta = 0.9999 for Sepsis (very heavily imbalanced, need high sensitivity)
+             beta = 0.9999 
+             effective_num = 1.0 - torch.pow(beta, class_counts)
+             weights = (1.0 - beta) / (effective_num + 1e-8)
+             
+             # Normalize weights so they sum to num_classes (keep loss scale consistent)
+             weights = weights / weights.sum() * self.num_classes
+             
+             # Create weight tensor for current batch
+             # If y is one-hot [B, C], we need weights [1, C]
+             batch_weights = weights.unsqueeze(0)
+        
+        # Apply weights to NLL (The driving force)
+        nll = nll * (y * batch_weights).sum(dim=1, keepdim=True)
+
         # 2. KL Divergence Regularizer (Penalty for being confident but wrong)
         # Drives distribution towards uniform Dirichlet [1, 1, ...] when evidence is low/wrong.
         # annealed_weight = min(1, epoch / 10)
-        annealing_coef = min(1, max(self.epoch_num / self.annealing_step, 0))
+        # [SOTA 2026] Auto-Scaled Annealing (from Implementation Plan)
+        # We use a longer horizon (40 epochs) to prevent premature regularization.
+        annealing_coef = min(1, max(self.epoch_num / 40, 0))
         
         # KL(Dir(alpha) || Dir([1,1,...]))
         # Approximate: alpha_tilde = y + (1-y)*alpha

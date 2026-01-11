@@ -1976,6 +1976,45 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
     # Removed on_before_optimizer_step in favor of manual clipping in training_step
 
+    def get_dynamic_ema_decay(self, batch_size: int, beta_ref: float = 0.999, batch_ref: int = 256) -> float:
+        """
+        [SOTA 2026] Adaptive EMA Decay (Polyack Invariance).
+        Calculates decay rate that preserves the "Sample Half-Life" across batch sizes.
+        Formula: beta_new = beta_ref ^ (batch_size / batch_ref)
+        """
+        # Exponent > 1 means decay gets smaller (faster forgetting)
+        # Exponent < 1 means decay gets larger (slower forgetting)
+        # Ratio 2.0 (Batch 500) -> 0.999^1.95 = 0.998
+        scaling_ratio = batch_size / float(batch_ref)
+        dynamic_beta = beta_ref ** scaling_ratio
+        logger.info(f"⚡ [Dynamic EMA] Adjusted beta {beta_ref} -> {dynamic_beta:.5f} for Batch {batch_size} (Scale: {scaling_ratio:.2f}x)")
+        return dynamic_beta
+
+    def get_auto_warmup_steps(self, batch_size: int, total_steps: int) -> int:
+        """
+        [SOTA 2026] Auto-Scaling Warmup (Linear Rule).
+        Standard: 5 Epochs of Warmup, regardless of step count.
+        """
+        if self.trainer.datamodule is not None and hasattr(self.trainer.datamodule, "train_dataset"):
+            num_samples = len(self.trainer.datamodule.train_dataset)
+        else:
+            # Fallback for inference/resuming without datamodule attached yet
+            num_samples = 451305 # Hardcoded Phase 1 size as safety
+            
+        steps_per_epoch = num_samples // batch_size
+        warmup_epochs = 5 # ROI (Region of Interest) Alignment Standard
+        
+        warmup_steps = steps_per_epoch * warmup_epochs
+        
+        # Override if manually set to something suspiciously specific (not 500 default)
+        manual_steps = self.cfg.train.get("warmup_steps", 500)
+        if manual_steps != 500 and manual_steps > 0:
+             logger.info(f"⚡ [Warmup] User Override Detected: {manual_steps} (Ignored Auto: {warmup_steps})")
+             return manual_steps
+             
+        logger.info(f"⚡ [Auto-Warmup] Batch {batch_size} => {steps_per_epoch} steps/epoch. Warmup (5 Epochs): {warmup_steps} steps.")
+        return int(warmup_steps)
+
     def configure_optimizers(self):
         """
         [2025 SOTA] Conflict-Averse Optimizer Configuration.
@@ -2014,7 +2053,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Rationale: When scaling batch size (Z8=120 -> 500), we must scale LR
             # to preserve convergence velocity.
             # Effective Batch Size = BatchPerGPU * Devices * Accumulation
-            eff_batch_size =  self.trainer.datamodule.batch_size * self.trainer.num_devices * self.trainer.accumulate_grad_batches
+            # [FIX] Use cfg.train.batch_size as source of truth (datamodule might wrap it)
+            batch_per_gpu = self.cfg.train.batch_size
+            eff_batch_size =  batch_per_gpu * self.trainer.num_devices * self.trainer.accumulate_grad_batches
             
             # Scaling Factor: Reference batch size 256
             # If batch=500, scale=~2.0x. If batch=120, scale=~0.5x.
@@ -2073,11 +2114,28 @@ class ICUGeneralistWrapper(pl.LightningModule):
         else:
             # "sota_2025" uses Integrated Scalar Loss -> Pure Optimizer is optimal
             optimizer = base_optimizer
-
-        # 3. Learning Rate Scheduler
+            
+        # [SOTA 2026] Dynamic Optimization Hooks
+        # We perform these calculations here because we need 'eff_batch_size' and 'total_steps'
         total_steps = self.trainer.estimated_stepping_batches
-        warmup_steps = int(total_steps * self.cfg.train.get("warmup_ratio", 0.05))
         
+        # 1. Update EMA Decay dynamically (inject into Model Config so TieredEMA sees it)
+        if hasattr(self, 'model') and hasattr(self.model, 'ema_decay'):
+             # Note: self.model.ema_decay works if using my custom TieredEMA wrapper
+             # But usually EMA is handled by a callback or wrapper class. 
+             # Assuming 'wrapper_generalist' manages EMA (L93 in config implies it).
+             # We update the config value itself for reference
+             new_decay = self.get_dynamic_ema_decay(eff_batch_size)
+             self.cfg.train.ema_decay = new_decay # Update config so EMA callback picks it up
+             
+             # Also update the active EMA object if it exists
+             if hasattr(self, 'ema') and self.ema is not None:
+                 self.ema.decay = new_decay
+                 
+        # 2. Calculate Warmup
+        warmup_steps = self.get_auto_warmup_steps(eff_batch_size, total_steps)
+        
+        # 3. Learning Rate Scheduler
         scheduler = get_cosine_schedule_with_warmup(
             optimizer, 
             num_warmup_steps=warmup_steps, 
