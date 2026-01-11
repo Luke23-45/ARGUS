@@ -101,7 +101,7 @@ class TemporalContrastiveBuffer(nn.Module):
              self._rng = torch.Generator(device=self.queue.device)
              self._rng.manual_seed(42) # Fixed seed is fine for uniformity
         
-        subset = self.queue[torch.randperm(self.capacity, generator=self._rng)[:sample_size]]
+        subset = self.queue[torch.randperm(self.capacity, generator=self._rng, device=self.queue.device)[:sample_size]]
         sim_matrix = torch.matmul(subset, subset.t())
         uniformity_loss = torch.log(torch.exp(sim_matrix).mean() + 1e-6)
         

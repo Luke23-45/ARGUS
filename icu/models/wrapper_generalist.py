@@ -500,7 +500,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
         # [v20.0 VERIFICATION MARKER]
-        print(f"DEBUG: training_step hit (balancing_mode={self.balancing_mode})")
+        # print(f"DEBUG: training_step hit (balancing_mode={self.balancing_mode})")
         if not batch or "observed_data" not in batch:
             return
         
@@ -1082,28 +1082,40 @@ class ICUGeneralistWrapper(pl.LightningModule):
             total_loss = scaled_total + phys_loss
             l_batch = total_loss - (l_ref if l_ref is not None else 0.0)
 
+            # [SOTA FIX] Accumulation-Aware A-GEM
+            # Rationale: If accumulate_grad_batches > 1, we must preserve and restore 
+            # gradients from previous mini-batches during the A-GEM projection loop.
+            acc_batches = self.trainer.accumulate_grad_batches
+            is_accumulating = (batch_idx % acc_batches != 0)
+            accum_grads = {}
+            
+            if is_accumulating:
+                for name, p in self.named_parameters():
+                    if p.grad is not None:
+                        accum_grads[name] = p.grad.clone()
+                        p.grad.zero_()
+
             if l_ref is not None and l_ref.grad_fn is not None:
                 # A. Ghost Pass (Reference)
                 # Protects the Clinical Memory Manifold
-                opt.zero_grad()
+                # [FIX]: Use manual_backward cleanly without opt.zero_grad()
                 self.manual_backward(l_ref, retain_graph=True)
                 
-                # Capture Reference Gradients for the Diagnostic Path
-                # Includes: Encoder, ALB, Aux Head, ACL Projector.
-                # Excludes: Backbone (Diffusion Planner), Scheduler, Loss Scaler.
+                # Capture Reference Gradients...
                 g_ref = {}
                 for name, p in self.named_parameters():
+                    # [v20.1 Hardened] Include 'acl_projector' in reference path
                     if p.grad is not None and not any(k in name for k in ["backbone", "scheduler", "loss_scaler"]):
                         g_ref[name] = p.grad.clone()
                         p.grad.zero_()
                 
-                print(f"DEBUG: A-GEM Ghost Pass (GradFn: {l_ref.grad_fn}) captured {len(g_ref)} diagnostic grads")
+                # print(f"DEBUG: A-GEM Ghost Pass (GradFn: {l_ref.grad_fn}) captured {len(g_ref)} diagnostic grads")
                 
                 # B. Batch Pass
                 self.manual_backward(l_batch)
                 
                 batch_grad_count = sum(1 for name, p in self.named_parameters() if p.grad is not None and not any(k in name for k in ["backbone", "scheduler", "loss_scaler"]))
-                print(f"DEBUG: A-GEM Batch Pass (GradFn: {l_batch.grad_fn}) produced {batch_grad_count} diagnostic grads")
+                # print(f"DEBUG: A-GEM Batch Pass (GradFn: {l_batch.grad_fn}) produced {batch_grad_count} diagnostic grads")
                 
                 # C. [SOTA] A-GEM Projection
                 with torch.no_grad():
@@ -1116,10 +1128,20 @@ class ICUGeneralistWrapper(pl.LightningModule):
                                 p.grad.sub_(g_ref[name], alpha=dot_prod / ref_norm_sq)
                                 proj_count += 1
                             p.grad.add_(g_ref[name])
-                    print(f"DEBUG: A-GEM Projection applied to {proj_count}/{len(g_ref)} diagnostic layers")
+                    # print(f"DEBUG: A-GEM Projection applied to {proj_count}/{len(g_ref)} diagnostic layers")
             else:
-                print("DEBUG: A-GEM Fallback (Single Pass)")
+                # print("DEBUG: A-GEM Fallback (Single Pass)")
                 self.manual_backward(total_loss)
+
+            # [SOTA FIX] Restore Accumulated Gradients
+            if is_accumulating:
+                with torch.no_grad():
+                    for name, p in self.named_parameters():
+                        if name in accum_grads:
+                            if p.grad is None:
+                                p.grad = accum_grads[name]
+                            else:
+                                p.grad.add_(accum_grads[name])
             
             # [PMS] SCS: Manifold Health Monitoring
             with torch.no_grad():
