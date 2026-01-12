@@ -125,4 +125,9 @@ test_aux_loss.py
 test_shape_fix.py
 Professor_SOTA_Report_AEEA.md
 verify_integrity_simulation.py
+leg_generalist.py
 verify_optimization_parity.py
+plan
+icu/models_backup_z14
+Z8_Z14_Hybrid_Strategy.md
+Z8_vs_Z14_Comparison_Report.md

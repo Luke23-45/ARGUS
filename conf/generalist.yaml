@@ -45,12 +45,12 @@ model:
 # --- Training Hyperparameters ---
 train:
   phase: "phase1"
-  epochs: 100 #384
-  batch_size: 384           # [v24.0] Target SOTA Batch Size
+  epochs: 100
+  batch_size: 384           # [v20.6] Increased update frequency for classification signal
   num_workers: 2
   lr: 1.5e-4                  # [NERYVA-ALPHA] Optimal tempo for sepsis innovation
   min_lr: 1e-6
-  warmup_steps: -1      # [SOTA 2026] Set to -1 to trigger Auto-Scaling in wrapper_generalist.py
+  warmup_steps: 500
   weight_decay: 1e-4
   grad_clip: 1.0
 
@@ -61,7 +61,7 @@ train:
   log_every_n_steps: 50
   fused_optimizer: true       # [H100] Enable fused kernels 
   
-  balancing_mode: "sota_2025" # [Z12-Fix] Clamped Dynamic Balancing Active
+  balancing_mode: "sota_2025" 
   uw_lr: 0.025                # Learning rate for uncertainty weights
   
   # Phase 3: Longitudinal Foresight (Agentic Convergence)
@@ -72,7 +72,7 @@ train:
 
   # Debug Mode (Smoke Test)
   debug_run: true
-  debug_limit_batches: 150
+  debug_limit_batches: 120
   debug_limit_val: 500
 
   
@@ -90,7 +90,7 @@ train:
   awr_calibration_mode: "sample" # full for whole population scan
   awr_max_samples: 20000      # 60000 [STABILITY] Increased for Batch 2048
   
-  ema_decay: 0.999            # [SOTA 2026] Base Reference Phase. Auto-scaled in code.
+  ema_decay: 0.999
   ema_update_every: 10        # [SOTA] Staggered updates to fix I/O bottleneck
   monitor: "val/clinical_auroc"
   patience: 10

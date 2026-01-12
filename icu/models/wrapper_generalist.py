@@ -691,11 +691,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
             uncertainty = aux_out["uncertainty"][:, 0, :] if aux_out["uncertainty"].dim() == 3 else aux_out["uncertainty"]
             
             # Use detachment to compute trust factor (Cybernetic Control Gate)
-            u_avg = uncertainty.detach().mean()
-            # Trust Factor: 1.0 (Confident) -> 0.1 (Panic)
-            trust_factor = (1.0 - (u_avg * 0.9)).clamp(min=0.1, max=1.0).item()
+            # [Z9 PATCH] Disabled Trust Factor to restore Z8 dynamics
+            # Original code (caused gradient starvation):
+            # u_avg = uncertainty.detach().mean()
+            # trust_factor = (1.0 - (u_avg * 0.9)).clamp(min=0.1, max=1.0).item()
+            trust_factor = 1.0  # Always full gradient flow
             
             # Surgical Hook: Scopes gradients only for the shared connection
+            # (Now a no-op since trust_factor = 1.0, but kept for structure)
             if ctx_aux.requires_grad:
                 ctx_aux.register_hook(lambda grad: grad * trust_factor)
             
@@ -1024,23 +1027,52 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 pred_state = logits_seq[..., 1:].logsumexp(dim=-1, keepdim=True) - logits_seq[..., 0:1]
             else:
                 pred_state = logits_seq
+
+            # [v26.6 FIX] Universal Dynamic Tail Slicing (The "Iron Dome")
+            # Problem: Encoder output is T=25 (with CLS), Aux Head is T=26 (with its own CLS). This creates massive chaos.
+            # Solution: We enforce that ALL inputs to BGSL are sliced to exactly match the known ground truth length (T_obs).
+            T_obs = past.shape[1]
             
-            # [v5.1 SOTA] Surgical Signal Preservation
-            # 0.1 Smoothing: 1.0 -> 0.95, 0.0 -> 0.05
-            # Prevents Uncertainty Scaler singularity by keeping loss > 0.
+            # 1. Prediction Alignment
+            # [Fix v27.1] Do NOT overwrite pred_state here. It was calculated above (reduced or not).
+            # We ONLY need to ensure pred_state itself is sliced if it somehow exceeds T_obs.
+            if pred_state.shape[1] > T_obs:
+                 pred_state = pred_state[:, -T_obs:, :]
+            
+            # 2. Ground Truth Alignment
+            # true_state is expanded from [B, 1, 1] to match ctx_expert [B, T=25, 1]. We must slice it back to T_obs.
             ls_alpha = 0.1
             true_state_binary = (batch["phase_label"] > 0).float()
             smoothed_target = true_state_binary * (1 - ls_alpha) + (ls_alpha / 2)
-            true_state = smoothed_target.view(B, 1, 1).expand(-1, ctx_expert.size(1), 1)
+            true_state = smoothed_target.view(B, 1, 1).expand(-1, ctx_expert.size(1), 1) # Original true_state
+            
+            if true_state.shape[1] > T_obs:
+                 true_state_bgsl = true_state[:, -T_obs:, :]
+            else:
+                 true_state_bgsl = true_state
+                 
+            # 3. Mask Alignment
+            # mask comes from ctx_mask which includes CLS tokens.
+            mask_bgsl = ctx_mask # Original ctx_mask
+            if ctx_mask is not None and ctx_mask.shape[1] > T_obs:
+                 mask_bgsl = ctx_mask[:, -T_obs:]
+            
+            # 4. Risk Coef Alignment
+            risk_coef_bgsl = risk_coef.view(B, 1, 1).expand(-1, T_obs, 1) # Force expand to correct shape directly
             
             # [v17.4] Surgical Forensic Fix: BGSL restricted to real batch [0:B]
             # Rationale: BGSL computes physical slopes which are not available for Ghosts.
+            # Note: We slice [:, 1:] inside BGSL or here?
+            # BGSL expects full sequence and does derivative internally. BUT we must ensure T is consistent.
+            # If we pass T=24, BGSL will compute T=23 derivatives.
+            # Previously we passed [:, 1:]. Let's stick to standard practice: Pass FULL aligned sequence (T=24).
+            
             bgsl_out = self.bgsl_loss(
-                pred_state[:B, 1:], # [B, T, 1]
-                true_state[:, 1:],  # [B, T, 1]
-                past,               # [B, T, D] (Original batch)
-                risk_coef=risk_coef.view(B, 1, 1), 
-                mask=ctx_mask[:B, 1:] # [B, T]
+                pred_state[:B],       # [B, T=24, 1]
+                true_state_bgsl[:B],  # [B, T=24, 1]
+                past,                 # [B, T=24, D] (Original batch)
+                risk_coef=risk_coef_bgsl[:B], 
+                mask=mask_bgsl[:B]    # [B, T=24]
             )
             l_bgsl = bgsl_out["loss"]
             
@@ -1101,13 +1133,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 # Result: Foundation gets full gradients (1.0), Expert gets amplified gradients (Beta).
                 
                 # Beta = How much bigger is Diffusion than Aux? (e.g., 0.25 / 0.006 = ~40x)
-                # We clamp beta to prevent massive explosions in early training.
-                beta = (d_ema / (a_ema + 1e-8)).clamp(1.0, 50.0)
+                # [v31.0 Z14 FIX] Operation Unclamped
+                # We relax the clamp from 50.0 to 100.0 to allow full Expert Expression.
+                beta = (d_ema / (a_ema + 1e-8)).clamp(1.0, 100.0)
                 
-                # [v21.0 FIX] Proactive Gradient Cool-Down
-                # If the manifold is shocking (GN > 5.0), we throttle the Expert to preventing breaking the backbone.
-                is_shocking = (self.grad_norm_ema > 5.0)
-                cool_down = 0.5 if is_shocking else 1.0
+                # [v31.0 Z14 FIX] Removed Proactive Gradient Cool-Down
+                # Rationale: Throttling shocks prevents learning critical sepsis onsets.
+                # We rely on Global Gradient Clipping (Iron Dome) for safety.
+                cool_down = 1.0 
                 
             loss_dict['diffusion'] = diff_loss # Foundation is UNTOUCHED
             

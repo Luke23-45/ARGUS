@@ -125,7 +125,6 @@ class SepsisGhostBank(nn.Module):
         return int(lvp_idx)
 
     @torch.no_grad()
-    @torch.no_grad()
     def update(
         self, 
         vitals: torch.Tensor, 
