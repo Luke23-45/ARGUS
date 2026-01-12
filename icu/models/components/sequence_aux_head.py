@@ -380,8 +380,9 @@ class SequenceAuxHead(nn.Module):
         
         # 4. Predict
         if return_sequence:
-            seq_out = x_seq[:, 1:, :] 
-            logits = self.head(seq_out)
+            # [v25.7 SOTA FIX] Return full sequence including CLS token at index 0
+            # This allows unified one-pass execution in the training loop.
+            logits = self.head(x_seq)
         else:
             cls_out = x_seq[:, 0, :]
             logits = self.head(cls_out)

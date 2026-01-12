@@ -718,17 +718,23 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # [FIX] Define targets before evidential forward pass
             targets = batch["phase_label"] # [B]
 
-            # Forward pass to get current competence (Uncertainty)
+            # [v25.7 SOTA FIX] Unified Sequence-Aware Forward Pass
+            # Rationale: One pass with return_sequence=True provides both CLS and Sequence risk.
+            # This eliminates redundant activation memory in the 15GB VRAM limit.
             aux_out = self.model.aux_head(
                 ctx_aux, 
                 mask=ctx_mask, 
                 targets=targets_expanded, # [v17.3 FIX] Use expanded targets for [B+G] context
-                samples_seen=self.total_samples_seen, # [v25.0 AEEA] Dynamic Annealing context
-                epoch_num=self.current_epoch 
+                samples_seen=int(self.total_samples_seen), # [v25.0 AEEA] Dynamic Annealing context
+                epoch_num=self.current_epoch,
+                return_sequence=True # Always return sequence for downstream BGSL
             )
-            logits = aux_out["logits"]
+            logits_seq_full = aux_out["logits"]
+            # Extract CLS logits (index 0) from the sequence for standard diagnostic loss
+            logits = logits_seq_full[:, 0, :] if logits_seq_full.dim() == 3 else logits_seq_full
+            
             aux_loss_base = aux_out["loss"]
-            uncertainty = aux_out["uncertainty"] # [B, 1]
+            uncertainty = aux_out["uncertainty"][:, 0, :] if aux_out["uncertainty"].dim() == 3 else aux_out["uncertainty"]
             
             # Use detachment to compute trust factor (Cybernetic Control Gate)
             u_avg = uncertainty.detach().mean()
@@ -1045,15 +1051,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # However, for now, let's assume we use the window-level logits for state loss
             # and potentially expand SequenceAuxHead if we want sequence-level risk.
             
-            # [v5.2] Manifold Sync: Use the SOTA SequenceAuxHead for BGSL supervision
-            # We call the aux_head with return_sequence=True to get [B, T, C]
-            # [v25.6] Pass samples_seen for Batch-Invariant AEEA
-            aux_seq_out = self.model.aux_head(
-                ctx_expert, 
-                return_sequence=True, 
-                samples_seen=int(self.total_samples_seen)
-            )
-            logits_seq = aux_seq_out["logits"]
+            # [v25.7 SOTA FIX] Reusing Unified Sequence Results
+            # No redundant forward pass; eliminates OOM on 15GB hardware.
+            # logits_seq_full contains [CLS, T1, T2, ...]
+            # logits_seq should contain only [T1, T2, ...] for BGSL/Supervision
+            logits_seq = logits_seq_full[:, 1:, :]
             
             if logits_seq.shape[-1] > 1:
                 # [SOTA Alignment] Convert multi-class logits to a single "Sepsis Risk" logit
@@ -1184,8 +1186,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
             accum_grads_vec = None
             
             if is_accumulating:
-                # [v25.5] Vectorized Accumulation Backup
-                accum_grads_vec = self._get_vectorized_grads()
+                # [v25.7 SOTA FIX] Filter Backbone Backup
+                # Rationale: Cloning the entire backbone grads consumes ~1.5GB of VRAM.
+                # A-GEM only projects diagnostic heads, so backbone backup is redundant.
+                # [v25.8 AUDIT FIX] Added 'encoder' to filter keys to catch all foundation components.
+                filter_keys = ["backbone", "encoder", "scheduler", "loss_scaler"]
+                accum_grads_vec = self._get_vectorized_grads(filter_keys=filter_keys)
                 if accum_grads_vec is not None:
                     self.zero_grad(set_to_none=False)
 
@@ -1220,15 +1226,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
             else:
                 self.manual_backward(total_loss)
 
-            # [SOTA v25.5] Restore Accumulated Gradients
+            # [SOTA v25.7] Restore Accumulated Gradients (Filtered)
             if is_accumulating and accum_grads_vec is not None:
                 with torch.no_grad():
-                    curr_grads_vec = self._get_vectorized_grads()
+                    filter_keys = ["backbone", "encoder", "scheduler", "loss_scaler"]
+                    curr_grads_vec = self._get_vectorized_grads(filter_keys=filter_keys)
                     if curr_grads_vec is not None:
                         # Vectorized Restore (Zero Allocation)
-                        self._set_vectorized_grads(curr_grads_vec + accum_grads_vec)
+                        self._set_vectorized_grads(curr_grads_vec + accum_grads_vec, filter_keys=filter_keys)
                     else:
-                        self._set_vectorized_grads(accum_grads_vec)
+                        self._set_vectorized_grads(accum_grads_vec, filter_keys=filter_keys)
             
             # [PMS] SCS: Manifold Health Monitoring
             with torch.no_grad():

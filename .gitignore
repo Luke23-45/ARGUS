@@ -99,7 +99,7 @@ legacy
 tests/
 
 
-# sepsis_clinical_28
+sepsis_clinical_28
 
 verify_patches.py
 
@@ -123,3 +123,4 @@ Z11_Analysis_Report.md
 Prof_Sepsis_ZeroTrust_Report.md
 Professor_SOTA_Report_AEEA.md
 verify_optimization_parity.py
+verify_integrity_simulation.py

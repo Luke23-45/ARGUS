@@ -146,13 +146,16 @@ class SepsisGhostBank(nn.Module):
         B_orig = vitals.shape[0]
         if B_orig == 0: return
 
-        # Intra-Batch Redundancy Filtering (SOTA v25.6)
+        # Intra-Batch Redundancy Filtering (SOTA v25.7 Precision Guard)
         # Prevents filling the bank with identical samples from the same batch
         with torch.no_grad():
-            norm_b = F.normalize(latents, dim=1)
-            b_self_sim = torch.matmul(norm_b, norm_b.T)
-            # Mask out identity diagonal
-            b_self_sim.fill_diagonal_(0)
+            with torch.cuda.amp.autocast(enabled=False):
+                norm_b = F.normalize(latents, dim=1).half()
+                b_self_sim = torch.matmul(norm_b, norm_b.T)
+                # Mask out identity diagonal
+                b_self_sim.fill_diagonal_(0)
+                # Convert back for indexing
+                b_self_sim = b_self_sim.float()
             # Find samples that are too similar to earlier ones in the same batch
             keep_mask = torch.ones(B_orig, dtype=torch.bool, device=vitals.device)
             for i in range(B_orig):
@@ -185,12 +188,16 @@ class SepsisGhostBank(nn.Module):
             if self.size == self.capacity: self.is_full.fill_(True)
             return
 
-        # 3. Vectorized Similarity Check
-        norm_new = F.normalize(latents, dim=1)
-        norm_old = F.normalize(self.latent_anchors[:self.size], dim=1)
-        # Similarity Matrix [B, Size]
-        sim_matrix = torch.matmul(norm_new, norm_old.T)
-        max_sim, twin_idx = sim_matrix.max(dim=1)
+        # 3. Vectorized Similarity Check (v25.7 Precision Guard)
+        # Using .half() for the similarity matrix reduces peak VRAM by 50% for this op.
+        with torch.cuda.amp.autocast(enabled=False):
+            norm_new = F.normalize(latents, dim=1).half()
+            norm_old = F.normalize(self.latent_anchors[:self.size], dim=1).half()
+            # Similarity Matrix [B, Size] in FP16
+            sim_matrix = torch.matmul(norm_new, norm_old.T)
+            max_sim, twin_idx = sim_matrix.max(dim=1)
+            # Convert back to float for stable logical ops
+            max_sim = max_sim.float()
         
         # Criteria A: Informative Replacement (Redundant but harder)
         is_redundant = max_sim > self.similarity_threshold
@@ -232,10 +239,11 @@ class SepsisGhostBank(nn.Module):
             # Replace LVPs if bank is full
             num_lvp = num_div - num_fill
             if num_lvp > 0 and self.is_full:
-                # SOTA: Batched LVP Selection
-                lat_all = F.normalize(self.latent_anchors[:self.size], dim=1)
-                K = torch.matmul(lat_all, lat_all.T)
-                redundancy = (K ** 2).sum(dim=1) - 1.0
+                # SOTA: Batched LVP Selection (v25.7 Precision Guard)
+                with torch.cuda.amp.autocast(enabled=False):
+                    lat_all = F.normalize(self.latent_anchors[:self.size], dim=1).half()
+                    K = torch.matmul(lat_all, lat_all.T)
+                    redundancy = (K.float() ** 2).sum(dim=1) - 1.0
                 unc = self.uncertainties[:self.size].flatten()
                 lvp_scores = redundancy / (unc + 1e-6)
                 

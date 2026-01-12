@@ -126,9 +126,12 @@ class BGSLLoss(nn.Module):
         
         if mask is not None:
             slope_mask = mask[:, 1:] | mask[:, :-1] # Union of masks
-            l_trend = (l_trend_unreduced * surprise * (~slope_mask).unsqueeze(-1)).sum() / ((~slope_mask).sum() + 1e-8)
+            # [v25.8 FIX] Shape Alignment for Trend Loss
+            # pred_slopes is [T-2] (Delta 1->2). surprise is [T-1] (Delta 0->1, 1->2...).
+            # We must slice surprise to match the predictive window (1->2 onwards).
+            l_trend = (l_trend_unreduced * surprise[:, 1:] * (~slope_mask).unsqueeze(-1)).sum() / ((~slope_mask).sum() + 1e-8)
         else:
-            l_trend = (l_trend_unreduced * surprise).mean()
+            l_trend = (l_trend_unreduced * surprise[:, 1:]).mean()
         
         # Shock: Acceleration
         # [Fix] Safe Division for num_shock
@@ -139,11 +142,15 @@ class BGSLLoss(nn.Module):
         true_accel = (true_slopes[:, 1:] - true_slopes[:, :-1]).abs()
         l_shock_unreduced = F.mse_loss(pred_accel, true_accel, reduction='none')
         
+        # [v25.8 FIX] Shape Alignment for Shock Loss
+        # pred_accel is [T-3]. num_shock is [T-2].
+        # Align physical shock to predictive window.
         if mask is not None:
-            accel_mask = mask[:, 2:] | mask[:, 1:-1] | mask[:, :-2]
-            l_shock = (l_shock_unreduced * num_shock.detach() * (~accel_mask).unsqueeze(-1)).sum() / ((~accel_mask).sum() + 1e-8)
+            # Mask for acceleration (union of 3 steps)
+            accel_mask = slope_mask[:, 1:] | slope_mask[:, :-1]
+            l_shock = (l_shock_unreduced * num_shock[:, 1:] * (~accel_mask).unsqueeze(-1)).sum() / ((~accel_mask).sum() + 1e-8)
         else:
-            l_shock = (l_shock_unreduced * num_shock.detach()).mean()
+            l_shock = (l_shock_unreduced * num_shock[:, 1:]).mean()
         
         # Constant Physics Supervision
         if self.training:
