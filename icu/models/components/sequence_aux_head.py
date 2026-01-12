@@ -116,6 +116,12 @@ class EvidentialLoss(nn.Module):
              # Normalize weights so they sum to num_classes (keep loss scale consistent)
              weights = weights / weights.sum() * self.num_classes
              
+             # [SAFETY CLAMP] Prevent Weight Explosion (Panic Mode Fix)
+             # Z12 Analysis: Unclamped weights caused Recall->1.0 / Precision->0.0 crash.
+             # We clamp the max boost to 10.0x to ensure gradient stability.
+             weights = torch.clamp(weights, max=10.0)
+
+             
              # Create weight tensor for current batch
              # If y is one-hot [B, C], we need weights [1, C]
              batch_weights = weights.unsqueeze(0)
@@ -126,9 +132,10 @@ class EvidentialLoss(nn.Module):
         # 2. KL Divergence Regularizer (Penalty for being confident but wrong)
         # Drives distribution towards uniform Dirichlet [1, 1, ...] when evidence is low/wrong.
         # annealed_weight = min(1, epoch / 10)
-        # [SOTA 2026] Auto-Scaled Annealing (from Implementation Plan)
-        # We use a longer horizon (40 epochs) to prevent premature regularization.
-        annealing_coef = min(1, max(self.epoch_num / 40, 0))
+        # [SOTA 2026] Auto-Scaled Annealing (Accelerated)
+        # Z12 Analysis: Convergence happens at Epoch 5. Waiting for Epoch 40 leaves the model
+        # defenseless against overconfidence. We accelerate to 10 epochs.
+        annealing_coef = min(1, max(self.epoch_num / self.annealing_step, 0))
         
         # KL(Dir(alpha) || Dir([1,1,...]))
         # Approximate: alpha_tilde = y + (1-y)*alpha

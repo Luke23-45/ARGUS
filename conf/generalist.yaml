@@ -46,7 +46,7 @@ model:
 train:
   phase: "phase1"
   epochs: 100
-  batch_size: 384           # [v20.6] Increased update frequency for classification signal
+  batch_size: 500           # [v24.0] Target SOTA Batch Size
   num_workers: 2
   lr: 1.5e-4                  # [NERYVA-ALPHA] Optimal tempo for sepsis innovation
   min_lr: 1e-6
@@ -61,7 +61,7 @@ train:
   log_every_n_steps: 50
   fused_optimizer: true       # [H100] Enable fused kernels 
   
-  balancing_mode: "sota_2025" 
+  balancing_mode: "sota_2025" # [Z12-Fix] Clamped Dynamic Balancing Active
   uw_lr: 0.025                # Learning rate for uncertainty weights
   
   # Phase 3: Longitudinal Foresight (Agentic Convergence)
