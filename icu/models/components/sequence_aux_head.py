@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Dict
+import math
 
 class AsymmetricLoss(nn.Module):
     """
@@ -74,7 +75,22 @@ class EvidentialLoss(nn.Module):
         self.annealing_step = annealing_step
         self.epoch_num = 0
 
-    def forward(self, alpha: torch.Tensor, y: torch.Tensor, epoch_num: int = None) -> torch.Tensor:
+    def get_decisiveness(self, alpha: torch.Tensor) -> torch.Tensor:
+        """
+        [SOTA 2026] Predictive Categorical Decisiveness.
+        Calculates normalized confidence from the expected probability distribution.
+        Returns: [1.0] for high confidence (delta), [0.0] for zero confidence (uniform).
+        """
+        # A = Expected probability distribution from Dirichlet(alpha)
+        p = alpha / alpha.sum(dim=-1, keepdim=True)
+        # Shannon Entropy H(p)
+        entropy = -torch.sum(p * torch.log(p + 1e-10), dim=-1)
+        # Normalized against maximum entropy log(K)
+        max_entropy = math.log(self.num_classes)
+        # Decisiveness = 1 - (Entropy / MaxEntropy)
+        return (1.0 - (entropy / (max_entropy + 1e-10))).mean()
+
+    def forward(self, alpha: torch.Tensor, y: torch.Tensor, epoch_num: int = None, samples_seen: int = None) -> torch.Tensor:
         """
         alpha: [B, C] Dirichlet concentration parameters (alpha = evidence + 1)
         y: [B, C] One-hot target labels
@@ -131,11 +147,22 @@ class EvidentialLoss(nn.Module):
 
         # 2. KL Divergence Regularizer (Penalty for being confident but wrong)
         # Drives distribution towards uniform Dirichlet [1, 1, ...] when evidence is low/wrong.
-        # annealed_weight = min(1, epoch / 10)
-        # [SOTA 2026] Auto-Scaled Annealing (Accelerated)
-        # Z12 Analysis: Convergence happens at Epoch 5. Waiting for Epoch 40 leaves the model
-        # defenseless against overconfidence. We accelerate to 10 epochs.
-        annealing_coef = min(1, max(self.epoch_num / self.annealing_step, 0))
+        
+        # [SOTA 2026] Adaptive Evidence-Entropy Annealing (AEEA)
+        # Decouples defense from fixed timers and makes it sensitive to the model's 'Arrogance'.
+        # Vector 1: Sample-Invariant Temporal Ramp (Batch-size independent)
+        # Rationale: 150,000 samples = 10 epochs at batch 150.
+        if samples_seen is not None:
+            time_idx = float(samples_seen) / 150000.0
+        else:
+            time_idx = self.epoch_num / self.annealing_step
+            
+        # Vector 2: State-Adaptive "Decisiveness" (Clinical Guard)
+        # Detects overconfidence in real-time and applies the penalty immediately.
+        state_idx = self.get_decisiveness(alpha)
+        
+        # Max-Defense: The barrier is only as weak as the model's humility.
+        annealing_coef = torch.max(torch.tensor(time_idx, device=alpha.device), state_idx).clamp(0, 1)
         
         # KL(Dir(alpha) || Dir([1,1,...]))
         # Approximate: alpha_tilde = y + (1-y)*alpha
@@ -329,7 +356,7 @@ class SequenceAuxHead(nn.Module):
         # Critical for safety when inputs are 90% imputed.
         self.criterion = EvidentialLoss(num_classes=num_classes, annealing_step=10)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, targets: Optional[torch.Tensor] = None, epoch_num: int = None, return_sequence: bool = False) -> Dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, targets: Optional[torch.Tensor] = None, epoch_num: int = None, samples_seen: int = None, return_sequence: bool = False) -> Dict[str, torch.Tensor]:
         """
         [SOTA 2025] Evidential Forward Pass.
         Returns:
@@ -383,7 +410,7 @@ class SequenceAuxHead(nn.Module):
             # [v14.0 PATCH] Use Evidential Loss on alphas
             # We pass 'alpha' (Dirichlet params) instead of 'logits'
             # Note: The loss needs the current epoch for KL annealing. 
-            loss = self.criterion(alpha, targets_oh, epoch_num=epoch_num)
+            loss = self.criterion(alpha, targets_oh, epoch_num=epoch_num, samples_seen=samples_seen)
             
         return {
             "logits": logits,

@@ -426,6 +426,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
         self.register_buffer("_awr_stats_initialized", torch.tensor(False))
         self.validation_step_outputs = []
         
+        # [v25.6 SOTA] Batch-Invariant Sample Counter
+        # Ensures that AEEA annealing is exactly calibrated across any batch size.
+        self.register_buffer("total_samples_seen", torch.tensor(0, dtype=torch.long))
+        
         # [Point 5] Bayesian Moving Average Calibration
         # Initialized to 0.5; will be updated via F2-opt during validation.
         self.register_buffer("calibrated_threshold", torch.tensor(0.5))
@@ -442,6 +446,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # Flattened size based on encoder hidden dim (e.g., 512, 1024)
         # We will initialize this lazily in training_step
         self._fnd_grad_ema = None 
+
+        # [v25.0 AEEA] Persistent Clinical History Counter
+        # Dekouples learning from epochs to ensure batch-invariance.
+        self.register_buffer("total_samples_seen", torch.tensor(0, dtype=torch.long))
 
     def on_train_epoch_start(self):
         """[Phase 3/4] Update AWR Horizon and SOTA v4.2 Warmup."""
@@ -494,6 +502,57 @@ class ICUGeneralistWrapper(pl.LightningModule):
         """
         return self.model(batch)
 
+    # =====================================================================
+    # [v25.5] HIGH-THROUGHPUT OPTIMIZATION UTILITIES
+    # =====================================================================
+    def _get_vectorized_grads(self, filter_keys=None):
+        """
+        [v25.6 Hardened] Vectorized Gradient Capture.
+        Uses 'requires_grad' as the anchor to ensure pointer stability.
+        If a gradient is None, it is treated as a zero-tensor placeholder.
+        """
+        grads = []
+        for name, p in self.named_parameters():
+            if p.requires_grad:
+                if filter_keys and any(k in name for k in filter_keys):
+                    continue
+                if p.grad is not None:
+                    grads.append(p.grad.view(-1))
+                else:
+                    grads.append(torch.zeros_like(p).view(-1))
+        return torch.cat(grads) if grads else None
+
+    def _set_vectorized_grads(self, grad_vec, filter_keys=None):
+        """
+        [v25.6 Hardened] Vectorized Gradient Restoration.
+        Ensures bit-identical mapping back to parameters.
+        """
+        if grad_vec is None: return
+        ptr = 0
+        for name, p in self.named_parameters():
+            if p.requires_grad:
+                if filter_keys and any(k in name for k in filter_keys):
+                    continue
+                numel = p.numel()
+                if p.grad is not None:
+                    p.grad.copy_(grad_vec[ptr:ptr + numel].view_as(p.grad))
+                else:
+                    # Initialize grad if it was None during capture
+                    p.grad = grad_vec[ptr:ptr + numel].view_as(p).clone()
+                ptr += numel
+
+    def _project_agem_vectorized(self, grads_new, grads_ref):
+        """
+        SOTA: A-GEM Projection in 1D Space.
+        Formula: g = g_new - ( (g_new . g_ref) / (g_ref . g_ref) ) * g_ref
+        Only applies if dot(g_new, g_ref) < 0.
+        """
+        dot_prod = torch.dot(grads_new, grads_ref)
+        if dot_prod < 0:
+            ref_mag = torch.dot(grads_ref, grads_ref) + 1e-8
+            grads_new = grads_new - grads_ref * (dot_prod / ref_mag)
+        return grads_new
+
     # =========================================================================
     # SOTA TRAINING LOGIC (The "Heart")
     # =========================================================================
@@ -506,6 +565,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
         
         opt = self.optimizers()
         B = batch["observed_data"].size(0)
+        
+        # [v25.0 AEEA] Atomic Clinical Clock Increment
+        # This ensuring regularization maturaty is tied to data volume, not wall-time.
+        self.total_samples_seen += B
         
         # [v17.3] Omega Summoning: Constant Clinical Pressure
         # Select 4 ghosts using a rank-agnostic global seed for DDP synchronization.
@@ -660,6 +723,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 ctx_aux, 
                 mask=ctx_mask, 
                 targets=targets_expanded, # [v17.3 FIX] Use expanded targets for [B+G] context
+                samples_seen=self.total_samples_seen, # [v25.0 AEEA] Dynamic Annealing context
                 epoch_num=self.current_epoch 
             )
             logits = aux_out["logits"]
@@ -983,7 +1047,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
             
             # [v5.2] Manifold Sync: Use the SOTA SequenceAuxHead for BGSL supervision
             # We call the aux_head with return_sequence=True to get [B, T, C]
-            aux_seq_out = self.model.aux_head(ctx_expert, return_sequence=True)
+            # [v25.6] Pass samples_seen for Batch-Invariant AEEA
+            aux_seq_out = self.model.aux_head(
+                ctx_expert, 
+                return_sequence=True, 
+                samples_seen=int(self.total_samples_seen)
+            )
             logits_seq = aux_seq_out["logits"]
             
             if logits_seq.shape[-1] > 1:
@@ -1112,61 +1181,54 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # gradients from previous mini-batches during the A-GEM projection loop.
             acc_batches = self.trainer.accumulate_grad_batches
             is_accumulating = (batch_idx % acc_batches != 0)
-            accum_grads = {}
+            accum_grads_vec = None
             
             if is_accumulating:
-                for name, p in self.named_parameters():
-                    if p.grad is not None:
-                        accum_grads[name] = p.grad.clone()
-                        p.grad.zero_()
+                # [v25.5] Vectorized Accumulation Backup
+                accum_grads_vec = self._get_vectorized_grads()
+                if accum_grads_vec is not None:
+                    self.zero_grad(set_to_none=False)
 
             if l_ref is not None and l_ref.grad_fn is not None:
                 # A. Ghost Pass (Reference)
                 # Protects the Clinical Memory Manifold
-                # [FIX]: Use manual_backward cleanly without opt.zero_grad()
                 self.manual_backward(l_ref, retain_graph=True)
                 
-                # Capture Reference Gradients...
-                g_ref = {}
-                for name, p in self.named_parameters():
-                    # [v20.1 Hardened] Include 'acl_projector' in reference path
-                    if p.grad is not None and not any(k in name for k in ["backbone", "scheduler", "loss_scaler"]):
-                        g_ref[name] = p.grad.clone()
-                        p.grad.zero_()
+                # [v25.5] Vectorized Reference Capture
+                filter_keys = ["backbone", "scheduler", "loss_scaler"]
+                g_ref_vec = self._get_vectorized_grads(filter_keys=filter_keys)
                 
-                # print(f"DEBUG: A-GEM Ghost Pass (GradFn: {l_ref.grad_fn}) captured {len(g_ref)} diagnostic grads")
+                # Zero out projected grads for the batch pass, leave backbone grads
+                if g_ref_vec is not None:
+                    for name, p in self.named_parameters():
+                        if p.grad is not None and not any(k in name for k in filter_keys):
+                            p.grad.zero_()
                 
                 # B. Batch Pass
                 self.manual_backward(l_batch)
                 
-                batch_grad_count = sum(1 for name, p in self.named_parameters() if p.grad is not None and not any(k in name for k in ["backbone", "scheduler", "loss_scaler"]))
-                # print(f"DEBUG: A-GEM Batch Pass (GradFn: {l_batch.grad_fn}) produced {batch_grad_count} diagnostic grads")
-                
-                # C. [SOTA] A-GEM Projection
+                # C. [SOTA v25.5] Vectorized A-GEM Projection
                 with torch.no_grad():
-                    proj_count = 0
-                    for name, p in self.named_parameters():
-                        if name in g_ref and p.grad is not None:
-                            dot_prod = torch.sum(p.grad * g_ref[name])
-                            if dot_prod < 0:
-                                ref_norm_sq = torch.sum(g_ref[name] * g_ref[name]) + 1e-8
-                                p.grad.sub_(g_ref[name], alpha=dot_prod / ref_norm_sq)
-                                proj_count += 1
-                            p.grad.add_(g_ref[name])
-                    # print(f"DEBUG: A-GEM Projection applied to {proj_count}/{len(g_ref)} diagnostic layers")
+                    g_batch_vec = self._get_vectorized_grads(filter_keys=filter_keys)
+                    if g_batch_vec is not None and g_ref_vec is not None:
+                        # 1. Project Batch Grads onto Reference
+                        g_batch_projected = self._project_agem_vectorized(g_batch_vec, g_ref_vec)
+                        # 2. Add Reference Gradients back
+                        g_total = g_batch_projected + g_ref_vec
+                        # 3. Restore to parameters
+                        self._set_vectorized_grads(g_total, filter_keys=filter_keys)
             else:
-                # print("DEBUG: A-GEM Fallback (Single Pass)")
                 self.manual_backward(total_loss)
 
-            # [SOTA FIX] Restore Accumulated Gradients
-            if is_accumulating:
+            # [SOTA v25.5] Restore Accumulated Gradients
+            if is_accumulating and accum_grads_vec is not None:
                 with torch.no_grad():
-                    for name, p in self.named_parameters():
-                        if name in accum_grads:
-                            if p.grad is None:
-                                p.grad = accum_grads[name]
-                            else:
-                                p.grad.add_(accum_grads[name])
+                    curr_grads_vec = self._get_vectorized_grads()
+                    if curr_grads_vec is not None:
+                        # Vectorized Restore (Zero Allocation)
+                        self._set_vectorized_grads(curr_grads_vec + accum_grads_vec)
+                    else:
+                        self._set_vectorized_grads(accum_grads_vec)
             
             # [PMS] SCS: Manifold Health Monitoring
             with torch.no_grad():

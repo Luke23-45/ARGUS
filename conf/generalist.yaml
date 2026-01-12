@@ -45,8 +45,8 @@ model:
 # --- Training Hyperparameters ---
 train:
   phase: "phase1"
-  epochs: 100
-  batch_size: 500           # [v24.0] Target SOTA Batch Size
+  epochs: 100 #384
+  batch_size: 384           # [v24.0] Target SOTA Batch Size
   num_workers: 2
   lr: 1.5e-4                  # [NERYVA-ALPHA] Optimal tempo for sepsis innovation
   min_lr: 1e-6

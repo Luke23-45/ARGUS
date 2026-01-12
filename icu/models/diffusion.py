@@ -1259,7 +1259,8 @@ class ICUUnifiedPlanner(nn.Module):
                 aux_out = self.aux_head(
                     out_alb["ctx_expert"], 
                     mask=ctx_mask, 
-                    targets=batch["phase_label"].long()
+                    targets=batch["phase_label"].long(),
+                    samples_seen=batch.get("samples_seen", None)
                 )
                 logits = aux_out["logits"]
                 aux_loss = aux_out["loss"]

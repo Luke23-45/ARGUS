@@ -125,6 +125,7 @@ class SepsisGhostBank(nn.Module):
         return int(lvp_idx)
 
     @torch.no_grad()
+    @torch.no_grad()
     def update(
         self, 
         vitals: torch.Tensor, 
@@ -135,75 +136,116 @@ class SepsisGhostBank(nn.Module):
         active_mask: Optional[torch.Tensor] = None
     ):
         """
-        DAB+: Selective Prototypical Update.
+        [v25.5 SOTA] Vectorized Diversity-Aware Update.
+        Eliminates the O(B) loop for massive throughput gains.
         """
         if active_mask is not None:
-            vitals = vitals[active_mask]
-            masks = masks[active_mask]
-            labels = labels[active_mask]
-            latents = latents[active_mask]
-            if uncertainties is not None:
-                uncertainties = uncertainties[active_mask]
+            vitals, masks, labels, latents = vitals[active_mask], masks[active_mask], labels[active_mask], latents[active_mask]
+            if uncertainties is not None: uncertainties = uncertainties[active_mask]
         
-        if vitals.shape[0] == 0:
-            return
+        B_orig = vitals.shape[0]
+        if B_orig == 0: return
+
+        # Intra-Batch Redundancy Filtering (SOTA v25.6)
+        # Prevents filling the bank with identical samples from the same batch
+        with torch.no_grad():
+            norm_b = F.normalize(latents, dim=1)
+            b_self_sim = torch.matmul(norm_b, norm_b.T)
+            # Mask out identity diagonal
+            b_self_sim.fill_diagonal_(0)
+            # Find samples that are too similar to earlier ones in the same batch
+            keep_mask = torch.ones(B_orig, dtype=torch.bool, device=vitals.device)
+            for i in range(B_orig):
+                if keep_mask[i]:
+                    # If any subsequent sample is too similar, mask it out
+                    too_similar = b_self_sim[i, i+1:] > 0.99
+                    if too_similar.any():
+                        keep_mask[i+1:][too_similar] = False
+            
+            vitals, masks, labels, latents = vitals[keep_mask], masks[keep_mask], labels[keep_mask], latents[keep_mask]
+            if uncertainties is not None: uncertainties = uncertainties[keep_mask]
+            B = vitals.shape[0]
 
         if uncertainties is None:
-            uncertainties = torch.zeros(vitals.shape[0], 1, device=vitals.device)
+            uncertainties = torch.zeros(B, 1, device=vitals.device)
 
-        # Update global prototype with new incoming signal
+        # 1. Update global prototype with new incoming signal
         self._update_prototype(latents)
 
-        # Normalize latents for similarity check
-        norm_latents = F.normalize(latents, dim=1)
-        
-        # Process each potential ghost
-        for i in range(vitals.shape[0]):
-            new_v = vitals[i]
-            new_m = masks[i]
-            new_lab = labels[i]
-            new_l = latents[i]
-            new_l_norm = norm_latents[i]
-            new_unc = uncertainties[i].item()
-            
-            inserted = False
-            
-            # 1. Similarity-Based Informative Replacement
-            if self.size > 0:
-                existing_latents = F.normalize(self.latent_anchors[:self.size], dim=1)
-                similarities = torch.matmul(existing_latents, new_l_norm) # [Size]
-                max_sim, twin_idx = similarities.max(dim=0)
-                
-                if max_sim > self.similarity_threshold:
-                    # Redundant case: Only replace if the new one is significantly "harder" (higher uncertainty)
-                    if new_unc > self.uncertainties[twin_idx].item() * 1.1:
-                        idx = int(twin_idx)
-                        inserted = True
-                    else:
-                        continue # Discard redundant easy case
-            
-            # 2. LVP Selection for Diverse Cases
-            if not inserted:
-                if not self.is_full:
-                    idx = int(self.ptr)
-                    self.ptr.fill_((idx + 1) % self.capacity)
-                    if self.size < self.capacity:
-                        self.size.fill_(self.size + 1)
-                        if self.size == self.capacity:
-                            self.is_full.fill_(True)
-                    inserted = True
-                else:
-                    # Bank is full and case is diverse: Find the Least Valuable existing ghost
-                    idx = self._find_lvp_index()
-                    inserted = True
+        # 2. Sequential Bootstrap for Empty Bank
+        if self.size == 0:
+            num_fill = min(B, self.capacity)
+            self.raw_vitals[:num_fill].copy_(vitals[:num_fill])
+            self.raw_masks[:num_fill].copy_(masks[:num_fill])
+            self.raw_labels[:num_fill].copy_(labels[:num_fill])
+            self.latent_anchors[:num_fill].copy_(latents[:num_fill])
+            self.uncertainties[:num_fill].copy_(uncertainties[:num_fill])
+            self.size.fill_(num_fill)
+            self.ptr.fill_(num_fill % self.capacity)
+            if self.size == self.capacity: self.is_full.fill_(True)
+            return
 
-            # 3. Final Insertion
-            if inserted:
-                self.raw_vitals[idx] = new_v
-                self.raw_masks[idx] = new_m
-                self.raw_labels[idx] = new_lab
-                self.latent_anchors[idx] = new_l
-                self.uncertainties[idx] = uncertainties[i]
+        # 3. Vectorized Similarity Check
+        norm_new = F.normalize(latents, dim=1)
+        norm_old = F.normalize(self.latent_anchors[:self.size], dim=1)
+        # Similarity Matrix [B, Size]
+        sim_matrix = torch.matmul(norm_new, norm_old.T)
+        max_sim, twin_idx = sim_matrix.max(dim=1)
+        
+        # Criteria A: Informative Replacement (Redundant but harder)
+        is_redundant = max_sim > self.similarity_threshold
+        target_unc = self.uncertainties[twin_idx].flatten()
+        is_harder = uncertainties.flatten() > (target_unc * 1.1)
+        to_replace = is_redundant & is_harder
+        
+        # Criteria B: Diverse Candidates (Non-redundant)
+        is_diverse = ~is_redundant
+        
+        # [PHASE 1] Batched Informative Replacement
+        if to_replace.any():
+            r_idx = twin_idx[to_replace]
+            self.raw_vitals[r_idx] = vitals[to_replace]
+            self.raw_masks[r_idx] = masks[to_replace]
+            self.raw_labels[r_idx] = labels[to_replace]
+            self.latent_anchors[r_idx] = latents[to_replace]
+            self.uncertainties[r_idx] = uncertainties[to_replace]
+
+        # [PHASE 2] Batched Diverse Expansion
+        if is_diverse.any():
+            dv, dm, dl, dlat, dunc = vitals[is_diverse], masks[is_diverse], labels[is_diverse], latents[is_diverse], uncertainties[is_diverse]
+            num_div = dv.shape[0]
+            
+            # Fill remaining space
+            available = self.capacity - int(self.size)
+            num_fill = min(num_div, available)
+            if num_fill > 0:
+                indices = (torch.arange(num_fill, device=dv.device) + int(self.ptr)) % self.capacity
+                self.raw_vitals[indices] = dv[:num_fill]
+                self.raw_masks[indices] = dm[:num_fill]
+                self.raw_labels[indices] = dl[:num_fill]
+                self.latent_anchors[indices] = dlat[:num_fill]
+                self.uncertainties[indices] = dunc[:num_fill]
+                self.ptr.fill_((int(self.ptr) + num_fill) % self.capacity)
+                self.size.fill_(int(self.size) + num_fill)
+                if self.size == self.capacity: self.is_full.fill_(True)
+                
+            # Replace LVPs if bank is full
+            num_lvp = num_div - num_fill
+            if num_lvp > 0 and self.is_full:
+                # SOTA: Batched LVP Selection
+                lat_all = F.normalize(self.latent_anchors[:self.size], dim=1)
+                K = torch.matmul(lat_all, lat_all.T)
+                redundancy = (K ** 2).sum(dim=1) - 1.0
+                unc = self.uncertainties[:self.size].flatten()
+                lvp_scores = redundancy / (unc + 1e-6)
+                
+                _, lvp_indices = torch.topk(lvp_scores, min(num_lvp, int(self.size)))
+                num_to_replace = lvp_indices.shape[0]
+                self.raw_vitals[lvp_indices] = dv[num_fill:num_fill+num_to_replace]
+                self.raw_masks[lvp_indices] = dm[num_fill:num_fill+num_to_replace]
+                self.raw_labels[lvp_indices] = dl[num_fill:num_fill+num_to_replace]
+                self.latent_anchors[lvp_indices] = dlat[num_fill:num_fill+num_to_replace]
+                self.uncertainties[lvp_indices] = dunc[num_fill:num_fill+num_to_replace]
 
     def sample(self, num_ghosts: int, seed: int, mixup_alpha: float = 0.0, uncertainty_weighted: bool = False) -> Dict[str, torch.Tensor]:
         """
