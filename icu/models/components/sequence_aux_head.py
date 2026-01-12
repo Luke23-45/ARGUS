@@ -397,21 +397,32 @@ class SequenceAuxHead(nn.Module):
         
         # 6. Loss
         loss = None
-        if targets is not None and not return_sequence:
-            num_classes = logits.shape[-1]
-            if num_classes > 1:
+        if targets is not None:
+             # [v26.3 SAFETY FIX] Hybrid Mode Support
+             # If returning sequence, we specifically extract the CLS token (index 0)
+             # to compute the diagnostic loss. This ensures 'aux_loss' is never None.
+             if return_sequence:
+                 logits_for_loss = logits[:, 0, :]
+             else:
+                 logits_for_loss = logits
+                 
+             num_classes = logits_for_loss.shape[-1]
+             if num_classes > 1:
                 # [SOTA FIX] Multi-Class One-Hot Conversion
                 if targets.ndim == 1:
                     targets_oh = F.one_hot(targets.long(), num_classes=num_classes).float()
                 else:
                     targets_oh = targets.float()
-            else:
+             else:
                 targets_oh = targets.float().unsqueeze(-1) if targets.ndim == 1 else targets.float()
-                    
-            # [v14.0 PATCH] Use Evidential Loss on alphas
-            # We pass 'alpha' (Dirichlet params) instead of 'logits'
-            # Note: The loss needs the current epoch for KL annealing. 
-            loss = self.criterion(alpha, targets_oh, epoch_num=epoch_num, samples_seen=samples_seen)
+                
+             # [v14.0 PATCH] Use Evidential Loss on alphas
+             # We pass 'alpha' (Dirichlet params) instead of 'logits'
+             # Note: The loss needs the current epoch for KL annealing.
+             # Recalculate alpha for CLS token specifically
+             evidence_loss = F.softplus(logits_for_loss)
+             alpha_loss = evidence_loss + 1
+             loss = self.criterion(alpha_loss, targets_oh, epoch_num=epoch_num, samples_seen=samples_seen)
             
         return {
             "logits": logits,

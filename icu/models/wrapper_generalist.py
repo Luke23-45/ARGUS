@@ -503,55 +503,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
         return self.model(batch)
 
     # =====================================================================
-    # [v25.5] HIGH-THROUGHPUT OPTIMIZATION UTILITIES
+    # [v26.4 CLEANUP] Removed OOM-Prone Vectorized Utils
+    # Reverted to iterative logic in training_step.
     # =====================================================================
-    def _get_vectorized_grads(self, filter_keys=None):
-        """
-        [v25.6 Hardened] Vectorized Gradient Capture.
-        Uses 'requires_grad' as the anchor to ensure pointer stability.
-        If a gradient is None, it is treated as a zero-tensor placeholder.
-        """
-        grads = []
-        for name, p in self.named_parameters():
-            if p.requires_grad:
-                if filter_keys and any(k in name for k in filter_keys):
-                    continue
-                if p.grad is not None:
-                    grads.append(p.grad.view(-1))
-                else:
-                    grads.append(torch.zeros_like(p).view(-1))
-        return torch.cat(grads) if grads else None
-
-    def _set_vectorized_grads(self, grad_vec, filter_keys=None):
-        """
-        [v25.6 Hardened] Vectorized Gradient Restoration.
-        Ensures bit-identical mapping back to parameters.
-        """
-        if grad_vec is None: return
-        ptr = 0
-        for name, p in self.named_parameters():
-            if p.requires_grad:
-                if filter_keys and any(k in name for k in filter_keys):
-                    continue
-                numel = p.numel()
-                if p.grad is not None:
-                    p.grad.copy_(grad_vec[ptr:ptr + numel].view_as(p.grad))
-                else:
-                    # Initialize grad if it was None during capture
-                    p.grad = grad_vec[ptr:ptr + numel].view_as(p).clone()
-                ptr += numel
-
-    def _project_agem_vectorized(self, grads_new, grads_ref):
-        """
-        SOTA: A-GEM Projection in 1D Space.
-        Formula: g = g_new - ( (g_new . g_ref) / (g_ref . g_ref) ) * g_ref
-        Only applies if dot(g_new, g_ref) < 0.
-        """
-        dot_prod = torch.dot(grads_new, grads_ref)
-        if dot_prod < 0:
-            ref_mag = torch.dot(grads_ref, grads_ref) + 1e-8
-            grads_new = grads_new - grads_ref * (dot_prod / ref_mag)
-        return grads_new
 
     # =========================================================================
     # SOTA TRAINING LOGIC (The "Heart")
@@ -1053,9 +1007,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
             
             # [v25.7 SOTA FIX] Reusing Unified Sequence Results
             # No redundant forward pass; eliminates OOM on 15GB hardware.
-            # logits_seq_full contains [CLS, T1, T2, ...]
-            # logits_seq should contain only [T1, T2, ...] for BGSL/Supervision
-            logits_seq = logits_seq_full[:, 1:, :]
+            # logits_seq_full contains [CLS, T1, T2, ...] or [CLS_aux, CLS_enc, T1, ...]
+            # [v26.1 FIX] Dynamic Tail Slicing
+            # We must ensure logits_seq matches 'past' length exactly (T=24).
+            # Using -T_obs: ensures we get the actual sequence regardless of how many CLS tokens exist.
+            T_obs = past.shape[1]
+            # Ensure safety if logits are shorter (shouldn't happen)
+            if logits_seq_full.shape[1] > T_obs:
+                 logits_seq = logits_seq_full[:, -T_obs:, :]
+            else:
+                 logits_seq = logits_seq_full[:, 1:, :]
             
             if logits_seq.shape[-1] > 1:
                 # [SOTA Alignment] Convert multi-class logits to a single "Sepsis Risk" logit
@@ -1186,56 +1147,97 @@ class ICUGeneralistWrapper(pl.LightningModule):
             accum_grads_vec = None
             
             if is_accumulating:
-                # [v25.7 SOTA FIX] Filter Backbone Backup
-                # Rationale: Cloning the entire backbone grads consumes ~1.5GB of VRAM.
-                # A-GEM only projects diagnostic heads, so backbone backup is redundant.
-                # [v25.8 AUDIT FIX] Added 'encoder' to filter keys to catch all foundation components.
+                # [v26.4 REVERT] Switch to Iterative Backup (OOM Rescue)
+                # The "Vectorized" optimization (torch.cat) required 300MB+ contiguous memory,
+                # causing OOM on 15GB cards. We revert to a list-based backup.
                 filter_keys = ["backbone", "encoder", "scheduler", "loss_scaler"]
-                accum_grads_vec = self._get_vectorized_grads(filter_keys=filter_keys)
-                if accum_grads_vec is not None:
-                    self.zero_grad(set_to_none=False)
+                # Manual Iterative Backup
+                accum_grads_list = []
+                for name, p in self.named_parameters():
+                    if p.requires_grad:
+                        if any(k in name for k in filter_keys): 
+                             accum_grads_list.append(None) # Placeholder to maintain index alignment
+                             continue
+                        if p.grad is not None:
+                            accum_grads_list.append(p.grad.to("cpu", non_blocking=True)) # Offload to CPU to save VRAM
+                        else:
+                            accum_grads_list.append(None)
+                
+                # Zero bucket but keep structure
+                self.zero_grad(set_to_none=False)
 
             if l_ref is not None and l_ref.grad_fn is not None:
                 # A. Ghost Pass (Reference)
                 # Protects the Clinical Memory Manifold
                 self.manual_backward(l_ref, retain_graph=True)
                 
-                # [v25.5] Vectorized Reference Capture
+                # [v26.4 REVERT] Iterative Reference Capture
+                # Replaces OOM-prone usage of _get_vectorized_grads (torch.cat)
+                ref_grads = {}
                 filter_keys = ["backbone", "scheduler", "loss_scaler"]
-                g_ref_vec = self._get_vectorized_grads(filter_keys=filter_keys)
                 
-                # Zero out projected grads for the batch pass, leave backbone grads
-                if g_ref_vec is not None:
-                    for name, p in self.named_parameters():
-                        if p.grad is not None and not any(k in name for k in filter_keys):
-                            p.grad.zero_()
+                # Snapshot Reference Gradients
+                for name, p in self.named_parameters():
+                    if p.grad is not None and not any(k in name for k in filter_keys):
+                        ref_grads[name] = p.grad.detach().clone()
+                        p.grad.zero_()
                 
                 # B. Batch Pass
                 self.manual_backward(l_batch)
                 
-                # C. [SOTA v25.5] Vectorized A-GEM Projection
-                with torch.no_grad():
-                    g_batch_vec = self._get_vectorized_grads(filter_keys=filter_keys)
-                    if g_batch_vec is not None and g_ref_vec is not None:
-                        # 1. Project Batch Grads onto Reference
-                        g_batch_projected = self._project_agem_vectorized(g_batch_vec, g_ref_vec)
-                        # 2. Add Reference Gradients back
-                        g_total = g_batch_projected + g_ref_vec
-                        # 3. Restore to parameters
-                        self._set_vectorized_grads(g_total, filter_keys=filter_keys)
+                # C. [v26.4 FIX] Iterative A-GEM Projection
+                # Compute dot(g, g_ref) without concatenation
+                dot_prod = 0.0
+                ref_mag = 0.0
+                
+                # 1. Compute Dot Product
+                for name, p in self.named_parameters():
+                    if p.grad is not None and name in ref_grads:
+                        g_ref = ref_grads[name]
+                        dot_prod += torch.sum(p.grad * g_ref)
+                        ref_mag += torch.sum(g_ref * g_ref)
+                
+                # 2. Project if conflict
+                if dot_prod < 0:
+                    scaling = dot_prod / (ref_mag + 1e-8)
+                    for name, p in self.named_parameters():
+                         if name in ref_grads and p.grad is not None:
+                             # g_proj = g - (g_ref * scaling)
+                             g_ref = ref_grads[name]
+                             p.grad.sub_(g_ref * scaling)
+                
+                # 3. Add Reference Gradients back (Optimization Objective: L_total = L_batch_projected + L_ref)
+                for name, p in self.named_parameters():
+                    if name in ref_grads:
+                        if p.grad is None:
+                            p.grad = ref_grads[name]
+                        else:
+                            p.grad.add_(ref_grads[name])
             else:
                 self.manual_backward(total_loss)
 
             # [SOTA v25.7] Restore Accumulated Gradients (Filtered)
-            if is_accumulating and accum_grads_vec is not None:
-                with torch.no_grad():
-                    filter_keys = ["backbone", "encoder", "scheduler", "loss_scaler"]
-                    curr_grads_vec = self._get_vectorized_grads(filter_keys=filter_keys)
-                    if curr_grads_vec is not None:
-                        # Vectorized Restore (Zero Allocation)
-                        self._set_vectorized_grads(curr_grads_vec + accum_grads_vec, filter_keys=filter_keys)
-                    else:
-                        self._set_vectorized_grads(accum_grads_vec, filter_keys=filter_keys)
+            # [SOTA v25.7] Restore Accumulated Gradients (Filtered)
+            if is_accumulating and 'accum_grads_list' in locals() and accum_grads_list is not None:
+                # [v26.4 REVERT] Iterative Restore
+                # Add stored gradients back to current gradients
+                ptr = 0
+                filter_keys = ["backbone", "encoder", "scheduler", "loss_scaler"]
+                for name, p in self.named_parameters():
+                    if p.requires_grad:
+                        if any(k in name for k in filter_keys):
+                            ptr += 1
+                            continue
+                        
+                        g_stored = accum_grads_list[ptr]
+                        if g_stored is not None:
+                            # Move back to GPU if needed
+                            g_stored = g_stored.to(p.device, non_blocking=True)
+                            if p.grad is None:
+                                p.grad = g_stored
+                            else:
+                                p.grad.add_(g_stored)
+                        ptr += 1
             
             # [PMS] SCS: Manifold Health Monitoring
             with torch.no_grad():

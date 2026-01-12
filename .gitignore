@@ -114,13 +114,15 @@ patches_snippet.md
 logs.md
 suggestion.md
 patch_report.md
-# .gitignore
+.gitignore
 ui.md
 working
 icu/models/wrapper_generalist copy 2.py
 error_1.md
 Z11_Analysis_Report.md
 Prof_Sepsis_ZeroTrust_Report.md
+test_aux_loss.py
+test_shape_fix.py
 Professor_SOTA_Report_AEEA.md
-verify_optimization_parity.py
 verify_integrity_simulation.py
+verify_optimization_parity.py
