@@ -33,7 +33,7 @@ import numpy as np
 import torch
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple, Union
-from torch.utils.data import Dataset, default_collate, Sampler, WeightedRandomSampler
+from torch.utils.data import Dataset, default_collate
 from huggingface_hub import snapshot_download
 
 # --- Configuration & Constants ---
@@ -257,7 +257,6 @@ class ICUTrajectoryDataset(Dataset):
         
         # --- Lazy LMDB Handle ---
         self._lmdb_env = None
-        self._parent_pid = os.getpid() # [v4.1.1 SOTA FIX] Fork-Safety
         self.max_cache_size = max_cache_size
 
         logger.info(f"[{split.upper()}] Initialized. Windows: {self.total_chunks:,} | Episodes: {valid_episodes:,}")
@@ -266,18 +265,7 @@ class ICUTrajectoryDataset(Dataset):
         return self.total_chunks
 
     def _init_lmdb(self):
-        """
-        Thread-safe lazy initialization of the LMDB environment.
-        [v4.1.1 SOTA FIX] PID-Aware Multiprocessing Safety.
-        Ensures that if the dataset is forked (DataLoader workers), 
-        the child processes open their own LMDB environment handles.
-        """
-        curr_pid = os.getpid()
-        if self._lmdb_env is not None and curr_pid != self._parent_pid:
-            # Fork detected! The inherited handle is unsafe in child.
-            self._lmdb_env = None
-            self._parent_pid = curr_pid
-
+        """Thread-safe lazy initialization of the LMDB environment."""
         if self._lmdb_env is None:
             self._lmdb_env = lmdb.open(
                 str(self.lmdb_path),
@@ -297,7 +285,7 @@ class ICUTrajectoryDataset(Dataset):
                 raise KeyError(f"LMDB Key failure: {key}. Index desynchronization detected.")
             return data
 
-    @functools.lru_cache(maxsize=128000) # [OPTIMIZATION] Cache entire dataset (Fits in RAM)
+    @functools.lru_cache(maxsize=8192)
     def _fetch_numpy(self, key: str, dtype_str: str, shape: Tuple[int, ...]) -> np.ndarray:
         """
         Fetches and deserializes a numpy array from LMDB.
@@ -523,80 +511,3 @@ def robust_collate_fn(batch: List[Optional[Dict]]) -> Dict[str, torch.Tensor]:
         return {}
     
     return default_collate(valid_batch)
-
-# ==============================================================================
-# 4. STRATIFIED SAMPLER (Gap 5 Fix)
-# ==============================================================================
-
-def create_sepsis_aware_sampler(
-    dataset: ICUTrajectoryDataset,
-    sepsis_boost_factor: float = 10.0,
-    max_samples: int = 100000
-) -> WeightedRandomSampler:
-    """
-    [v13.0 PATCH] Create a WeightedRandomSampler that oversamples sepsis-positive windows.
-    
-    Problem: With 7.2% episode sepsis rate and 1.76% timestep rate, random batches
-    often contain zero sepsis cases, causing noisy gradients for the sepsis classifier.
-    
-    Solution: Assign higher sampling weights to windows that have sepsis (phase > 0).
-    This ensures each batch is more likely to contain meaningful sepsis examples.
-    
-    Args:
-        dataset: ICUTrajectoryDataset or ICUSotaDataset instance
-        sepsis_boost_factor: Weight multiplier for sepsis-positive windows (default 10x)
-        max_samples: Maximum samples to scan for weight computation (for speed)
-        
-    Returns:
-        WeightedRandomSampler: Sampler that can be passed to DataLoader
-        
-    Usage:
-        dataset = ICUSotaDataset(...)
-        sampler = create_sepsis_aware_sampler(dataset, sepsis_boost_factor=10.0)
-        dataloader = DataLoader(dataset, batch_size=32, sampler=sampler)
-    """
-    n_samples = len(dataset)
-    
-    # Initialize weights (default = 1.0 for normal samples)
-    weights = torch.ones(n_samples)
-    
-    # Compute weights by scanning dataset (cached, so reasonably fast)
-    logger.info(f"[Sampler] Computing sample weights for {n_samples:,} windows...")
-    
-    # For efficiency, we only scan a subset to estimate prevalence
-    scan_count = min(n_samples, max_samples)
-    indices_to_scan = np.linspace(0, n_samples - 1, scan_count, dtype=int)
-    
-    sepsis_count = 0
-    for idx in indices_to_scan:
-        try:
-            sample = dataset[int(idx)]
-            if sample is not None:
-                phase = sample.get("phase_label", torch.tensor(0))
-                if isinstance(phase, torch.Tensor):
-                    phase = phase.item()
-                
-                # Phase > 0 means PRESHOCK or SHOCK (sepsis-related)
-                if phase > 0:
-                    weights[int(idx)] = sepsis_boost_factor
-                    sepsis_count += 1
-        except Exception:
-            pass  # Skip problematic samples
-    
-    # Extrapolate weights to unscanned samples
-    # Assume same distribution as scanned subset
-    if scan_count < n_samples:
-        logger.info(f"[Sampler] Scanned {scan_count:,} samples, extrapolating to full dataset")
-    
-    estimated_sepsis_rate = sepsis_count / scan_count if scan_count > 0 else 0.0
-    logger.info(f"[Sampler] Estimated sepsis rate: {estimated_sepsis_rate*100:.2f}% | Boost factor: {sepsis_boost_factor}x")
-    
-    # Create the weighted sampler
-    # replacement=True allows oversampling of rare sepsis windows
-    sampler = WeightedRandomSampler(
-        weights=weights,
-        num_samples=n_samples,
-        replacement=True
-    )
-    
-    return sampler

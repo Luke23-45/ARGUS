@@ -38,7 +38,7 @@ References:
 from __future__ import annotations
 import math
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List, Union
 import torch
 import torch.nn as nn
@@ -52,14 +52,12 @@ from icu.models.components.geometric_projector import GeometricProjector
 from icu.models.components.temporal_sampler import TemporalSampler
 from icu.models.components.nth_encoder import NTHEncoderBlock
 from icu.models.components.sequence_aux_head import SequenceAuxHead
-from icu.models.components.alb_encoder import AsymmetricLatentBottleneck
-# from icu.models.components.loss_scaler import UncertaintyLossScaler (Removed: Scaling handled by Wrapper)
+from icu.models.components.loss_scaler import UncertaintyLossScaler
 
 # [PHASE 4-5] Agentic Evolution Components
 from icu.models.components.risk_scorer import PhysiologicalRiskScorer
 from icu.models.components.adaptive_sampler import StateAwareSampler
 from icu.models.components.clinical_governor import ConfidenceAwareGovernor
-from icu.models.components.distributional_critic import DistributionalValueHead, IQLQuantileLoss
 from icu.utils.stability import DynamicThresholding
 
 # Setup Logger
@@ -113,7 +111,6 @@ class ICUConfig:
     use_auxiliary_head: bool = True
     num_phases: int = 3  # Tri-Phase: Stable(0) -> Pre-Shock(1) -> Shock(2)
     aux_loss_scale: float = 0.1 # [v11.1] Configurable Aux Loss Scale
-    num_quantiles: int = 25     # [v4.1 SOTA] Distributional Critic resolution
 
     # Stable Sampling [v18.0]
     use_dynamic_thresholding: bool = True
@@ -122,20 +119,6 @@ class ICUConfig:
     min_sampling_steps: int = 25
     base_safety_percentile: float = 0.99
     min_safety_percentile: float = 0.90
-    
-    # [v4.2.1 SOTA] Canonical Feature Registry
-    # Ensures absolute alignment across ALB, Scorer, and Planner
-    idx_map: int = 4
-    idx_lactate: int = 7
-    idx_hemo_end: int = 7
-    idx_labs_end: int = 18
-    idx_elec_end: int = 22
-    idx_static_start: int = 22
-
-    # [v4.2.1 SOTA] Clinical Importance Mapping
-    importance_weights: Dict[str, float] = field(default_factory=lambda: {
-        "4": 2.0, "2": 2.0, "1": 2.0, "7": 1.5, "0": 1.2
-    })
 
 # =============================================================================
 # 2. LOW-LEVEL PRIMITIVES (Mask-Aware & Robust)
@@ -496,13 +479,7 @@ class TemporalFusionEncoder(nn.Module):
         
         # Projects
         # [SOTA Phase 1] Geometric Projector
-        self.vitals_proj = GeometricProjector(
-            cfg.d_model, 
-            hemo_dim=cfg.idx_hemo_end,
-            labs_dim=cfg.idx_labs_end - cfg.idx_hemo_end,
-            elec_dim=cfg.idx_elec_end - cfg.idx_labs_end,
-            use_imputation_masks=cfg.use_imputation_masks
-        )
+        self.vitals_proj = GeometricProjector(cfg.d_model, use_imputation_masks=cfg.use_imputation_masks)
         self.static_proj = nn.Linear(cfg.static_dim, cfg.d_model)
         
         # [SOTA Phase 1] Temporal Sampler
@@ -513,12 +490,7 @@ class TemporalFusionEncoder(nn.Module):
         
         # Encoder Layers (NTH Architecture)
         self.layers = nn.ModuleList([
-            NTHEncoderBlock(
-                cfg.d_model, 
-                cfg.n_heads, 
-                hidden_dim=cfg.d_model * 2,
-                drop_path_prob=cfg.stochastic_depth_prob
-            ) 
+            NTHEncoderBlock(cfg.d_model, cfg.n_heads, hidden_dim=cfg.d_model * 2) 
             for _ in range(cfg.encoder_layers)
         ])
         
@@ -560,31 +532,31 @@ class TemporalFusionEncoder(nn.Module):
         # The static features are already processed separately via static_proj.
         # Including them in vitals_proj causes the model to see them at EVERY timestep,
         # drowning out the dynamic physiological signals.
-        past_vitals_dynamic = past_vitals[..., :self.cfg.idx_static_start]  # [B, T, 22]
+        past_vitals_dynamic = past_vitals[..., :22]  # [B, T, 22]
         
         # [v12.0] Imputation Awareness (Feature Conditioning)
         if self.cfg.use_imputation_masks:
             if imputation_mask is not None:
                 # Slice mask to dynamic features only
-                mask_dynamic = imputation_mask[..., :self.cfg.idx_static_start]
+                mask_dynamic = imputation_mask[..., :22]
                 
                 # [CRITICAL FIX v12.1] Geometric Group Alignment
                 # GeometricProjector expects: [Hemo_V, Hemo_M, Lab_V, Lab_M, Elec_V, Elec_M]
                 # Default "cat" produces: [All_V, All_M] which misaligns the groups.
                 
                 # 1. Hemodynamics (Indices 0-6)
-                hemo_v = past_vitals_dynamic[..., 0:self.cfg.idx_hemo_end]
-                hemo_m = mask_dynamic[..., 0:self.cfg.idx_hemo_end]
+                hemo_v = past_vitals_dynamic[..., 0:7]
+                hemo_m = mask_dynamic[..., 0:7]
                 hemo_grp = torch.cat([hemo_v, hemo_m], dim=-1) # 14 channels
                 
-                # 2. Labs (Indices idx_hemo_end-idx_labs_end)
-                labs_v = past_vitals_dynamic[..., self.cfg.idx_hemo_end:self.cfg.idx_labs_end]
-                labs_m = mask_dynamic[..., self.cfg.idx_hemo_end:self.cfg.idx_labs_end]
+                # 2. Labs (Indices 7-17)
+                labs_v = past_vitals_dynamic[..., 7:18]
+                labs_m = mask_dynamic[..., 7:18]
                 labs_grp = torch.cat([labs_v, labs_m], dim=-1) # 22 channels
                 
-                # 3. Electrolytes (Indices idx_labs_end-idx_elec_end)
-                elec_v = past_vitals_dynamic[..., self.cfg.idx_labs_end:self.cfg.idx_elec_end]
-                elec_m = mask_dynamic[..., self.cfg.idx_labs_end:self.cfg.idx_elec_end]
+                # 3. Electrolytes (Indices 18-21)
+                elec_v = past_vitals_dynamic[..., 18:22]
+                elec_m = mask_dynamic[..., 18:22]
                 elec_grp = torch.cat([elec_v, elec_m], dim=-1) # 8 channels
                 
                 # Final Interleaved Input
@@ -593,16 +565,16 @@ class TemporalFusionEncoder(nn.Module):
                 # Fallback: Assume all real (ones) if no mask provided but expected
                 mask_dynamic = torch.ones_like(past_vitals_dynamic)
                 # Apply same interleaving fallback
-                hemo_v = past_vitals_dynamic[..., 0:self.cfg.idx_hemo_end]
-                hemo_m = mask_dynamic[..., 0:self.cfg.idx_hemo_end]
+                hemo_v = past_vitals_dynamic[..., 0:7]
+                hemo_m = mask_dynamic[..., 0:7]
                 hemo_grp = torch.cat([hemo_v, hemo_m], dim=-1)
                 
-                labs_v = past_vitals_dynamic[..., self.cfg.idx_hemo_end:self.cfg.idx_labs_end]
-                labs_m = mask_dynamic[..., self.cfg.idx_hemo_end:self.cfg.idx_labs_end]
+                labs_v = past_vitals_dynamic[..., 7:18]
+                labs_m = mask_dynamic[..., 7:18]
                 labs_grp = torch.cat([labs_v, labs_m], dim=-1)
                 
-                elec_v = past_vitals_dynamic[..., self.cfg.idx_labs_end:self.cfg.idx_elec_end]
-                elec_m = mask_dynamic[..., self.cfg.idx_labs_end:self.cfg.idx_elec_end]
+                elec_v = past_vitals_dynamic[..., 18:22]
+                elec_m = mask_dynamic[..., 18:22]
                 elec_grp = torch.cat([elec_v, elec_m], dim=-1)
                 
                 network_input = torch.cat([hemo_grp, labs_grp, elec_grp], dim=-1)
@@ -1053,8 +1025,7 @@ class ICUUnifiedPlanner(nn.Module):
         self.cfg = cfg
         
         # Core Components
-        base_encoder = TemporalFusionEncoder(cfg)
-        self.encoder = AsymmetricLatentBottleneck(base_encoder, cfg=cfg)
+        self.encoder = TemporalFusionEncoder(cfg)
         self.backbone = DiffusionActionHead(cfg)
         self.scheduler = NoiseScheduler(cfg.timesteps)
         
@@ -1069,20 +1040,20 @@ class ICUUnifiedPlanner(nn.Module):
                 # If num_phases=3 (Stable/Pre/Shock), it's multi-class.
                 # NTH SequenceAuxHead output shape is [B, num_classes].
                 num_layers=2,
-                n_heads=4,
-                drop_path_prob=cfg.stochastic_depth_prob
+                n_heads=4
             )
             
+            # [SOTA Phase 1] Uncertainty Loss Scaler
+            self.loss_scaler = UncertaintyLossScaler(num_tasks=4)
             
-        # [v4.1 SOTA] Implicit Distributional Critic (IDC-25)
-        # Replaces scalar ClinicalResidualHead for high-fidelity risk modeling
-        self.value_head = DistributionalValueHead(
-            d_model=cfg.d_model, 
-            pred_len=cfg.pred_len,
-            num_quantiles=cfg.num_quantiles,
+        # Dense Value Head for GAE-Lambda (AWR)
+        # Replaced with 2025 SOTA ClinicalResidualHead
+        # Critical for accurate AWR weights in high-variance clinical data
+        self.value_head = ClinicalResidualHead(
+            input_dim=cfg.d_model, 
+            output_dim=cfg.pred_len,
             dropout=0.1
         )
-        self.value_loss_fn = IQLQuantileLoss(tau=0.7, delta=1.0)
         
         # [v10.0] Physics Loss for both training and PGS
         self.phys_loss = PhysiologicalConsistencyLoss()
@@ -1105,24 +1076,7 @@ class ICUUnifiedPlanner(nn.Module):
             base_p=cfg.base_safety_percentile,
             min_p=cfg.min_safety_percentile
         )
-        self.clinical_feat_idx = {'hr': 0, 'o2sat': 1, 'sbp': 2, 'map': cfg.idx_map, 'lactate': cfg.idx_lactate, 'resp': 5}
-        
-        # [v4.2 SOTA Pillar 3] Life-Critical MSE Weighting
-        # Indices: MAP=4, O2Sat=1, Lactate=7, HR=0, SBP=2, Resp=5
-        # Standard weights are 1.0. We boost high-stakes channels.
-        weights_dict = getattr(cfg, "importance_weights", {
-            "4": 2.0, "2": 2.0, "1": 2.0, "7": 1.5, "0": 1.2
-        })
-        weights = torch.ones(cfg.input_dim)
-        for idx, w in weights_dict.items():
-            weights[int(idx)] = w
-        self.register_buffer("importance_weights", weights)
-
-        # [v4.2 SOTA Pillar 4] Adaptive Safety Envelope Sigma
-        self.register_buffer("curr_sigma", torch.tensor(cfg.base_safety_percentile)) # Initialized to base (e.g., 0.99 for 2.5 sigma)
-        # Note: base_safety_percentile in cfg is usually 0.99 (which yields ~2.5 sigma)
-        # We will use a direct sigma value for clarity in v4.2 code.
-        self.register_buffer("curr_envelope_sigma", torch.tensor(2.5)) 
+        self.clinical_feat_idx = {'hr': 0, 'o2sat': 1, 'sbp': 2, 'map': 4, 'lactate': 7, 'resp': 5}
 
         # Hooks for Normalizer
         logger.info(f"[APEX PLANNER] Initialized v11.0 Agentic: {self.cfg.d_model}d, {self.cfg.n_layers}L")
@@ -1175,15 +1129,11 @@ class ICUUnifiedPlanner(nn.Module):
         # [v16.0] FIX: Disable unsafe padding inference. Fixed window dataset has no padding.
         padding_mask = batch.get("padding_mask", None) 
         
-        out_alb = self.encoder(
+        ctx_seq, global_ctx, ctx_mask = self.encoder(
             past_norm, static_norm, 
             imputation_mask=src_mask, 
             padding_mask=padding_mask # Successfully propagates to Attention
         )
-        ctx_seq = out_alb["ctx_planner"]
-        global_ctx = out_alb["global_planner"]
-        ctx_mask = out_alb["ctx_mask"]
-        # ctx_expert is available in out_alb["ctx_expert"] for the wrapper
         
         # 2. Forward Diffusion (add noise)
         B = past.shape[0]
@@ -1220,12 +1170,8 @@ class ICUUnifiedPlanner(nn.Module):
         
         # 4. Loss Computation
         if reduction == 'none':
-            # Mean over features but preserve clinical moments [B, T]
-            # [v4.2 SOTA] Importance Weighted MSE
-            # pred_noise, noise_eps: [B, T, D]
-            diff_sq = (pred_noise - noise_eps) ** 2
-            weighted_diff = diff_sq * self.importance_weights.view(1, 1, -1)
-            diff_loss = weighted_diff.mean(dim=2)
+            # Mean over valid prediction horizon
+            diff_loss = F.mse_loss(pred_noise, noise_eps, reduction='none').mean(dim=[1, 2])
             
             if self.cfg.use_auxiliary_head and "phase_label" in batch:
                 # [SOTA Upgrade] SequenceAuxHead takes (x_seq, mask, targets)
@@ -1235,74 +1181,76 @@ class ICUUnifiedPlanner(nn.Module):
                 # Targets: phase_label [B]
                 
                 # Note: SequenceAuxHead returns (logits, loss).
-                # [SOTA 2025] Evidential aux_head returns a Dict
-                aux_out = self.aux_head(
-                    out_alb["ctx_expert"], 
+                logits, sota_aux_loss = self.aux_head(
+                    ctx_seq, 
                     mask=ctx_mask, 
                     targets=batch["phase_label"].long() if batch["phase_label"] is not None else None
                 )
-                logits = aux_out["logits"]
-                aux_loss = aux_out["loss"]
-                uncertainty = aux_out["uncertainty"]
                 
-                if aux_loss is None:
-                    # Fallback for inference or missing targets
-                    aux_loss = torch.tensor(0.0, device=past.device)
+                # If sota_aux_loss is returned, use it directly (includes Asymmetric Logic)
+                if sota_aux_loss is not None:
+                    aux_loss = sota_aux_loss 
+                else:
+                    # Fallback (shouldn't happen if targets provided)
+                    aux_loss = F.cross_entropy(logits, batch["phase_label"].long(), reduction='none')
             else:
                 aux_loss = torch.zeros(B, device=past.device)
         else:
-            # [v4.2 SOTA] Importance Weighted MSE
-            diff_sq = (pred_noise - noise_eps) ** 2
-            weighted_diff = diff_sq * self.importance_weights.view(1, 1, -1)
-            diff_loss = weighted_diff.mean()
+            diff_loss = F.mse_loss(pred_noise, noise_eps)
             if self.cfg.use_auxiliary_head and "phase_label" in batch:
-                aux_out = self.aux_head(
-                    out_alb["ctx_expert"], 
+                # Scaler handles reduction usually, but here we return scalar
+                 logits, sota_aux_loss = self.aux_head(
+                    ctx_seq, 
                     mask=ctx_mask, 
                     targets=batch["phase_label"].long()
                 )
-                logits = aux_out["logits"]
-                aux_loss = aux_out["loss"]
-                uncertainty = aux_out["uncertainty"]
+                 aux_loss = sota_aux_loss
             else:
-                logits = None
                 aux_loss = torch.tensor(0.0, device=past.device)
-                uncertainty = torch.tensor(0.0, device=past.device)
             
-        # [v4.1 SOTA] Implicit Distributional Critic Pass
-        # pred_val shape: [B, T_pred, N_quantiles]
+        # 5. Value Prediction (Critic for AWR)
         pred_val = self.value_head(global_ctx)
         value_loss = torch.tensor(0.0, device=past.device)
         
         if "clinical_reward" in batch:
-            # target_val shape: [B, T_pred]
+            # [v11.1] Masked MSE for Value Head
+            # Ignore padding in the prediction horizon
             target_val = batch["clinical_reward"]
             
-            # Masking for incomplete future trajectories
+            # Try to get explicit future mask
             f_mask = batch.get("future_mask")
-            if f_mask is not None:
-                if f_mask.dim() == 3: f_mask = f_mask.any(dim=-1)
-                f_mask = f_mask.float()[:, :self.cfg.pred_len]
+            if f_mask is None:
+                # Fallback: Inference from target zeros? No, risky. 
+                # Use src_mask if it matches length? 
+                f_mask = torch.ones_like(target_val, dtype=torch.float32)
                 
-                # Apply IQL + Quantile Loss with masking
-                # We compute loss per-sample and apply mask before averaging
-                # pred_val: [B, T, N], target_val: [B, T]
-                raw_loss = self.value_loss_fn(pred_val, target_val) # Note: SOTA loss currently handles mean
-                # [REFINEMENT] Re-implementing masked loss call for utmost quality
-                B_idx, T_idx = target_val.shape
-                # Custom masked forward for IQLQuantileLoss
-                value_loss = self.value_loss_fn(pred_val, target_val) # Fallback to standard for now, will refine if f_mask is sparse
+                loss_ele = F.smooth_l1_loss(pred_val, target_val, beta=1.0, reduction='none')
+                value_loss = (loss_ele * f_mask).sum() / (f_mask.sum() + 1e-8)
             else:
-                value_loss = self.value_loss_fn(pred_val, target_val)
+                # Ensure mask matches shape
+                if f_mask.dim() == 3: f_mask = f_mask.any(dim=-1) # [B, T]
+                f_mask = f_mask.float()
+                
+                # Check alignment
+                if f_mask.shape[1] > pred_val.shape[1]:
+                    f_mask = f_mask[:, :pred_val.shape[1]]
+                
+                # Weighted MSE
+                sq_err = (pred_val - target_val) ** 2
+                masked_mse = (sq_err * f_mask).sum() / (f_mask.sum() + 1e-8)
+                value_loss = masked_mse
         
         # Total loss (Value weight 0.5 is standard for AWR baselines)
-        # Handle broadcasting if reduction='none' (diff_loss is [B, T], aux_loss is [B])
-        aux_term = self.cfg.aux_loss_scale * aux_loss
-        if diff_loss.dim() > aux_loss.dim():
-            aux_term = aux_term.unsqueeze(1)
-            
-        total = diff_loss + aux_term + 0.5 * value_loss
-        logs = {}
+        # Total loss (Value weight 0.5 is standard for AWR baselines)
+        # Total loss (Value weight 0.5 is standard for AWR baselines)
+        # [SOTA Upgrade] Use Uncertainty Scaler if available
+        if hasattr(self, 'loss_scaler') and self.cfg.use_auxiliary_head:
+            losses = {'diffusion': diff_loss, 'aux': aux_loss}
+            total, logs = self.loss_scaler(losses)
+            total = total + 0.5 * value_loss
+        else:
+            total = diff_loss + self.cfg.aux_loss_scale * aux_loss + 0.5 * value_loss
+            logs = {}
         
         # Compute aux_logits for return (needed by callbacks)
         # Use logits computed earlier (from SequenceAuxHead)
@@ -1312,8 +1260,7 @@ class ICUUnifiedPlanner(nn.Module):
             "loss": total,
             "diffusion_loss": diff_loss,
             "aux_loss": aux_loss,
-            "aux_logits": logits,
-            "aux_uncertainty": uncertainty,
+            "aux_logits": aux_logits,
             "value_loss": value_loss,
             "pred_value": pred_val
         }
@@ -1366,14 +1313,11 @@ class ICUUnifiedPlanner(nn.Module):
              if src_mask.dim() == 3:
                  padding_mask = (src_mask.sum(dim=-1) == 0)
              
-        out_alb = self.encoder(
+        ctx_seq, global_ctx, ctx_mask = self.encoder(
             past_norm, static_norm, 
             imputation_mask=src_mask,
             padding_mask=padding_mask # [FIX] Pass padding mask
         )
-        ctx_seq = out_alb["ctx_planner"]
-        global_ctx = out_alb["global_planner"]
-        ctx_mask = out_alb["ctx_mask"]
         
         # 2. Initialize from pure noise
         x_t = torch.randn(B, self.cfg.pred_len, self.cfg.input_dim, device=past.device)
@@ -1413,13 +1357,15 @@ class ICUUnifiedPlanner(nn.Module):
                 # Prevents one patient's artifact from suppressing the batch
                 grad_norm = grad.norm(dim=(1, 2), keepdim=True)
                 
-                # [SOTA 2025] Directional Preservation
-                # We normalize the gradient to unit norm to preserve the 'Clinical Intent'.
-                # We then apply the guidance scale. No element-wise clamping is performed
-                # as it distorts the manifold trajectory.
+                # 2. USE GRAD_NORM HERE: Normalize the gradient
+                # This ensures the steering 'direction' is preserved but magnitude is controlled
                 grad = grad / (grad_norm + 1e-8)
+                
+                # 3. USE CLAMP: Final safety guard against high-frequency noise
+                # Since the grad is now normalized to ~1.0, a clamp of 0.1 is very safe
+                grad = torch.clamp(grad, -0.1, 0.1) 
                     
-                # 4. Apply steering using the normalized gradient
+                # 4. Apply steering using the scaled, normalized, and clamped gradient
                 # x_t = x_t - (Force * Direction)
                 x_t = x_t - self.cfg.physics_guidance_scale * grad.detach()
 

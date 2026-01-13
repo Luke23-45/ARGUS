@@ -20,23 +20,6 @@ class SwiGLU(nn.Module):
         gate_path = self.linear_gate(x)
         return act_path * self.silu(gate_path)
 
-class DropPath(nn.Module):
-    """
-    [v10.0] Stochastic Depth (DropPath) regularization.
-    """
-    def __init__(self, drop_prob: float = 0.0):
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.drop_prob == 0.0 or not self.training:
-            return x
-        keep_prob = 1 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-        random_tensor.floor_()
-        return x.div(keep_prob) * random_tensor
-
 class GatedResidualNetwork(nn.Module):
     """
     [TFT-Style] Gated Residual Network (GRN) with SwiGLU.
@@ -189,11 +172,6 @@ class NTHAttention(nn.Module):
         dist = indices.unsqueeze(0) - indices.unsqueeze(1)
         # 0 for keep, -inf for mask
         local_mask_2d = (dist.abs() > self.local_window) # True to mask
-        
-        # [v4.2.1 SOTA FIX] Unstall Static Token
-        # Always allow attention to index 0 (Static Context) regardless of distance
-        local_mask_2d[:, 0] = False
-        
         local_mask_float = torch.zeros((T, T), device=x.device)
         local_mask_float = local_mask_float.masked_fill(local_mask_2d, -1e9)
         
@@ -216,18 +194,17 @@ class NTHEncoderBlock(nn.Module):
     1. Processing: Gated Residual Network (SwiGLU) for feature extraction.
     2. Mixing: NTH Attention (Local + Global, RoPE) for temporal mixing.
     """
-    def __init__(self, d_model: int, n_heads: int, hidden_dim: int, drop_path_prob: float = 0.1):
+    def __init__(self, d_model: int, n_heads: int, hidden_dim: int):
         super().__init__()
         self.grn = GatedResidualNetwork(d_model, hidden_dim)
         self.attn = NTHAttention(d_model, n_heads)
-        self.drop_path = DropPath(drop_path_prob) if drop_path_prob > 0 else nn.Identity()
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # 1. Feature Processing (Residual handled inside GRN, but we add DropPath for layer-level)
-        x = x + self.drop_path(self.grn(x) - x)
+        # 1. Feature Processing (Time-distributed)
+        x = self.grn(x)
         
         # 2. Temporal Mixing
-        x = x + self.drop_path(self.attn(x, mask=mask) - x)
+        x = self.attn(x, mask=mask)
         
         return x

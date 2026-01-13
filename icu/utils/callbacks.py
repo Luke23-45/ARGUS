@@ -482,11 +482,10 @@ class EMACallback(Callback):
     2. Zero-Copy: Uses pointer swapping to avoid memory overhead.
     3. Manual Opt Aware: Syncs update steps with custom optimization loops.
     """
-    def __init__(self, decay: float = 0.9999, cpu_offload: bool = True, update_every: int = 1):
+    def __init__(self, decay: float = 0.9999, cpu_offload: bool = True):
         super().__init__()
         self.decay = decay
         self.cpu_offload = cpu_offload
-        self.update_every = update_every
         self.ema: Optional[TieredEMA] = None
         self._deferred_ema_state: Optional[Dict] = None # For checkpoint loading
 
@@ -511,11 +510,7 @@ class EMACallback(Callback):
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if self.ema and (batch_idx + 1) % trainer.accumulate_grad_batches == 0:
-            self.ema.update(
-                pl_module.model, 
-                global_step=trainer.global_step, 
-                update_every=self.update_every
-            )
+            self.ema.update(pl_module.model)
 
     def on_validation_start(self, trainer, pl_module):
         self._init_ema(pl_module)
@@ -658,20 +653,6 @@ def get_sota_callbacks(cfg: DictConfig) -> List[Callback]:
     )
     callbacks.append(saver_cb)
     
-    # [USER-REQUESTED] Latest Epoch Saver
-    # Saves strictly the current epoch, overwriting the previous one.
-    # Naming format: {project/run_name}-{epoch}
-    latest_ckpt_cb = ModelCheckpoint(
-        dirpath=save_dir,
-        filename=f"{cfg.run_name}-latest-epoch={{epoch:02d}}",
-        monitor=None, # Save based on timing (latest)
-        save_top_k=1, # Keep only 1 (delete previous)
-        every_n_epochs=1,
-        save_weights_only=False,
-        auto_insert_metric_name=False # Cleaner filenames
-    )
-    callbacks.append(latest_ckpt_cb)
-    
     # [BACKUP] Optional Remote Mirroring (Simple Copy)
     remote_dir = cfg.get("remote_dir", None)
     if remote_dir:
@@ -689,9 +670,8 @@ def get_sota_callbacks(cfg: DictConfig) -> List[Callback]:
         callbacks.append(RemoteMirror())
     
     ema_decay = cfg.train.get("ema_decay", 0.9999)
-    ema_update_every = cfg.train.get("ema_update_every", 1)
     if ema_decay > 0:
-        callbacks.append(EMACallback(decay=ema_decay, update_every=ema_update_every))
+        callbacks.append(EMACallback(decay=ema_decay))
 
     # 2. Guardians (Anomaly, Metric, Health) - Keep as is
     callbacks.append(AnomalyGuardian(halt_on_anomaly=True))

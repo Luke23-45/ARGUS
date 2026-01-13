@@ -867,7 +867,7 @@ class TieredEMA:
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
                 # Async transfer GPU -> CPU
-                model_val = param.data.detach().to(device="cpu", non_blocking=True).float()
+                model_val = param.data.detach().to(device="cpu", non_blocking=False).float()
                 model_params.append(model_val)
                 shadow_params.append(self.shadow[name])
 
@@ -877,9 +877,9 @@ class TieredEMA:
                 target_dtype = self.shadow[name].dtype
                 
                 if torch.is_floating_point(buffer):
-                    new_data = buffer.data.detach().to(device="cpu", non_blocking=True).float()
+                    new_data = buffer.data.detach().to(device="cpu", non_blocking=False).float()
                 else:
-                    new_data = buffer.data.detach().to(device="cpu", non_blocking=True)
+                    new_data = buffer.data.detach().to(device="cpu", non_blocking=False)
                 
                 # Integer buffers (steps) copy directly
                 if target_dtype in (torch.int64, torch.int32, torch.bool):
@@ -920,8 +920,7 @@ class TieredEMA:
         for name, buffer in model.named_buffers():
             if name in self.shadow:
                 self.backup[name] = buffer.data.detach().cpu().clone()
-                # [v4.2.1 SOTA FIX] Standardize on Sync for Validation Swaps
-                buffer.data.copy_(self.shadow[name].to(buffer.device, non_blocking=False))
+                buffer.data.copy_(self.shadow[name].to(buffer.device, non_blocking=True))
 
     def restore(self, model: nn.Module):
         """
@@ -933,13 +932,12 @@ class TieredEMA:
         # Parameters
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.backup:
-                # [v4.2.1 SOTA FIX] Standardize on Sync for Validation Swaps
-                param.data.copy_(self.backup[name].to(param.device, non_blocking=False))
+                param.data.copy_(self.backup[name].to(param.device, non_blocking=True))
         
         # Buffers
         for name, buffer in model.named_buffers():
             if name in self.backup:
-                saved_data = self.backup[name].to(buffer.device, non_blocking=False)
+                saved_data = self.backup[name].to(buffer.device, non_blocking=True)
                 # Handle type mismatch
                 if buffer.dtype != saved_data.dtype:
                     if not torch.is_floating_point(buffer):
