@@ -126,9 +126,6 @@ class BGSLLoss(nn.Module):
         
         if mask is not None:
             slope_mask = mask[:, 1:] | mask[:, :-1] # Union of masks
-            # [v26.2 FIX] Restored Natural Alignment
-            # Wrapper now enforces T=24 for both inputs.
-            # pred_slopes is T-1 (23). surprise is T-1 (23). They align perfectly.
             l_trend = (l_trend_unreduced * surprise * (~slope_mask).unsqueeze(-1)).sum() / ((~slope_mask).sum() + 1e-8)
         else:
             l_trend = (l_trend_unreduced * surprise).mean()
@@ -142,14 +139,11 @@ class BGSLLoss(nn.Module):
         true_accel = (true_slopes[:, 1:] - true_slopes[:, :-1]).abs()
         l_shock_unreduced = F.mse_loss(pred_accel, true_accel, reduction='none')
         
-        # [v26.2 FIX] Restored Natural Alignment for Shock
-        # pred_accel is T-2 (22). num_shock is T-2 (22).
         if mask is not None:
-            # Mask for acceleration (union of 3 steps)
-            accel_mask = slope_mask[:, 1:] | slope_mask[:, :-1]
-            l_shock = (l_shock_unreduced * num_shock * (~accel_mask).unsqueeze(-1)).sum() / ((~accel_mask).sum() + 1e-8)
+            accel_mask = mask[:, 2:] | mask[:, 1:-1] | mask[:, :-2]
+            l_shock = (l_shock_unreduced * num_shock.detach() * (~accel_mask).unsqueeze(-1)).sum() / ((~accel_mask).sum() + 1e-8)
         else:
-            l_shock = (l_shock_unreduced * num_shock).mean()
+            l_shock = (l_shock_unreduced * num_shock.detach()).mean()
         
         # Constant Physics Supervision
         if self.training:

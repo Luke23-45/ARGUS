@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Dict
-import math
 
 class AsymmetricLoss(nn.Module):
     """
@@ -75,22 +74,7 @@ class EvidentialLoss(nn.Module):
         self.annealing_step = annealing_step
         self.epoch_num = 0
 
-    def get_decisiveness(self, alpha: torch.Tensor) -> torch.Tensor:
-        """
-        [SOTA 2026] Predictive Categorical Decisiveness.
-        Calculates normalized confidence from the expected probability distribution.
-        Returns: [1.0] for high confidence (delta), [0.0] for zero confidence (uniform).
-        """
-        # A = Expected probability distribution from Dirichlet(alpha)
-        p = alpha / alpha.sum(dim=-1, keepdim=True)
-        # Shannon Entropy H(p)
-        entropy = -torch.sum(p * torch.log(p + 1e-10), dim=-1)
-        # Normalized against maximum entropy log(K)
-        max_entropy = math.log(self.num_classes)
-        # Decisiveness = 1 - (Entropy / MaxEntropy)
-        return (1.0 - (entropy / (max_entropy + 1e-10))).mean()
-
-    def forward(self, alpha: torch.Tensor, y: torch.Tensor, epoch_num: int = None, samples_seen: int = None) -> torch.Tensor:
+    def forward(self, alpha: torch.Tensor, y: torch.Tensor, epoch_num: int = None) -> torch.Tensor:
         """
         alpha: [B, C] Dirichlet concentration parameters (alpha = evidence + 1)
         y: [B, C] One-hot target labels
@@ -110,59 +94,10 @@ class EvidentialLoss(nn.Module):
         # L = sum( y * (log(S) - log(alpha)) )
         nll = torch.sum(y * (torch.log(S) - torch.log(alpha)), dim=1, keepdim=True)
         
-        # [SOTA 2026] Dynamic Class Balancing (Effective Number of Samples)
-        # We calculate weights *per batch* to handle local skew in small batches,
-        # or use global stats if available. Here we use batch-local for robustness.
-        # Logic: If batch is 492:8, we need to upweight the 8 significantly.
-        with torch.no_grad():
-             # Check if y is one-hot or indices
-             if y.shape == alpha.shape:
-                 # One-hot: sum columns to get counts
-                 class_counts = y.sum(dim=0)
-             else:
-                 # Indices: bincount
-                 class_counts = torch.bincount(y.view(-1), minlength=self.num_classes).float()
-            
-             # [SOTA] CB Loss Formula: (1 - beta) / (1 - beta^n)
-             # Beta = 0.9999 for Sepsis (very heavily imbalanced, need high sensitivity)
-             beta = 0.9999 
-             effective_num = 1.0 - torch.pow(beta, class_counts)
-             weights = (1.0 - beta) / (effective_num + 1e-8)
-             
-             # Normalize weights so they sum to num_classes (keep loss scale consistent)
-             weights = weights / weights.sum() * self.num_classes
-             
-             # [SAFETY CLAMP] Prevent Weight Explosion (Panic Mode Fix)
-             # Z12 Analysis: Unclamped weights caused Recall->1.0 / Precision->0.0 crash.
-             # We clamp the max boost to 10.0x to ensure gradient stability.
-             weights = torch.clamp(weights, max=10.0)
-
-             
-             # Create weight tensor for current batch
-             # If y is one-hot [B, C], we need weights [1, C]
-             batch_weights = weights.unsqueeze(0)
-        
-        # Apply weights to NLL (The driving force)
-        nll = nll * (y * batch_weights).sum(dim=1, keepdim=True)
-
         # 2. KL Divergence Regularizer (Penalty for being confident but wrong)
         # Drives distribution towards uniform Dirichlet [1, 1, ...] when evidence is low/wrong.
-        
-        # [SOTA 2026] Adaptive Evidence-Entropy Annealing (AEEA)
-        # Decouples defense from fixed timers and makes it sensitive to the model's 'Arrogance'.
-        # Vector 1: Sample-Invariant Temporal Ramp (Batch-size independent)
-        # Rationale: 150,000 samples = 10 epochs at batch 150.
-        if samples_seen is not None:
-            time_idx = float(samples_seen) / 150000.0
-        else:
-            time_idx = self.epoch_num / self.annealing_step
-            
-        # Vector 2: State-Adaptive "Decisiveness" (Clinical Guard)
-        # Detects overconfidence in real-time and applies the penalty immediately.
-        state_idx = self.get_decisiveness(alpha)
-        
-        # Max-Defense: The barrier is only as weak as the model's humility.
-        annealing_coef = torch.max(torch.tensor(time_idx, device=alpha.device), state_idx).clamp(0, 1)
+        # annealed_weight = min(1, epoch / 10)
+        annealing_coef = min(1, max(self.epoch_num / self.annealing_step, 0))
         
         # KL(Dir(alpha) || Dir([1,1,...]))
         # Approximate: alpha_tilde = y + (1-y)*alpha
@@ -356,7 +291,7 @@ class SequenceAuxHead(nn.Module):
         # Critical for safety when inputs are 90% imputed.
         self.criterion = EvidentialLoss(num_classes=num_classes, annealing_step=10)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, targets: Optional[torch.Tensor] = None, epoch_num: int = None, samples_seen: int = None, return_sequence: bool = False) -> Dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, targets: Optional[torch.Tensor] = None, epoch_num: int = None, return_sequence: bool = False) -> Dict[str, torch.Tensor]:
         """
         [SOTA 2025] Evidential Forward Pass.
         Returns:
@@ -380,8 +315,7 @@ class SequenceAuxHead(nn.Module):
         
         # 4. Predict
         if return_sequence:
-            # [v25.7 SOTA FIX] Return full sequence including CLS token at index 0
-            # This allows unified one-pass execution in the training loop.
+            # [v25.7 SOTA FIX] Pass full sequence (inclusive of CLS) for unified pass
             logits = self.head(x_seq)
         else:
             cls_out = x_seq[:, 0, :]
@@ -398,31 +332,29 @@ class SequenceAuxHead(nn.Module):
         # 6. Loss
         loss = None
         if targets is not None:
-             # [v26.3 SAFETY FIX] Hybrid Mode Support
-             # If returning sequence, we specifically extract the CLS token (index 0)
-             # to compute the diagnostic loss. This ensures 'aux_loss' is never None.
-             if return_sequence:
-                 logits_for_loss = logits[:, 0, :]
-             else:
-                 logits_for_loss = logits
-                 
-             num_classes = logits_for_loss.shape[-1]
-             if num_classes > 1:
+            # [v14.0 PATCH] Decouple sequence return from supervision logic
+            if return_sequence:
+                # Extract global risk (index 0) even if returning temporal sequence
+                logits_for_loss = logits[:, 0, :]
+                alpha_for_loss = alpha[:, 0, :]
+            else:
+                logits_for_loss = logits
+                alpha_for_loss = alpha
+                
+            num_classes = logits_for_loss.shape[-1]
+            if num_classes > 1:
                 # [SOTA FIX] Multi-Class One-Hot Conversion
                 if targets.ndim == 1:
                     targets_oh = F.one_hot(targets.long(), num_classes=num_classes).float()
                 else:
                     targets_oh = targets.float()
-             else:
+            else:
                 targets_oh = targets.float().unsqueeze(-1) if targets.ndim == 1 else targets.float()
-                
-             # [v14.0 PATCH] Use Evidential Loss on alphas
-             # We pass 'alpha' (Dirichlet params) instead of 'logits'
-             # Note: The loss needs the current epoch for KL annealing.
-             # Recalculate alpha for CLS token specifically
-             evidence_loss = F.softplus(logits_for_loss)
-             alpha_loss = evidence_loss + 1
-             loss = self.criterion(alpha_loss, targets_oh, epoch_num=epoch_num, samples_seen=samples_seen)
+                    
+            # [v14.0 PATCH] Use Evidential Loss on alphas
+            # We pass 'alpha' (Dirichlet params) instead of 'logits'
+            # Note: The loss needs the current epoch for KL annealing. 
+            loss = self.criterion(alpha_for_loss, targets_oh, epoch_num=epoch_num)
             
         return {
             "logits": logits,

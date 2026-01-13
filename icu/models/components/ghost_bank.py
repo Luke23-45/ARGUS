@@ -148,7 +148,7 @@ class SepsisGhostBank(nn.Module):
         # Intra-Batch Redundancy Filtering (SOTA v25.7 Precision Guard)
         # Prevents filling the bank with identical samples from the same batch
         with torch.no_grad():
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast('cuda', enabled=False):
                 norm_b = F.normalize(latents, dim=1).half()
                 b_self_sim = torch.matmul(norm_b, norm_b.T)
                 # Mask out identity diagonal
@@ -189,7 +189,7 @@ class SepsisGhostBank(nn.Module):
 
         # 3. Vectorized Similarity Check (v25.7 Precision Guard)
         # Using .half() for the similarity matrix reduces peak VRAM by 50% for this op.
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             norm_new = F.normalize(latents, dim=1).half()
             norm_old = F.normalize(self.latent_anchors[:self.size], dim=1).half()
             # Similarity Matrix [B, Size] in FP16

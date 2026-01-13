@@ -426,10 +426,6 @@ class ICUGeneralistWrapper(pl.LightningModule):
         self.register_buffer("_awr_stats_initialized", torch.tensor(False))
         self.validation_step_outputs = []
         
-        # [v25.6 SOTA] Batch-Invariant Sample Counter
-        # Ensures that AEEA annealing is exactly calibrated across any batch size.
-        self.register_buffer("total_samples_seen", torch.tensor(0, dtype=torch.long))
-        
         # [Point 5] Bayesian Moving Average Calibration
         # Initialized to 0.5; will be updated via F2-opt during validation.
         self.register_buffer("calibrated_threshold", torch.tensor(0.5))
@@ -446,10 +442,6 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # Flattened size based on encoder hidden dim (e.g., 512, 1024)
         # We will initialize this lazily in training_step
         self._fnd_grad_ema = None 
-
-        # [v25.0 AEEA] Persistent Clinical History Counter
-        # Dekouples learning from epochs to ensure batch-invariance.
-        self.register_buffer("total_samples_seen", torch.tensor(0, dtype=torch.long))
 
     def on_train_epoch_start(self):
         """[Phase 3/4] Update AWR Horizon and SOTA v4.2 Warmup."""
@@ -502,11 +494,6 @@ class ICUGeneralistWrapper(pl.LightningModule):
         """
         return self.model(batch)
 
-    # =====================================================================
-    # [v26.4 CLEANUP] Removed OOM-Prone Vectorized Utils
-    # Reverted to iterative logic in training_step.
-    # =====================================================================
-
     # =========================================================================
     # SOTA TRAINING LOGIC (The "Heart")
     # =========================================================================
@@ -519,10 +506,6 @@ class ICUGeneralistWrapper(pl.LightningModule):
         
         opt = self.optimizers()
         B = batch["observed_data"].size(0)
-        
-        # [v25.0 AEEA] Atomic Clinical Clock Increment
-        # This ensuring regularization maturaty is tied to data volume, not wall-time.
-        self.total_samples_seen += B
         
         # [v17.3] Omega Summoning: Constant Clinical Pressure
         # Select 4 ghosts using a rank-agnostic global seed for DDP synchronization.
@@ -672,33 +655,23 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # [FIX] Define targets before evidential forward pass
             targets = batch["phase_label"] # [B]
 
-            # [v25.7 SOTA FIX] Unified Sequence-Aware Forward Pass
-            # Rationale: One pass with return_sequence=True provides both CLS and Sequence risk.
-            # This eliminates redundant activation memory in the 15GB VRAM limit.
+            # Forward pass to get current competence (Uncertainty)
             aux_out = self.model.aux_head(
                 ctx_aux, 
                 mask=ctx_mask, 
                 targets=targets_expanded, # [v17.3 FIX] Use expanded targets for [B+G] context
-                samples_seen=int(self.total_samples_seen), # [v25.0 AEEA] Dynamic Annealing context
-                epoch_num=self.current_epoch,
-                return_sequence=True # Always return sequence for downstream BGSL
+                epoch_num=self.current_epoch 
             )
-            logits_seq_full = aux_out["logits"]
-            # Extract CLS logits (index 0) from the sequence for standard diagnostic loss
-            logits = logits_seq_full[:, 0, :] if logits_seq_full.dim() == 3 else logits_seq_full
-            
+            logits = aux_out["logits"]
             aux_loss_base = aux_out["loss"]
-            uncertainty = aux_out["uncertainty"][:, 0, :] if aux_out["uncertainty"].dim() == 3 else aux_out["uncertainty"]
+            uncertainty = aux_out["uncertainty"] # [B, 1]
             
             # Use detachment to compute trust factor (Cybernetic Control Gate)
-            # [Z9 PATCH] Disabled Trust Factor to restore Z8 dynamics
-            # Original code (caused gradient starvation):
-            # u_avg = uncertainty.detach().mean()
-            # trust_factor = (1.0 - (u_avg * 0.9)).clamp(min=0.1, max=1.0).item()
-            trust_factor = 1.0  # Always full gradient flow
+            u_avg = uncertainty.detach().mean()
+            # Trust Factor: 1.0 (Confident) -> 0.1 (Panic)
+            trust_factor = (1.0 - (u_avg * 0.9)).clamp(min=0.1, max=1.0).item()
             
             # Surgical Hook: Scopes gradients only for the shared connection
-            # (Now a no-op since trust_factor = 1.0, but kept for structure)
             if ctx_aux.requires_grad:
                 ctx_aux.register_hook(lambda grad: grad * trust_factor)
             
@@ -1008,18 +981,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # However, for now, let's assume we use the window-level logits for state loss
             # and potentially expand SequenceAuxHead if we want sequence-level risk.
             
-            # [v25.7 SOTA FIX] Reusing Unified Sequence Results
-            # No redundant forward pass; eliminates OOM on 15GB hardware.
-            # logits_seq_full contains [CLS, T1, T2, ...] or [CLS_aux, CLS_enc, T1, ...]
-            # [v26.1 FIX] Dynamic Tail Slicing
-            # We must ensure logits_seq matches 'past' length exactly (T=24).
-            # Using -T_obs: ensures we get the actual sequence regardless of how many CLS tokens exist.
-            T_obs = past.shape[1]
-            # Ensure safety if logits are shorter (shouldn't happen)
-            if logits_seq_full.shape[1] > T_obs:
-                 logits_seq = logits_seq_full[:, -T_obs:, :]
-            else:
-                 logits_seq = logits_seq_full[:, 1:, :]
+            # [v5.2] Manifold Sync: Use the SOTA SequenceAuxHead for BGSL supervision
+            # We call the aux_head with return_sequence=True to get [B, T, C]
+            aux_seq_out = self.model.aux_head(ctx_expert, return_sequence=True)
+            logits_seq = aux_seq_out["logits"]
             
             if logits_seq.shape[-1] > 1:
                 # [SOTA Alignment] Convert multi-class logits to a single "Sepsis Risk" logit
@@ -1027,52 +992,24 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 pred_state = logits_seq[..., 1:].logsumexp(dim=-1, keepdim=True) - logits_seq[..., 0:1]
             else:
                 pred_state = logits_seq
-
-            # [v26.6 FIX] Universal Dynamic Tail Slicing (The "Iron Dome")
-            # Problem: Encoder output is T=25 (with CLS), Aux Head is T=26 (with its own CLS). This creates massive chaos.
-            # Solution: We enforce that ALL inputs to BGSL are sliced to exactly match the known ground truth length (T_obs).
-            T_obs = past.shape[1]
             
-            # 1. Prediction Alignment
-            # [Fix v27.1] Do NOT overwrite pred_state here. It was calculated above (reduced or not).
-            # We ONLY need to ensure pred_state itself is sliced if it somehow exceeds T_obs.
-            if pred_state.shape[1] > T_obs:
-                 pred_state = pred_state[:, -T_obs:, :]
-            
-            # 2. Ground Truth Alignment
-            # true_state is expanded from [B, 1, 1] to match ctx_expert [B, T=25, 1]. We must slice it back to T_obs.
+            # [v5.1 SOTA] Surgical Signal Preservation
+            # 0.1 Smoothing: 1.0 -> 0.95, 0.0 -> 0.05
+            # Prevents Uncertainty Scaler singularity by keeping loss > 0.
             ls_alpha = 0.1
             true_state_binary = (batch["phase_label"] > 0).float()
             smoothed_target = true_state_binary * (1 - ls_alpha) + (ls_alpha / 2)
-            true_state = smoothed_target.view(B, 1, 1).expand(-1, ctx_expert.size(1), 1) # Original true_state
-            
-            if true_state.shape[1] > T_obs:
-                 true_state_bgsl = true_state[:, -T_obs:, :]
-            else:
-                 true_state_bgsl = true_state
-                 
-            # 3. Mask Alignment
-            # mask comes from ctx_mask which includes CLS tokens.
-            mask_bgsl = ctx_mask # Original ctx_mask
-            if ctx_mask is not None and ctx_mask.shape[1] > T_obs:
-                 mask_bgsl = ctx_mask[:, -T_obs:]
-            
-            # 4. Risk Coef Alignment
-            risk_coef_bgsl = risk_coef.view(B, 1, 1).expand(-1, T_obs, 1) # Force expand to correct shape directly
+            true_state = smoothed_target.view(B, 1, 1).expand(-1, ctx_expert.size(1), 1)
             
             # [v17.4] Surgical Forensic Fix: BGSL restricted to real batch [0:B]
             # Rationale: BGSL computes physical slopes which are not available for Ghosts.
-            # Note: We slice [:, 1:] inside BGSL or here?
-            # BGSL expects full sequence and does derivative internally. BUT we must ensure T is consistent.
-            # If we pass T=24, BGSL will compute T=23 derivatives.
-            # Previously we passed [:, 1:]. Let's stick to standard practice: Pass FULL aligned sequence (T=24).
-            
+            T_obs = past.shape[1]
             bgsl_out = self.bgsl_loss(
-                pred_state[:B],       # [B, T=24, 1]
-                true_state_bgsl[:B],  # [B, T=24, 1]
-                past,                 # [B, T=24, D] (Original batch)
-                risk_coef=risk_coef_bgsl[:B], 
-                mask=mask_bgsl[:B]    # [B, T=24]
+                pred_state[:B, -T_obs:, :], # [B, T, 1]
+                true_state[:, -T_obs:, :],  # [B, T, 1]
+                past,               # [B, T, D] (Original batch)
+                risk_coef=risk_coef.view(B, 1, 1), 
+                mask=ctx_mask[:B, -T_obs:] # [B, T]
             )
             l_bgsl = bgsl_out["loss"]
             
@@ -1133,14 +1070,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 # Result: Foundation gets full gradients (1.0), Expert gets amplified gradients (Beta).
                 
                 # Beta = How much bigger is Diffusion than Aux? (e.g., 0.25 / 0.006 = ~40x)
-                # [v31.0 Z14 FIX] Operation Unclamped
-                # We relax the clamp from 50.0 to 100.0 to allow full Expert Expression.
-                beta = (d_ema / (a_ema + 1e-8)).clamp(1.0, 100.0)
+                # We clamp beta to prevent massive explosions in early training.
+                beta = (d_ema / (a_ema + 1e-8)).clamp(1.0, 50.0)
                 
-                # [v31.0 Z14 FIX] Removed Proactive Gradient Cool-Down
-                # Rationale: Throttling shocks prevents learning critical sepsis onsets.
-                # We rely on Global Gradient Clipping (Iron Dome) for safety.
-                cool_down = 1.0 
+                # [v21.0 FIX] Proactive Gradient Cool-Down
+                # If the manifold is shocking (GN > 5.0), we throttle the Expert to preventing breaking the backbone.
+                is_shocking = (self.grad_norm_ema > 5.0)
+                cool_down = 0.5 if is_shocking else 1.0
                 
             loss_dict['diffusion'] = diff_loss # Foundation is UNTOUCHED
             
@@ -1177,100 +1113,61 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # gradients from previous mini-batches during the A-GEM projection loop.
             acc_batches = self.trainer.accumulate_grad_batches
             is_accumulating = (batch_idx % acc_batches != 0)
-            accum_grads_vec = None
+            accum_grads = {}
             
             if is_accumulating:
-                # [v26.4 REVERT] Switch to Iterative Backup (OOM Rescue)
-                # The "Vectorized" optimization (torch.cat) required 300MB+ contiguous memory,
-                # causing OOM on 15GB cards. We revert to a list-based backup.
-                filter_keys = ["backbone", "encoder", "scheduler", "loss_scaler"]
-                # Manual Iterative Backup
-                accum_grads_list = []
                 for name, p in self.named_parameters():
-                    if p.requires_grad:
-                        if any(k in name for k in filter_keys): 
-                             accum_grads_list.append(None) # Placeholder to maintain index alignment
-                             continue
-                        if p.grad is not None:
-                            accum_grads_list.append(p.grad.to("cpu", non_blocking=True)) # Offload to CPU to save VRAM
-                        else:
-                            accum_grads_list.append(None)
-                
-                # Zero bucket but keep structure
-                self.zero_grad(set_to_none=False)
+                    if p.grad is not None:
+                        accum_grads[name] = p.grad.clone()
+                        p.grad.zero_()
 
             if l_ref is not None and l_ref.grad_fn is not None:
                 # A. Ghost Pass (Reference)
                 # Protects the Clinical Memory Manifold
+                # [FIX]: Use manual_backward cleanly without opt.zero_grad()
                 self.manual_backward(l_ref, retain_graph=True)
                 
-                # [v26.4 REVERT] Iterative Reference Capture
-                # Replaces OOM-prone usage of _get_vectorized_grads (torch.cat)
-                ref_grads = {}
-                filter_keys = ["backbone", "scheduler", "loss_scaler"]
-                
-                # Snapshot Reference Gradients
+                # Capture Reference Gradients...
+                g_ref = {}
                 for name, p in self.named_parameters():
-                    if p.grad is not None and not any(k in name for k in filter_keys):
-                        ref_grads[name] = p.grad.detach().clone()
+                    # [v20.1 Hardened] Include 'acl_projector' in reference path
+                    if p.grad is not None and not any(k in name for k in ["backbone", "scheduler", "loss_scaler"]):
+                        g_ref[name] = p.grad.clone()
                         p.grad.zero_()
+                
+                # print(f"DEBUG: A-GEM Ghost Pass (GradFn: {l_ref.grad_fn}) captured {len(g_ref)} diagnostic grads")
                 
                 # B. Batch Pass
                 self.manual_backward(l_batch)
                 
-                # C. [v26.4 FIX] Iterative A-GEM Projection
-                # Compute dot(g, g_ref) without concatenation
-                dot_prod = 0.0
-                ref_mag = 0.0
+                batch_grad_count = sum(1 for name, p in self.named_parameters() if p.grad is not None and not any(k in name for k in ["backbone", "scheduler", "loss_scaler"]))
+                # print(f"DEBUG: A-GEM Batch Pass (GradFn: {l_batch.grad_fn}) produced {batch_grad_count} diagnostic grads")
                 
-                # 1. Compute Dot Product
-                for name, p in self.named_parameters():
-                    if p.grad is not None and name in ref_grads:
-                        g_ref = ref_grads[name]
-                        dot_prod += torch.sum(p.grad * g_ref)
-                        ref_mag += torch.sum(g_ref * g_ref)
-                
-                # 2. Project if conflict
-                if dot_prod < 0:
-                    scaling = dot_prod / (ref_mag + 1e-8)
+                # C. [SOTA] A-GEM Projection
+                with torch.no_grad():
+                    proj_count = 0
                     for name, p in self.named_parameters():
-                         if name in ref_grads and p.grad is not None:
-                             # g_proj = g - (g_ref * scaling)
-                             g_ref = ref_grads[name]
-                             p.grad.sub_(g_ref * scaling)
-                
-                # 3. Add Reference Gradients back (Optimization Objective: L_total = L_batch_projected + L_ref)
-                for name, p in self.named_parameters():
-                    if name in ref_grads:
-                        if p.grad is None:
-                            p.grad = ref_grads[name]
-                        else:
-                            p.grad.add_(ref_grads[name])
+                        if name in g_ref and p.grad is not None:
+                            dot_prod = torch.sum(p.grad * g_ref[name])
+                            if dot_prod < 0:
+                                ref_norm_sq = torch.sum(g_ref[name] * g_ref[name]) + 1e-8
+                                p.grad.sub_(g_ref[name], alpha=dot_prod / ref_norm_sq)
+                                proj_count += 1
+                            p.grad.add_(g_ref[name])
+                    # print(f"DEBUG: A-GEM Projection applied to {proj_count}/{len(g_ref)} diagnostic layers")
             else:
+                # print("DEBUG: A-GEM Fallback (Single Pass)")
                 self.manual_backward(total_loss)
 
-            # [SOTA v25.7] Restore Accumulated Gradients (Filtered)
-            # [SOTA v25.7] Restore Accumulated Gradients (Filtered)
-            if is_accumulating and 'accum_grads_list' in locals() and accum_grads_list is not None:
-                # [v26.4 REVERT] Iterative Restore
-                # Add stored gradients back to current gradients
-                ptr = 0
-                filter_keys = ["backbone", "encoder", "scheduler", "loss_scaler"]
-                for name, p in self.named_parameters():
-                    if p.requires_grad:
-                        if any(k in name for k in filter_keys):
-                            ptr += 1
-                            continue
-                        
-                        g_stored = accum_grads_list[ptr]
-                        if g_stored is not None:
-                            # Move back to GPU if needed
-                            g_stored = g_stored.to(p.device, non_blocking=True)
+            # [SOTA FIX] Restore Accumulated Gradients
+            if is_accumulating:
+                with torch.no_grad():
+                    for name, p in self.named_parameters():
+                        if name in accum_grads:
                             if p.grad is None:
-                                p.grad = g_stored
+                                p.grad = accum_grads[name]
                             else:
-                                p.grad.add_(g_stored)
-                        ptr += 1
+                                p.grad.add_(accum_grads[name])
             
             # [PMS] SCS: Manifold Health Monitoring
             with torch.no_grad():
@@ -2080,45 +1977,6 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
     # Removed on_before_optimizer_step in favor of manual clipping in training_step
 
-    def get_dynamic_ema_decay(self, batch_size: int, beta_ref: float = 0.999, batch_ref: int = 256) -> float:
-        """
-        [SOTA 2026] Adaptive EMA Decay (Polyack Invariance).
-        Calculates decay rate that preserves the "Sample Half-Life" across batch sizes.
-        Formula: beta_new = beta_ref ^ (batch_size / batch_ref)
-        """
-        # Exponent > 1 means decay gets smaller (faster forgetting)
-        # Exponent < 1 means decay gets larger (slower forgetting)
-        # Ratio 2.0 (Batch 500) -> 0.999^1.95 = 0.998
-        scaling_ratio = batch_size / float(batch_ref)
-        dynamic_beta = beta_ref ** scaling_ratio
-        logger.info(f"⚡ [Dynamic EMA] Adjusted beta {beta_ref} -> {dynamic_beta:.5f} for Batch {batch_size} (Scale: {scaling_ratio:.2f}x)")
-        return dynamic_beta
-
-    def get_auto_warmup_steps(self, batch_size: int, total_steps: int) -> int:
-        """
-        [SOTA 2026] Auto-Scaling Warmup (Linear Rule).
-        Standard: 5 Epochs of Warmup, regardless of step count.
-        """
-        if self.trainer.datamodule is not None and hasattr(self.trainer.datamodule, "train_dataset"):
-            num_samples = len(self.trainer.datamodule.train_dataset)
-        else:
-            # Fallback for inference/resuming without datamodule attached yet
-            num_samples = 451305 # Hardcoded Phase 1 size as safety
-            
-        steps_per_epoch = num_samples // batch_size
-        warmup_epochs = 5 # ROI (Region of Interest) Alignment Standard
-        
-        warmup_steps = steps_per_epoch * warmup_epochs
-        
-        # Override if manually set to something suspiciously specific (not 500 default)
-        manual_steps = self.cfg.train.get("warmup_steps", 500)
-        if manual_steps != 500 and manual_steps > 0:
-             logger.info(f"⚡ [Warmup] User Override Detected: {manual_steps} (Ignored Auto: {warmup_steps})")
-             return manual_steps
-             
-        logger.info(f"⚡ [Auto-Warmup] Batch {batch_size} => {steps_per_epoch} steps/epoch. Warmup (5 Epochs): {warmup_steps} steps.")
-        return int(warmup_steps)
-
     def configure_optimizers(self):
         """
         [2025 SOTA] Conflict-Averse Optimizer Configuration.
@@ -2157,9 +2015,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Rationale: When scaling batch size (Z8=120 -> 500), we must scale LR
             # to preserve convergence velocity.
             # Effective Batch Size = BatchPerGPU * Devices * Accumulation
-            # [FIX] Use cfg.train.batch_size as source of truth (datamodule might wrap it)
-            batch_per_gpu = self.cfg.train.batch_size
-            eff_batch_size =  batch_per_gpu * self.trainer.num_devices * self.trainer.accumulate_grad_batches
+            eff_batch_size =  self.trainer.datamodule.batch_size * self.trainer.num_devices * self.trainer.accumulate_grad_batches
             
             # Scaling Factor: Reference batch size 256
             # If batch=500, scale=~2.0x. If batch=120, scale=~0.5x.
@@ -2218,28 +2074,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
         else:
             # "sota_2025" uses Integrated Scalar Loss -> Pure Optimizer is optimal
             optimizer = base_optimizer
-            
-        # [SOTA 2026] Dynamic Optimization Hooks
-        # We perform these calculations here because we need 'eff_batch_size' and 'total_steps'
-        total_steps = self.trainer.estimated_stepping_batches
-        
-        # 1. Update EMA Decay dynamically (inject into Model Config so TieredEMA sees it)
-        if hasattr(self, 'model') and hasattr(self.model, 'ema_decay'):
-             # Note: self.model.ema_decay works if using my custom TieredEMA wrapper
-             # But usually EMA is handled by a callback or wrapper class. 
-             # Assuming 'wrapper_generalist' manages EMA (L93 in config implies it).
-             # We update the config value itself for reference
-             new_decay = self.get_dynamic_ema_decay(eff_batch_size)
-             self.cfg.train.ema_decay = new_decay # Update config so EMA callback picks it up
-             
-             # Also update the active EMA object if it exists
-             if hasattr(self, 'ema') and self.ema is not None:
-                 self.ema.decay = new_decay
-                 
-        # 2. Calculate Warmup
-        warmup_steps = self.get_auto_warmup_steps(eff_batch_size, total_steps)
-        
+
         # 3. Learning Rate Scheduler
+        total_steps = self.trainer.estimated_stepping_batches
+        warmup_steps = int(total_steps * self.cfg.train.get("warmup_ratio", 0.05))
+        
         scheduler = get_cosine_schedule_with_warmup(
             optimizer, 
             num_warmup_steps=warmup_steps, 
