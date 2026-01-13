@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple
 
 class AsymmetricLoss(nn.Module):
     """
@@ -9,13 +9,8 @@ class AsymmetricLoss(nn.Module):
     Unlike Focal Loss which just handles down-weighting easy negatives,
     Asymmetric Loss allows us to explicitly PENALIZE False Negatives more than False Positives.
     Crucial for Sepsis: Missing a case (FN) is worse than a false alarm (FP).
-    
-    [v13.0 PATCH] Tuned gamma values based on data analysis:
-    - Data shows 98.24% normal, 1.76% sepsis at timestep level
-    - gamma_neg=6: Aggressively down-weight easy negatives (was 4)
-    - gamma_pos=0: Don't down-weight any positives - they're precious (was 1)
     """
-    def __init__(self, gamma_neg=6, gamma_pos=0, clip=0.05, eps=1e-8, disable_torch_grad_focal_loss=True):
+    def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-8, disable_torch_grad_focal_loss=True):
         super().__init__()
         self.gamma_neg = gamma_neg
         self.gamma_pos = gamma_pos
@@ -59,62 +54,6 @@ class AsymmetricLoss(nn.Module):
             
         return loss.mean()
 
-class EvidentialLoss(nn.Module):
-    """
-    [SOTA 2025] Evidential Loss (Type II Maximum Likelihood).
-    Minimizes the "Bayes Risk" with respect to the Dirichlet prior.
-    
-    Components:
-    1. Negative Log Likelihood (NLL): Fit the data.
-    2. KL Divergence: Regularize towards uniform distribution (vacuous prior) to prevent overconfidence.
-    """
-    def __init__(self, num_classes: int = 2, annealing_step: int = 25):
-        super().__init__()
-        self.num_classes = num_classes
-        self.annealing_step = annealing_step
-        self.epoch_num = 0
-
-    def forward(self, alpha: torch.Tensor, y: torch.Tensor, epoch_num: int = None) -> torch.Tensor:
-        """
-        alpha: [B, C] Dirichlet concentration parameters (alpha = evidence + 1)
-        y: [B, C] One-hot target labels
-        """
-        if epoch_num is not None:
-            self.epoch_num = epoch_num
-            
-        S = torch.sum(alpha, dim=1, keepdim=True)
-        
-        # 1. Expected Mean Squared Error (Risk)
-        # A = E[p] = alpha / S
-        # Loss = (y - A)^2 + Var(p)
-        A = alpha / S
-        m = alpha / S
-        
-        # Log Likelihood of the Dirichlet (Type 2 ML)
-        # L = sum( y * (log(S) - log(alpha)) )
-        nll = torch.sum(y * (torch.log(S) - torch.log(alpha)), dim=1, keepdim=True)
-        
-        # 2. KL Divergence Regularizer (Penalty for being confident but wrong)
-        # Drives distribution towards uniform Dirichlet [1, 1, ...] when evidence is low/wrong.
-        # annealed_weight = min(1, epoch / 10)
-        annealing_coef = min(1, max(self.epoch_num / self.annealing_step, 0))
-        
-        # KL(Dir(alpha) || Dir([1,1,...]))
-        # Approximate: alpha_tilde = y + (1-y)*alpha
-        alpha_tilde = y + (1 - y) * alpha
-        S_tilde = torch.sum(alpha_tilde, dim=1, keepdim=True)
-        
-        # KL term
-        # KL term: KL(Dir(alpha_tilde) || Dir(1))
-        # Correct Formula: log(Gamma(S_tilde)/Gamma(K)) - sum(log(Gamma(alpha_tilde))) + sum((alpha_tilde - 1) * (digamma(alpha_tilde) - digamma(S_tilde)))
-        kl = torch.lgamma(S_tilde) - torch.lgamma(torch.tensor(self.num_classes, dtype=alpha.dtype, device=alpha.device)) \
-             - torch.sum(torch.lgamma(alpha_tilde), dim=1, keepdim=True) \
-             + torch.sum((alpha_tilde - 1) * (torch.digamma(alpha_tilde) - torch.digamma(S_tilde)), dim=1, keepdim=True)
-             
-        # Combine
-        loss = nll + annealing_coef * kl
-        return loss.mean()
-
 # --- Shared SOTA Components (Duplicated from nth_encoder.py for independence) ---
 class SwiGLU(nn.Module):
     def __init__(self, input_dim: int, output_dim: int, bias: bool = True):
@@ -125,23 +64,6 @@ class SwiGLU(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear_act(x) * self.silu(self.linear_gate(x))
-
-class DropPath(nn.Module):
-    """
-    [v10.0] Stochastic Depth (DropPath) regularization.
-    """
-    def __init__(self, drop_prob: float = 0.0):
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.drop_prob == 0.0 or not self.training:
-            return x
-        keep_prob = 1 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-        random_tensor.floor_()
-        return x.div(keep_prob) * random_tensor
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, d_model: int, max_seq_len: int = 5000):
@@ -215,28 +137,33 @@ class SotaTransformerBlock(nn.Module):
     """
     [2025 SOTA] Pre-RMSNorm + RoPE + SwiGLU Block.
     """
-    def __init__(self, d_model: int, n_heads: int, drop_path_prob: float = 0.1):
+    def __init__(self, d_model: int, n_heads: int):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
         self.attn = RoPEMultiheadAttention(d_model, n_heads)
         self.norm2 = RMSNorm(d_model)
+        self.ffn = SwiGLU(d_model, d_model) # FFN usually projects up?
+        # Standard Transformer FFN: d -> 4d -> d
+        # SwiGLU handles internal projection.
+        # Let's verify standard SwiGLU FFN: 
+        # Usually: Gate(d->4d), Val(d->4d) -> Output(4d->d)
+        # My SwiGLU(d, d) above is simple. Let's make a proper FFN wrapper.
         self.ffn_net = nn.Sequential(
-            SwiGLU(d_model, d_model * 4), 
-            nn.Linear(d_model * 4, d_model)
+            SwiGLU(d_model, d_model * 4), # Expands to 4x
+            nn.Linear(d_model * 4, d_model) # Projects back
         )
         self.dropout = nn.Dropout(0.1)
-        self.drop_path = DropPath(drop_path_prob) if drop_path_prob > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # 1. Pre-Norm Attention
         x_norm = self.norm1(x)
         attn_out, _ = self.attn(x_norm, x_norm, x_norm, key_padding_mask=mask)
-        x = x + self.drop_path(self.dropout(attn_out))
+        x = x + self.dropout(attn_out)
         
         # 2. Pre-Norm FFN (SwiGLU)
         x_norm = self.norm2(x)
         ffn_out = self.ffn_net(x_norm)
-        x = x + self.drop_path(self.dropout(ffn_out))
+        x = x + self.dropout(ffn_out)
         
         return x
 
@@ -245,14 +172,14 @@ class SequenceAuxHead(nn.Module):
     [Step 4] Sequence-Aware Classification Head - SOTA Version.
     Features: CLS Token, RoPE Attention, SwiGLU FFN, RMSNorm, Asymmetric Loss.
     """
-    def __init__(self, d_model: int, num_classes: int = 1, num_layers: int = 2, n_heads: int = 4, drop_path_prob: float = 0.1):
+    def __init__(self, d_model: int, num_classes: int = 1, num_layers: int = 2, n_heads: int = 4):
         super().__init__()
         self.d_model = d_model
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         
         # SOTA Stack
         self.blocks = nn.ModuleList([
-            SotaTransformerBlock(d_model, n_heads, drop_path_prob=drop_path_prob) for _ in range(num_layers)
+            SotaTransformerBlock(d_model, n_heads) for _ in range(num_layers)
         ])
         
         # Final Projection
@@ -263,40 +190,9 @@ class SequenceAuxHead(nn.Module):
             nn.Linear(d_model, num_classes)
         )
         
-        # [v15.0 SOTA] Prior-Aware Initialization
-        # Constraint: Sepsis prevalence is 1.76%.
-        # Standard init assumes 50/50 (binary) or Uniform (multi-class), causing massive initial gradient shock.
-        # Fix: Hardcode bias to log(odds) of prevalence.
-        final_layer = self.head[-1]
-        
-        # Standard logic for Imbalanced Classification (Works for Softmax/Sigmoid and EDL)
-        # Target: P(Sepsis) approx 0.0176
-        bias_val = -4.02 # log(0.0176 / 0.9824)
-        
-        if num_classes > 1:
-            # Multi-class Case (Stable vs Pre-Shock vs Shock)
-            # Class 0 (Stable) is dominant (~98%) -> Bias 0 (Reference)
-            # Classes > 0 are rare (~2%) -> Bias -4.02
-            nn.init.zeros_(final_layer.bias)
-            with torch.no_grad():
-                final_layer.bias[1:].fill_(bias_val)
-        else:
-            # Binary Case
-            nn.init.constant_(final_layer.bias, bias_val)
-        
+        self.criterion = AsymmetricLoss(gamma_neg=4, gamma_pos=1)
 
-        
-        # [v14.0 PATCH] Replaced AsymmetricLoss with EvidentialLoss
-        # This allows the model to output *uncertainty* alongside probability.
-        # Critical for safety when inputs are 90% imputed.
-        self.criterion = EvidentialLoss(num_classes=num_classes, annealing_step=10)
-
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, targets: Optional[torch.Tensor] = None, epoch_num: int = None, return_sequence: bool = False) -> Dict[str, torch.Tensor]:
-        """
-        [SOTA 2025] Evidential Forward Pass.
-        Returns:
-            Dict containing 'logits', 'alpha' (Dirichlet), 'uncertainty', and 'loss' (if targets)
-        """
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, targets: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         B = x.shape[0]
         # 1. Prepend CLS
         cls_tokens = self.cls_token.expand(B, -1, -1)
@@ -313,52 +209,28 @@ class SequenceAuxHead(nn.Module):
         for block in self.blocks:
             x_seq = block(x_seq, mask=seq_mask)
         
-        # 4. Predict
-        if return_sequence:
-            # [v25.7 SOTA FIX] Pass full sequence (inclusive of CLS) for unified pass
-            logits = self.head(x_seq)
-        else:
-            cls_out = x_seq[:, 0, :]
-            logits = self.head(cls_out)
+        # 4. Extract CLS
+        cls_out = x_seq[:, 0, :]
         
-        # 5. [SOTA 2025] Evidential Deep Learning (EDL)
-        # alpha = evidence + 1. We use Softplus for evidence to ensure non-negativity.
-        evidence = F.softplus(logits)
-        alpha = evidence + 1
-        S = torch.sum(alpha, dim=-1, keepdim=True)
-        # Vacuous Uncertainty: Lower means the model is more confident in the distribution
-        uncertainty = logits.shape[-1] / S 
+        # 5. Predict
+        logits = self.head(cls_out)
         
         # 6. Loss
         loss = None
         if targets is not None:
-            # [v14.0 PATCH] Decouple sequence return from supervision logic
-            if return_sequence:
-                # Extract global risk (index 0) even if returning temporal sequence
-                logits_for_loss = logits[:, 0, :]
-                alpha_for_loss = alpha[:, 0, :]
-            else:
-                logits_for_loss = logits
-                alpha_for_loss = alpha
-                
-            num_classes = logits_for_loss.shape[-1]
+            num_classes = logits.shape[-1]
             if num_classes > 1:
-                # [SOTA FIX] Multi-Class One-Hot Conversion
-                if targets.ndim == 1:
-                    targets_oh = F.one_hot(targets.long(), num_classes=num_classes).float()
-                else:
-                    targets_oh = targets.float()
+                # Multi-Class: Expect Long indices, convert to One-Hot
+                if targets.ndim == 1 and (targets.dtype == torch.long or targets.dtype == torch.int):
+                    targets = F.one_hot(targets, num_classes=num_classes).float()
+                elif targets.ndim == 1:
+                     # Float but flat? Unsafe. Assume indices if >1 class.
+                     targets = F.one_hot(targets.long(), num_classes=num_classes).float()
             else:
-                targets_oh = targets.float().unsqueeze(-1) if targets.ndim == 1 else targets.float()
+                # Binary: [B] -> [B, 1]
+                if targets.ndim == 1:
+                    targets = targets.float().unsqueeze(-1)
                     
-            # [v14.0 PATCH] Use Evidential Loss on alphas
-            # We pass 'alpha' (Dirichlet params) instead of 'logits'
-            # Note: The loss needs the current epoch for KL annealing. 
-            loss = self.criterion(alpha_for_loss, targets_oh, epoch_num=epoch_num)
+            loss = self.criterion(logits, targets)
             
-        return {
-            "logits": logits,
-            "alpha": alpha,
-            "uncertainty": uncertainty,
-            "loss": loss
-        }
+        return logits, loss

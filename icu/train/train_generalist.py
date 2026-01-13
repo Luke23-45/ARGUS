@@ -201,6 +201,7 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
         super().__init__()
         self.cfg = cfg
         self.pin_memory = pin_memory
+        self.batch_size = cfg.train.batch_size
         self.train_ds: Optional[ICUSotaDataset] = None
         self.val_ds: Optional[ICUSotaDataset] = None
 
@@ -257,20 +258,14 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
 
         num_workers = self.cfg.train.num_workers
         
-        # [v4.1 SOTA] Balanced Clinical Sampling
-        # Ensures 15% sepsis prevalence to solve "Generative Collapse" / EV collapse.
-        from icu.utils.samplers import WeightedEpisodeSampler
-        sampler = WeightedEpisodeSampler(
+        # [SOTA] Use EpisodeAwareSampler to prevent LRU Cache Thrashing
+        # This keeps 'shuffle' behavior (random episodes) but sequential frames.
+        sampler = EpisodeAwareSampler(
             self.train_ds, 
-            target_prevalence=0.15,
             shuffle=True, 
             seed=self.cfg.seed,
             drop_last=True
         )
-        
-        # [v4.1.1 SOTA FIX] Final Handle Wipe
-        # Just in case any other logic touched the dataset before this point.
-        self.train_ds._lmdb_env = None
         
         return DataLoader(
             self.train_ds,
@@ -436,11 +431,6 @@ def main(cfg: DictConfig):
             logger.info(f"[CALLBACKS] Filtering out {type(cb).__name__} as use_teacher is False or wrapper handles EMA.")
             continue
         
-        # [FIX] Filter out ModelCheckpoint if checkpointing is disabled to prevent PL MisconfigurationException
-        if isinstance(cb, ModelCheckpoint) and not cfg.get("save_checkpoints", True):
-            logger.info(f"[CALLBACKS] Filtering out ModelCheckpoint as save_checkpoints is False.")
-            continue
-
         # If it's a TieredEMACallback and use_teacher is enabled, we keep it.
         # If it's any other callback, we keep it.
         callbacks.append(cb)
@@ -476,7 +466,7 @@ def main(cfg: DictConfig):
         # Handled manually in Wrapper.on_before_optimizer_step()
         gradient_clip_val=0,
         log_every_n_steps=cfg.logging.get("log_every_n_steps", 10),
-        enable_checkpointing=cfg.get("save_checkpoints", True),
+        enable_checkpointing=True,
         num_sanity_val_steps=0,  # [FIX] Allow calibration first
         accumulate_grad_batches=cfg.train.get("accumulate_grad_batches", 1),
         val_check_interval=cfg.train.get("val_check_interval", 1.0),
@@ -521,22 +511,19 @@ def main(cfg: DictConfig):
         if is_main_process():
             logger.info("="*80)
             logger.info("[SUCCESS] Phase 1 Training Complete!")
-            if trainer.checkpoint_callback:
-                logger.info(f"[BEST MODEL] {trainer.checkpoint_callback.best_model_path}")
-                logger.info(f"[BEST SCORE] val/sepsis_auroc = {trainer.checkpoint_callback.best_model_score:.4f}")
-                
-                # [BACKUP] Copy best model to backup_dir if configured
-                if cfg.get("backup_dir") and trainer.checkpoint_callback.best_model_path:
-                    import shutil
-                    best_path = Path(trainer.checkpoint_callback.best_model_path)
-                    backup_path = Path(cfg.backup_dir) / best_path.name
-                    try:
-                        shutil.copy2(best_path, backup_path)
-                        logger.info(f"[BACKUP] Successfully backed up best model to: {backup_path}")
-                    except Exception as e:
-                        logger.error(f"[BACKUP] Failed to backup model: {e}")
-            else:
-                logger.warning("[INFO] Checkpointing disabled. No best model path available.")
+            logger.info(f"[BEST MODEL] {trainer.checkpoint_callback.best_model_path}")
+            logger.info(f"[BEST SCORE] val/sepsis_auroc = {trainer.checkpoint_callback.best_model_score:.4f}")
+            
+            # [BACKUP] Copy best model to backup_dir if configured
+            if cfg.get("backup_dir") and trainer.checkpoint_callback.best_model_path:
+                import shutil
+                best_path = Path(trainer.checkpoint_callback.best_model_path)
+                backup_path = Path(cfg.backup_dir) / best_path.name
+                try:
+                    shutil.copy2(best_path, backup_path)
+                    logger.info(f"[BACKUP] Successfully backed up best model to: {backup_path}")
+                except Exception as e:
+                    logger.error(f"[BACKUP] Failed to backup model: {e}")
 
             logger.info("="*80)
         
