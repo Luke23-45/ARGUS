@@ -98,7 +98,7 @@ class TemporalContrastiveBuffer(nn.Module):
         # [SOTA FIX] Deterministic Uniformity Sampling (DDP Parity)
         # We need a generator to ensure all ranks pick the same subset
         if not hasattr(self, '_rng'):
-             self._rng = torch.Generator(device=self.queue.device)
+             self._rng = torch.Generator(device='cpu')
              self._rng.manual_seed(42) # Fixed seed is fine for uniformity
         
         subset = self.queue[torch.randperm(self.capacity, generator=self._rng)[:sample_size]]

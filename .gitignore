@@ -98,11 +98,11 @@ legacy
 
 tests/
 
-
-# sepsis_clinical_28
+plan
+sepsis_clinical_28
 
 verify_patches.py
-
+icu/models_backup_z14
 error.md
 verify_end_to_end_sota_v3.py
 icu/models/wrapper_generalist copy.py
@@ -114,8 +114,9 @@ patches_snippet.md
 logs.md
 suggestion.md
 patch_report.md
-.gitignore
+Surgical_Optimization_Proposal_Z8.md
 ui.md
 working
 icu/models/wrapper_generalist copy 2.py
 error_1.md
+Z8_vs_Z14_Comparative_Research_Report.md

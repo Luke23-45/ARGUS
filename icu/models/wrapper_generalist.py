@@ -500,7 +500,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
         # [v20.0 VERIFICATION MARKER]
-        print(f"DEBUG: training_step hit (balancing_mode={self.balancing_mode})")
+        # print(f"DEBUG: training_step hit (balancing_mode={self.balancing_mode})")
         if not batch or "observed_data" not in batch:
             return
         
@@ -1003,12 +1003,18 @@ class ICUGeneralistWrapper(pl.LightningModule):
             
             # [v17.4] Surgical Forensic Fix: BGSL restricted to real batch [0:B]
             # Rationale: BGSL computes physical slopes which are not available for Ghosts.
+            T_obs = past.shape[1]
+            # Iron Dome: Align predictions, targets, and masks to T_obs from the tail
+            pred_state_aligned = pred_state[:B, -T_obs:]
+            true_state_aligned = true_state[:B, -T_obs:]
+            mask_aligned = ctx_mask[:B, -T_obs:]
+
             bgsl_out = self.bgsl_loss(
-                pred_state[:B, 1:], # [B, T, 1]
-                true_state[:, 1:],  # [B, T, 1]
-                past,               # [B, T, D] (Original batch)
+                pred_state_aligned, 
+                true_state_aligned,  
+                past,               
                 risk_coef=risk_coef.view(B, 1, 1), 
-                mask=ctx_mask[:B, 1:] # [B, T]
+                mask=mask_aligned
             )
             l_bgsl = bgsl_out["loss"]
             
@@ -1073,14 +1079,25 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Task balancing should be stable from __init__ (6 tasks).
             scaled_total, logs = self.loss_scaler(loss_dict)
             
-            # [Point 3] SOTA A-GEM Parity (2025 Hardening)
-            # Rationale: l_ref must be EXACTLY scaled by the uncertainty weight 
-            # to ensure that l_batch + l_ref = total_loss for the gradient projection.
+            # [v25.7 FIX] Accumulation-Aware A-GEM Backup
+            # Rationale: l_batch + l_ref = total_loss for the gradient projection.
             w_aux = logs.get('weight/aux', 1.0)
             l_ref = (w_aux * 0.5 * l_cga) if 'l_cga' in locals() else None
             
             total_loss = scaled_total + phys_loss
             l_batch = total_loss - (l_ref if l_ref is not None else 0.0)
+
+            # [v25.7 FIX] Accumulation-Aware A-GEM Backup
+            acc_batches = self.trainer.accumulate_grad_batches
+            is_accumulating = (batch_idx % acc_batches != 0)
+            accum_grads_list = []
+            if is_accumulating:
+                # Offload to CPU to prevent OOM
+                for name, p in self.named_parameters():
+                    if p.grad is not None and p.requires_grad:
+                        accum_grads_list.append(p.grad.to("cpu", non_blocking=True))
+                    else:
+                        accum_grads_list.append(None)
 
             if l_ref is not None and l_ref.grad_fn is not None:
                 # A. Ghost Pass (Reference)
@@ -1089,37 +1106,36 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 self.manual_backward(l_ref, retain_graph=True)
                 
                 # Capture Reference Gradients for the Diagnostic Path
-                # Includes: Encoder, ALB, Aux Head, ACL Projector.
-                # Excludes: Backbone (Diffusion Planner), Scheduler, Loss Scaler.
                 g_ref = {}
                 for name, p in self.named_parameters():
                     if p.grad is not None and not any(k in name for k in ["backbone", "scheduler", "loss_scaler"]):
                         g_ref[name] = p.grad.clone()
                         p.grad.zero_()
                 
-                print(f"DEBUG: A-GEM Ghost Pass (GradFn: {l_ref.grad_fn}) captured {len(g_ref)} diagnostic grads")
-                
                 # B. Batch Pass
                 self.manual_backward(l_batch)
                 
-                batch_grad_count = sum(1 for name, p in self.named_parameters() if p.grad is not None and not any(k in name for k in ["backbone", "scheduler", "loss_scaler"]))
-                print(f"DEBUG: A-GEM Batch Pass (GradFn: {l_batch.grad_fn}) produced {batch_grad_count} diagnostic grads")
-                
                 # C. [SOTA] A-GEM Projection
                 with torch.no_grad():
-                    proj_count = 0
                     for name, p in self.named_parameters():
                         if name in g_ref and p.grad is not None:
                             dot_prod = torch.sum(p.grad * g_ref[name])
                             if dot_prod < 0:
                                 ref_norm_sq = torch.sum(g_ref[name] * g_ref[name]) + 1e-8
                                 p.grad.sub_(g_ref[name], alpha=dot_prod / ref_norm_sq)
-                                proj_count += 1
                             p.grad.add_(g_ref[name])
-                    print(f"DEBUG: A-GEM Projection applied to {proj_count}/{len(g_ref)} diagnostic layers")
             else:
-                print("DEBUG: A-GEM Fallback (Single Pass)")
                 self.manual_backward(total_loss)
+
+            # [v25.7 FIX] Restoration
+            if is_accumulating and accum_grads_list:
+                ptr = 0
+                for name, p in self.named_parameters():
+                    if p.requires_grad:
+                        g_stored = accum_grads_list[ptr]
+                        if g_stored is not None:
+                            p.grad.add_(g_stored.to(p.device))
+                        ptr += 1
             
             # [PMS] SCS: Manifold Health Monitoring
             with torch.no_grad():
