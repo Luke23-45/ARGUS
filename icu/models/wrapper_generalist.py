@@ -1431,8 +1431,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
                      flat_masks = torch.ones_like(flat_vitals)
                 
                 flat_labels = targets[sepsis_mask].float().unsqueeze(1)
-                flat_latents = global_ctx_expert[sepsis_mask].float()
-                flat_unc = uncertainty[sepsis_mask].float() # [N, 1]
+                flat_latents = global_ctx_expert[:B][sepsis_mask].float()
+                flat_unc = uncertainty[:B][sepsis_mask].float() # [N, 1]
                 
                 local_dict = {
                     "vitals": flat_vitals,
@@ -1444,8 +1444,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
             else:
                 # Proper Empty Initialization for Shape Consensus
                 local_dict = {
-                    "vitals": torch.empty(0, T*F, device=self.device),
-                    "masks": torch.empty(0, T*F, device=self.device),
+                    "vitals": torch.empty(0, T*F_feat, device=self.device),
+                    "masks": torch.empty(0, T*F_feat, device=self.device),
                     "labels": torch.empty(0, 1, device=self.device),
                     "latents": torch.empty(0, D, device=self.device),
                     "uncertainty": torch.empty(0, 1, device=self.device)
@@ -1457,8 +1457,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # 3. Unpack and Update
             if gathered_flat.size(0) > 0:
                  # Define Widths for splitting (Must match construction order)
-                 w_v = T*F
-                 w_m = T*F
+                 w_v = T*F_feat
+                 w_m = T*F_feat
                  w_lbl = 1
                  w_lat = D
                  w_unc = 1
@@ -1470,8 +1470,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
                  )
                  
                  self.ghost_bank.update(
-                    vitals=g_v.reshape(-1, T, F),
-                    masks=g_m.reshape(-1, T, F),
+                    vitals=g_v.reshape(-1, T, F_feat),
+                    masks=g_m.reshape(-1, T, F_feat),
                     labels=g_lbl.squeeze(1).long(), # Cast back to 1D long
                     latents=g_lat,
                     uncertainties=g_unc # Keep as [N, 1]

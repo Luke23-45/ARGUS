@@ -467,12 +467,9 @@ def main(cfg: DictConfig):
     for cb in raw_callbacks:
         # If use_teacher is enabled, we expect TieredEMACallback to be present and we should keep it.
         # Otherwise, if it's a generic EMACallback and use_teacher is NOT enabled, we filter it out
-        # to avoid double-updating if the wrapper handles EMA manually.
-        if isinstance(cb, EMACallback):
-            # [CRITICAL FIX] Always keep EMACallback. The Wrapper relies on self.ema presence 
-            # to enable the Target Network for AWR. Filtering it triggers "Dead Critic".
-            logger.info(f"[CALLBACKS] Keeping {type(cb).__name__} for SOTA Teacher-Student Training.")
-            pass
+        if isinstance(cb, EMACallback) and not cfg.model.get("use_teacher", False):
+            logger.info(f"[CALLBACKS] Filtering out {type(cb).__name__} as use_teacher is False or wrapper handles EMA.")
+            continue
         
         # [FIX] Filter out ModelCheckpoint if checkpointing is disabled to prevent PL MisconfigurationException
         if isinstance(cb, ModelCheckpoint) and not cfg.get("save_checkpoints", True):

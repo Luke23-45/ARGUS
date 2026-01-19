@@ -482,12 +482,11 @@ class EMACallback(Callback):
     2. Zero-Copy: Uses pointer swapping to avoid memory overhead.
     3. Manual Opt Aware: Syncs update steps with custom optimization loops.
     """
-    def __init__(self, decay: float = 0.9999, cpu_offload: bool = True, update_every: int = 1, manual_update_only: bool = False):
+    def __init__(self, decay: float = 0.9999, cpu_offload: bool = True, update_every: int = 1):
         super().__init__()
         self.decay = decay
         self.cpu_offload = cpu_offload
         self.update_every = update_every
-        self.manual_update_only = manual_update_only
         self.ema: Optional[TieredEMA] = None
         self._deferred_ema_state: Optional[Dict] = None # For checkpoint loading
 
@@ -510,9 +509,6 @@ class EMACallback(Callback):
         self._init_ema(pl_module)
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if self.manual_update_only:
-            return
-            
         if self.ema and (batch_idx + 1) % trainer.accumulate_grad_batches == 0:
             self.ema.update(
                 pl_module.model, 
@@ -523,20 +519,20 @@ class EMACallback(Callback):
     def on_validation_start(self, trainer, pl_module):
         self._init_ema(pl_module)
         if self.ema:
-            self.ema.swap(pl_module.model)
+            self.ema.apply_shadow(pl_module.model)
 
     def on_validation_end(self, trainer, pl_module):
         if self.ema:
-            self.ema.swap(pl_module.model) # Restore student
+            self.ema.restore(pl_module.model) # Restore student weights for next training epoch
 
     def on_test_start(self, trainer, pl_module):
         self._init_ema(pl_module)
         if self.ema:
-            self.ema.swap(pl_module.model)
+            self.ema.apply_shadow(pl_module.model)
 
     def on_test_end(self, trainer, pl_module):
         if self.ema:
-            self.ema.swap(pl_module.model)
+            self.ema.restore(pl_module.model) # Restore student weights post-testing
 
     def on_save_checkpoint(self, trainer, pl_module, checkpoint):
         if self.ema:
@@ -749,13 +745,11 @@ def get_sota_callbacks(cfg: DictConfig) -> List[Callback]:
     
     ema_decay = cfg.train.get("ema_decay", 0.9999)
     ema_update_every = cfg.train.get("ema_update_every", 1)
-    manual_ema_update = cfg.train.get("manual_ema_update", False)
     
     if ema_decay > 0:
         callbacks.append(EMACallback(
             decay=ema_decay, 
-            update_every=ema_update_every,
-            manual_update_only=manual_ema_update
+            update_every=ema_update_every
         ))
 
     # 2. Guardians (Anomaly, Metric, Health) - Keep as is
