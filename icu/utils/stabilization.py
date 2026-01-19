@@ -69,6 +69,9 @@ class StableContrastiveLoss(nn.Module):
                     else:
                         self.centroids[c] = batch_center
                         
+                if torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(self.centroids.data, op=torch.distributed.ReduceOp.SUM)
+                    self.centroids.data /= torch.distributed.get_world_size()
                 self.centroids.data = F.normalize(self.centroids, p=2, dim=1)
                 self.initialized.fill_(True)
         
@@ -123,9 +126,9 @@ class LinearManifoldSentinel:
         # dot = sum(grad_aux * grad_foundation)
         dot = (grad_aux * grad_foundation).sum(dim=-1, keepdim=True) # [..., 1]
         
-        # Only project if conflict detected (dot < 0)
-        # We use a mask for efficiency
-        conflict_mask = (dot < 0)
+        # Only project if conflict detected (dot < -0.1)
+        # Softened threshold for shared feature overlap
+        conflict_mask = (dot < -0.1)
         
         if conflict_mask.any():
             mag_fnd = (grad_foundation * grad_foundation).sum() + 1e-8

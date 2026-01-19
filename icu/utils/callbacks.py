@@ -482,11 +482,12 @@ class EMACallback(Callback):
     2. Zero-Copy: Uses pointer swapping to avoid memory overhead.
     3. Manual Opt Aware: Syncs update steps with custom optimization loops.
     """
-    def __init__(self, decay: float = 0.9999, cpu_offload: bool = True, update_every: int = 1):
+    def __init__(self, decay: float = 0.9999, cpu_offload: bool = True, update_every: int = 1, manual_update_only: bool = False):
         super().__init__()
         self.decay = decay
         self.cpu_offload = cpu_offload
         self.update_every = update_every
+        self.manual_update_only = manual_update_only
         self.ema: Optional[TieredEMA] = None
         self._deferred_ema_state: Optional[Dict] = None # For checkpoint loading
 
@@ -495,8 +496,7 @@ class EMACallback(Callback):
             logger.info(f"EMA: Initializing Teacher (Decay={self.decay})")
             self.ema = TieredEMA(
                 pl_module.model, 
-                decay=self.decay, 
-                cpu_offload=self.cpu_offload
+                decay=self.decay
             )
             pl_module.ema = self.ema # Authoritative attachment for training_step
 
@@ -510,6 +510,9 @@ class EMACallback(Callback):
         self._init_ema(pl_module)
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if self.manual_update_only:
+            return
+            
         if self.ema and (batch_idx + 1) % trainer.accumulate_grad_batches == 0:
             self.ema.update(
                 pl_module.model, 
@@ -631,6 +634,62 @@ class RotationalSaverCallback(Callback):
         return {"best_metric_val": self.best_metric_val}
 
 # ==============================================================================
+# 5.5. ENGINE: SAMPLER STEWARD
+# ==============================================================================
+
+class SamplerSteward(Callback):
+    """
+    [v4.2] Ensures Sampler state is saved/loaded with checkpoint.
+    This prevents 'Resumption Trauma' where the sampler resets to the
+    start of the epoch, potentially repeating seen data.
+    """
+    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+        if trainer.train_dataloader is not None:
+            # Handle potential Multiple DataLoaders
+            try:
+                # Access the underlying dataloader(s)
+                dls = trainer.train_dataloader
+                if not isinstance(dls, list): dls = [dls]
+                
+                sampler_states = []
+                for dl in dls:
+                    # Check for our custom EpisodeAwareSampler or similar
+                    if hasattr(dl, "sampler") and hasattr(dl.sampler, "state_dict"):
+                        sampler_states.append(dl.sampler.state_dict())
+                    else:
+                        sampler_states.append(None)
+                checkpoint["sampler_states"] = sampler_states
+            except Exception as e:
+                logger.warning(f"[SamplerSteward] Failed to save sampler state: {e}")
+
+    def on_load_checkpoint(self, trainer, pl_module, checkpoint):
+        # Note: DataLoaders might not be initialized yet.
+        # We store the state in the module temporarily.
+        if "sampler_states" in checkpoint:
+            pl_module.pending_sampler_states = checkpoint["sampler_states"]
+            logger.info("[SamplerSteward] Found Sampler states in checkpoint. Queued for restoration.")
+
+    def on_train_start(self, trainer, pl_module):
+        if hasattr(pl_module, "pending_sampler_states") and pl_module.pending_sampler_states:
+            try:
+                dls = trainer.train_dataloader
+                if dls is None: return
+                if not isinstance(dls, list): dls = [dls]
+                
+                for i, state in enumerate(pl_module.pending_sampler_states):
+                    if state is not None and i < len(dls):
+                        # Check if the new sampler supports loading
+                        if hasattr(dls[i], "sampler") and hasattr(dls[i].sampler, "load_state_dict"):
+                            dls[i].sampler.load_state_dict(state)
+                            logger.info(f"[SamplerSteward] Restored state for Sampler {i}.")
+                
+                # Clear to prevent re-application
+                pl_module.pending_sampler_states = None
+            except Exception as e:
+                logger.warning(f"[SamplerSteward] Failed to restore sampler state: {e}")
+
+
+# ==============================================================================
 # 6. SOTA FACTORY
 # ==============================================================================
 
@@ -690,13 +749,23 @@ def get_sota_callbacks(cfg: DictConfig) -> List[Callback]:
     
     ema_decay = cfg.train.get("ema_decay", 0.9999)
     ema_update_every = cfg.train.get("ema_update_every", 1)
+    manual_ema_update = cfg.train.get("manual_ema_update", False)
+    
     if ema_decay > 0:
-        callbacks.append(EMACallback(decay=ema_decay, update_every=ema_update_every))
+        callbacks.append(EMACallback(
+            decay=ema_decay, 
+            update_every=ema_update_every,
+            manual_update_only=manual_ema_update
+        ))
 
     # 2. Guardians (Anomaly, Metric, Health) - Keep as is
     callbacks.append(AnomalyGuardian(halt_on_anomaly=True))
     callbacks.append(ClinicalMetricCallback(inputs_are_logits=True))
     callbacks.append(GradientHealthMonitor(log_every_n_steps=100))
+    
+    # [v4.2.1 SOTA CLEANUP] Sampler Stewardship unified into DataModule Bridge.
+    # Disabling the generic callback to prevent "Double-Restoration" conflicts.
+    # callbacks.append(SamplerSteward())
 
     # 3. Standard SOTA Monitoring (TQDM Standardized)
     # [FIX] Primacy given to TQDM for terminal stability. 

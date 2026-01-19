@@ -134,6 +134,19 @@ class EpisodeAwareSampler(Sampler[int]):
     def set_epoch(self, epoch: int):
         self.epoch = epoch
 
+    def state_dict(self) -> Dict[str, int]:
+        """v4.2: Persist state for exact resumption."""
+        return {
+            "epoch": self.epoch,
+            "seed": self.seed
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, int]):
+        """v4.2: Restore state."""
+        self.epoch = state_dict.get("epoch", 0)
+        self.seed = state_dict.get("seed", self.seed)
+        logger.info(f"[Sampler] State Restored: Epoch={self.epoch}")
+
 
 class WeightedEpisodeSampler(EpisodeAwareSampler):
     """

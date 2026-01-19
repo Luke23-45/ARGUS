@@ -222,19 +222,26 @@ class ICUAdvantageCalculator(nn.Module):
             f"adaptive_beta={adaptive_beta}, adaptive_clipping={adaptive_clipping}"
         )
 
-    def set_stats(self, mean: float, std: float):
+    def set_stats(self, mean: float, std: float, beta: float = None, count: int = None):
         """
-        Locks normalization statistics for stable AWR weight computation.
-        
-        This should be called after computing statistics over the entire
-        training dataset. Critical for evaluation stability.
+        Locks normalization statistics and restores internal state for stable resumptions.
         
         Args:
             mean: Global advantage mean
             std: Global advantage standard deviation
+            beta: Optional AWR temperature (prevents reset shock)
+            count: Optional sample count (stabilizes moving average)
         """
         self.adv_mean.fill_(mean)
         self.adv_std.fill_(std if std > 1e-6 else 1.0)
+        
+        if beta is not None:
+            self.beta.fill_(beta)
+            logger.info(f"[RESUME] AWR Beta restored: {beta:.4f}")
+            
+        if count is not None:
+            self.stats_count.fill_(count)
+            
         self.stats_initialized.fill_(True)
         logger.info(
             f"[ADVANTAGE] Stats Locked: mu={self.adv_mean.item():.4f}, sigma={self.adv_std.item():.4f}"

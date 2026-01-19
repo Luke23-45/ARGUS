@@ -13,11 +13,12 @@ save_checkpoints: false
 
 # --- Directory Paths ---
 output_dir: "outputs/phase1"           # Main output directory
-checkpoint_dir: "/content/icu/checkpoints"  # Where checkpoints are saved
-log_dir: "/content/icu/logs/"         # Training logs directory
+checkpoint_dir: "/content/icu/checkpoints/"  # [OK] Large files, infrequent writes
+log_dir: "/content/icu/logs/"         # [CRITICAL] Must be LOCAL for WandB (High freq IO)
 backup_dir: null                        # Remote/backup directory
 resume_from: null     # Explicit checkpoint to resume from (optional)
 # "/content/drive/MyDrive/pda/models/checkpoints/icu_model-epoch=05-val/clinical_auroc=0.747.ckpt"          
+#"/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-16_16-21-21-latest-epoch=17.ckpt"
 # --- Model Architecture (ICUUnifiedPlanner) ---
 model:
   input_dim: 28
@@ -71,8 +72,8 @@ train:
   horizon_ramp: 40
 
   # Debug Mode (Smoke Test)
-  debug_run: true
-  debug_limit_batches: 120
+  debug_run: true #true
+  debug_limit_batches: 200
   debug_limit_val: 500
 
   
@@ -87,11 +88,12 @@ train:
   # AWR Calibration Speed/Quality (v10.1 Upgrade)
   # - "full": Scans all trajectories (~5-10 min, best for final training)
   # - "sample": Random subset (~10-30 sec, best for testing)
-  awr_calibration_mode: "sample" # full for whole population scan
-  awr_max_samples: 20000      # 60000 [STABILITY] Increased for Batch 2048
+  awr_calibration_mode: "sample" # full for whole population scan or sample
+  awr_max_samples: 10000      # 60000 [STABILITY] Increased for Batch 2048
   
   ema_decay: 0.999
   ema_update_every: 10        # [SOTA] Staggered updates to fix I/O bottleneck
+  manual_ema_update: true     # [v14.1 FIX] Handled manually in wrapper to prevent double-update
   monitor: "val/clinical_auroc"
   patience: 10
 

@@ -101,7 +101,7 @@ from icu.utils.train_utils import (
 
 
 # =============================================================================
-# 1. ROBUST CHECKPOINT LOADER
+# 1. STANDARD CHECKPOINT LOADER (v14.0 - Full Resume)
 # =============================================================================
 
 def load_checkpoint_robust(
@@ -110,60 +110,69 @@ def load_checkpoint_robust(
     trainer: pl.Trainer
 ) -> Optional[str]:
     """
-    Surgically inspects and loads a checkpoint, bypassing PL's faulty migration
-    if the 'pytorch-lightning_version' key is missing.
+    [v14.0] Standard PyTorch Lightning resume.
+    
+    Always returns the checkpoint path to trainer.fit() to enable FULL state restoration:
+    - Model weights
+    - Optimizer state (Adam momentum/variance buffers)
+    - LR scheduler state
+    - Epoch counter
+    - EMA weights (via callback)
+    - All trainer state
+    
+    Previous versions used "surgical" loading that only restored model weights,
+    causing optimizer state loss and gradient shocks on resume.
+    
+    Args:
+        system: The LightningModule (unused in standard mode, kept for API compat)
+        ckpt_path: Path to checkpoint file
+        trainer: The Trainer instance (unused in standard mode, kept for API compat)
+        
+    Returns:
+        ckpt_path: Always returns the path for standard PL resume
     """
     if not ckpt_path:
         return None
         
-    logger.info(f"[RESUME] Inspecting checkpoint: {ckpt_path}")
+    logger.info(f"[RESUME] Using Standard PL Resume: {ckpt_path}")
     
+    # Validate checkpoint exists and is readable
     try:
-        # Load metadata only to check keys
-        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        # [FIX] Use map_location='meta' to inspect keys WITHOUT loading 20GB+ weights to RAM
+        checkpoint = torch.load(ckpt_path, map_location="meta", weights_only=False)
         
-        # Check for PyTorch Lightning metadata
-        if "pytorch-lightning_version" not in checkpoint:
-            logger.warning("[RESUME] Detected Incomplete/SOTA Checkpoint. Transitioning to Manual Restoration Suite...")
+        # Log checkpoint contents for debugging
+        keys = list(checkpoint.keys())
+        logger.info(f"[RESUME] Checkpoint keys: {keys}")
+        
+        if "pytorch-lightning_version" in checkpoint:
+            logger.info(f"[RESUME] PL version: {checkpoint['pytorch-lightning_version']}")
+        else:
+            logger.warning("[RESUME] Checkpoint missing PL version key. PL will attempt migration.")
             
-            # 1. Restore Model Weights
-            # SurgicalCheckpointLoader handles prefix stripping and shape validation
-            SurgicalCheckpointLoader.load_model(system.model, ckpt_path)
-            logger.info("[RESUME] Model weights restored manually.")
+        if "optimizer_states" in checkpoint:
+            logger.info(f"[RESUME] Optimizer state found ({len(checkpoint['optimizer_states'])} optimizers)")
+        else:
+            logger.warning("[RESUME] No optimizer state in checkpoint - will start fresh optimizer")
             
-            # 2. Restore EMA state if callback exists
-            ema_cb = None
-            for cb in trainer.callbacks:
-                if isinstance(cb, EMACallback):
-                    ema_cb = cb
-                    break
+        if "lr_schedulers" in checkpoint:
+            logger.info(f"[RESUME] LR scheduler state found")
             
-            if ema_cb and "ema_state_dict" in checkpoint:
-                # Force-load EMA state dict
-                ema_cb.on_load_checkpoint(trainer, system, checkpoint)
-                logger.info("[RESUME] EMA weights restored manually.")
-            elif hasattr(system, 'ema') and system.ema is not None:
-                # [CRITICAL FIX] "Random Teacher" Prevention
-                # If we loaded the model but have no EMA state, the Teacher is still random.
-                # We must force-sync it to the Student to start with valid targets.
-                logger.warning("[RESUME] EMA state missing from checkpoint. Force-syncing Teacher (EMA) to Student (Model)...")
-                system.ema._register(system.model)
-                logger.info("[RESUME] EMA shadow weights re-initialized from loaded model.")
-                
-            # 3. Return None to trainer.fit to prevent it from trying to migrate
-            # The weights are already in 'system', so a "fresh" PL run will use them.
-            return None
+        if "epoch" in checkpoint:
+            logger.info(f"[RESUME] Will resume from epoch {checkpoint['epoch']}")
             
-        # [v12.5 FIX] Checkpoint Key Mismatch Protection
-        # If the checkpoint HAS Lightning metadata but is missing keys (e.g., from old DDP config)
-        # We must tell PL to use strict=False during the internal load_state_dict call.
-        # This is handled by patching the LightningModule's on_load_checkpoint.
-        logger.info(f"[RESUME] Checkpoint version found: {checkpoint.get('pytorch-lightning_version')}. Proceeding with native PL loader.")
-        return ckpt_path
+        if "global_step" in checkpoint:
+            logger.info(f"[RESUME] Global step: {checkpoint['global_step']}")
+            
+        # Clean up to free memory
+        del checkpoint
         
     except Exception as e:
-        logger.error(f"[RESUME] Checkpoint inspection failed: {e}. Falling back to default loader.")
-        return ckpt_path
+        logger.error(f"[RESUME] Checkpoint validation failed: {e}")
+        logger.error("[RESUME] Will attempt resume anyway - PL may handle errors")
+    
+    # Always return the path - let PyTorch Lightning handle everything
+    return ckpt_path
 
 
 # =============================================================================
@@ -203,6 +212,10 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
         self.pin_memory = pin_memory
         self.train_ds: Optional[ICUSotaDataset] = None
         self.val_ds: Optional[ICUSotaDataset] = None
+        
+        # [v4.2 SOTA FIX] Sampler state bridge
+        self.sampler: Optional[Any] = None
+        self.pending_sampler_state: Optional[Dict[str, Any]] = None
 
     def prepare_data(self):
         """
@@ -251,6 +264,19 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
                 f"Train={len(self.train_ds)}, Val={len(self.val_ds)}"
             )
 
+    def state_dict(self) -> Dict[str, Any]:
+        """v4.2: Capture Sampler state into checkpoint."""
+        state = {}
+        if self.sampler is not None:
+             state["sampler_state"] = self.sampler.state_dict()
+        return state
+
+    def load_state_dict(self, state_dict: Dict[str, Any]):
+        """v4.2: Stage Sampler state for restoration."""
+        if "sampler_state" in state_dict:
+             self.pending_sampler_state = state_dict["sampler_state"]
+             logger.info("[RESUME] Sampler state captured in DataModule.")
+
     def train_dataloader(self) -> DataLoader:
         """Returns the training DataLoader."""
         from icu.utils.samplers import EpisodeAwareSampler
@@ -260,13 +286,23 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
         # [v4.1 SOTA] Balanced Clinical Sampling
         # Ensures 15% sepsis prevalence to solve "Generative Collapse" / EV collapse.
         from icu.utils.samplers import WeightedEpisodeSampler
-        sampler = WeightedEpisodeSampler(
+        self.sampler = WeightedEpisodeSampler(
             self.train_ds, 
             target_prevalence=0.15,
             shuffle=True, 
             seed=self.cfg.seed,
             drop_last=True
         )
+
+        # [v4.2 BRIDGE] Restore Sampler State
+        if self.pending_sampler_state is not None:
+             self.sampler.load_state_dict(self.pending_sampler_state)
+             self.pending_sampler_state = None
+        elif hasattr(self, "trainer") and self.trainer is not None:
+            # Fallback: Sync with trainer epoch if state is missing but we are resuming
+            if self.trainer.current_epoch > 0:
+                 self.sampler.set_epoch(self.trainer.current_epoch)
+                 logger.info(f"[RESUME] Sampler epoch force-synced to Trainer: {self.trainer.current_epoch}")
         
         # [v4.1.1 SOTA FIX] Final Handle Wipe
         # Just in case any other logic touched the dataset before this point.
@@ -275,7 +311,7 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
         return DataLoader(
             self.train_ds,
             batch_size=self.cfg.train.batch_size,
-            sampler=sampler,
+            sampler=self.sampler,
             shuffle=False, # Sampler takes control
             num_workers=num_workers,
             collate_fn=robust_collate_fn,
@@ -432,9 +468,11 @@ def main(cfg: DictConfig):
         # If use_teacher is enabled, we expect TieredEMACallback to be present and we should keep it.
         # Otherwise, if it's a generic EMACallback and use_teacher is NOT enabled, we filter it out
         # to avoid double-updating if the wrapper handles EMA manually.
-        if isinstance(cb, EMACallback) and not cfg.model.get("use_teacher", False):
-            logger.info(f"[CALLBACKS] Filtering out {type(cb).__name__} as use_teacher is False or wrapper handles EMA.")
-            continue
+        if isinstance(cb, EMACallback):
+            # [CRITICAL FIX] Always keep EMACallback. The Wrapper relies on self.ema presence 
+            # to enable the Target Network for AWR. Filtering it triggers "Dead Critic".
+            logger.info(f"[CALLBACKS] Keeping {type(cb).__name__} for SOTA Teacher-Student Training.")
+            pass
         
         # [FIX] Filter out ModelCheckpoint if checkpointing is disabled to prevent PL MisconfigurationException
         if isinstance(cb, ModelCheckpoint) and not cfg.get("save_checkpoints", True):
@@ -453,15 +491,8 @@ def main(cfg: DictConfig):
                 cb.dirpath = cfg.checkpoint_dir
                 logger.info(f"[CONFIG] Checkpoint Dir overridden to: {cb.dirpath}")
 
-    class EMARestoration(pl.Callback):
-        def on_load_checkpoint(self, trainer, pl_module, checkpoint):
-            if "ema_state_dict" in checkpoint and hasattr(pl_module, 'ema'):
-                logger.info(f"[RESUME] Found EMA state in checkpoint. Restoring to {pl_module.ema.decay} decay...")
-                # Force CPU load to ensure TieredEMA doesn't spike VRAM
-                safe_state = {k: v.cpu() for k, v in checkpoint["ema_state_dict"].items()}
-                pl_module.ema.load_state_dict(safe_state)
-                
-    callbacks.append(EMARestoration())
+    # [SOTA FIX] Unified EMA restoration is now handled by EMACallback in callbacks.py.
+    # The redundant EMARestoration class was removed to prevent "Double-Load" race conditions.
             
     trainer = pl.Trainer(
         default_root_dir=cfg.output_dir,

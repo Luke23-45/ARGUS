@@ -889,6 +889,9 @@ class TieredEMA:
                     shadow_params.append(self.shadow[name])
 
         # 3. Fused Execution (PyTorch 2.0+ Speedup)
+        if torch.cuda.is_available():
+             torch.cuda.synchronize()
+             
         if model_params and hasattr(torch, "_foreach_lerp_"):
             # lerp(start, end, weight) -> start + weight * (end - start)
             # We want: shadow * decay + model * (1-decay)
