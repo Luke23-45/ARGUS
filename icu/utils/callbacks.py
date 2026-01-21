@@ -509,12 +509,17 @@ class EMACallback(Callback):
         self._init_ema(pl_module)
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        # [FIX] Skip if wrapper handles EMA updates manually
+        if getattr(pl_module.cfg.train, 'manual_ema_update', False):
+            return  # Wrapper handles update via its own ema.update() call
+        
         if self.ema and (batch_idx + 1) % trainer.accumulate_grad_batches == 0:
             self.ema.update(
                 pl_module.model, 
                 global_step=trainer.global_step, 
                 update_every=self.update_every
             )
+
 
     def on_validation_start(self, trainer, pl_module):
         self._init_ema(pl_module)
@@ -686,6 +691,44 @@ class SamplerSteward(Callback):
 
 
 # ==============================================================================
+# 5.7  DEBUG: SURGICAL SNAPSHOTS
+# ==============================================================================
+
+class DebugSnapshotCallback(Callback):
+    """
+    Saves 'Surgical Snapshots' at specific epochs defined in config.
+    Standardized on 0-based indexing (Epoch 0 is the first completed epoch).
+    """
+    def __init__(self, epochs: List[int], save_dir: str):
+        super().__init__()
+        self.epochs = set(epochs) 
+        self.save_dir = save_dir
+        
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        # 1. Skip if sanity checking
+        if trainer.sanity_checking:
+            return
+            
+        # 2. Skip if current epoch is not in list
+        current = trainer.current_epoch
+        if current not in self.epochs:
+            return
+            
+        # 3. Guard for DDP (Only Rank 0 saves)
+        if is_main_process():
+            filename = f"debug_snapshot_epoch_{current}.ckpt"
+            path = os.path.join(self.save_dir, filename)
+            
+            try:
+                os.makedirs(self.save_dir, exist_ok=True)
+                # Standard PL save (includes optimizer state for full resume)
+                trainer.save_checkpoint(path)
+                logger.info(f"🚨 [DEBUG] Captured Surgical Snapshot: {path}")
+            except Exception as e:
+                logger.error(f"Failed to save debug snapshot: {e}")
+
+
+# ==============================================================================
 # 6. SOTA FACTORY
 # ==============================================================================
 
@@ -746,10 +789,26 @@ def get_sota_callbacks(cfg: DictConfig) -> List[Callback]:
     ema_decay = cfg.train.get("ema_decay", 0.9999)
     ema_update_every = cfg.train.get("ema_update_every", 1)
     
-    if ema_decay > 0:
+    # [SOTA] Only create EMACallback if use_teacher is enabled
+    if cfg.model.get("use_teacher", False) and ema_decay > 0:
         callbacks.append(EMACallback(
             decay=ema_decay, 
             update_every=ema_update_every
+        ))
+
+
+    # [v14.5] Debug Snapshots (Epoch-Specific)
+    debug_epochs = cfg.get("debug_save_epochs", None)
+    if debug_epochs:
+        # Normalize to list
+        if isinstance(debug_epochs, int):
+            epochs = [debug_epochs]
+        else:
+            epochs = list(debug_epochs)
+            
+        callbacks.append(DebugSnapshotCallback(
+            epochs=epochs,
+            save_dir=save_dir 
         ))
 
     # 2. Guardians (Anomaly, Metric, Health) - Keep as is

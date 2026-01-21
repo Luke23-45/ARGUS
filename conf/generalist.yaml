@@ -10,13 +10,14 @@ run_name: "gen_v1_${now:%Y-%m-%d_%H-%M-%S}"
 seed: 42
 compile_model: false
 save_checkpoints: false
+debug_save_epochs: [7]     # [DEBUG] List of epochs to save snapshots (e.g., [5, 10, 50])
 
 # --- Directory Paths ---
 output_dir: "outputs/phase1"           # Main output directory
 checkpoint_dir: "/content/icu/checkpoints/"  # [OK] Large files, infrequent writes
 log_dir: "/content/icu/logs/"         # [CRITICAL] Must be LOCAL for WandB (High freq IO)
 backup_dir: null                        # Remote/backup directory
-resume_from: null     # Explicit checkpoint to resume from (optional)
+resume_from: null    # Explicit checkpoint to resume from (optional)
 # "/content/drive/MyDrive/pda/models/checkpoints/icu_model-epoch=05-val/clinical_auroc=0.747.ckpt"          
 #"/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-16_16-21-21-latest-epoch=17.ckpt"
 # --- Model Architecture (ICUUnifiedPlanner) ---
@@ -42,6 +43,8 @@ model:
   use_ddim_sampling: true
   use_auxiliary_head: true
   num_phases: 6 # SOTA-Clinical: 2 sub-experts per natural phase (Stable, Pre-Shock, Shock)
+  use_teacher: true  # [SOTA] Enable Teacher-Student bootstrapping for stable value estimation
+
 
 # --- Training Hyperparameters ---
 train:

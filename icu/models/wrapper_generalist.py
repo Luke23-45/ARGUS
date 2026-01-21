@@ -1998,7 +1998,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         
         # [SOTA FIX] Device Guard for PMS EMA
         if self._fnd_grad_ema is not None:
-             self._fnd_grad_ema = {k: v.to(self.device) for k, v in self._fnd_grad_ema.items()}
+             self._fnd_grad_ema = self._fnd_grad_ema.to(self.device)
              logger.info(f"✅ [RESUME] PMS Buffers migrated to {self.device}.")
         
         # Ensure AWR Stats are synced (if resumed, they are already in the buffer)
