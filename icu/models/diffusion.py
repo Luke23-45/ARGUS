@@ -114,6 +114,8 @@ class ICUConfig:
     num_phases: int = 3  # Tri-Phase: Stable(0) -> Pre-Shock(1) -> Shock(2)
     aux_loss_scale: float = 0.1 # [v11.1] Configurable Aux Loss Scale
     num_quantiles: int = 25     # [v4.1 SOTA] Distributional Critic resolution
+    use_teacher: bool = False   # [SOTA] EMA Teacher-Student toggle
+
 
     # Stable Sampling [v18.0]
     use_dynamic_thresholding: bool = True

@@ -881,8 +881,9 @@ class TieredEMA:
                 else:
                     new_data = buffer.data.detach().to(device="cpu", non_blocking=True)
                 
-                # Integer buffers (steps) copy directly
-                if target_dtype in (torch.int64, torch.int32, torch.bool):
+                # Integer buffers (steps) and Normalizer stats copy directly
+                # [v17.6 FIX] Prevent drift in Teacher's normalization bounds
+                if target_dtype in (torch.int64, torch.int32, torch.bool) or "normalizer." in name:
                     self.shadow[name].copy_(new_data)
                 else:
                     model_params.append(new_data)
