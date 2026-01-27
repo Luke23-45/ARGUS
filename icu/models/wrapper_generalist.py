@@ -264,7 +264,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
             lambda_gae=cfg.train.get("awr_lambda", 0.95),
             gamma=cfg.train.get("awr_gamma", 0.99),
             adaptive_beta=cfg.train.get("adaptive_beta", True),
-            adaptive_clipping=cfg.train.get("adaptive_clipping", True)
+            adaptive_clipping=cfg.train.get("adaptive_clipping", True),
+            beta_momentum=cfg.train.get("awr_momentum", 0.999) # [SOTA] Stabilize AWR for long epochs
         )
         
         # =====================================================================
@@ -287,7 +288,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
         pos_weight = cfg.train.get("pos_weight", None)
         self.class_balancer = DynamicClassBalancer(
             num_classes=cfg.model.get("num_phases", 3),
-            prior_pos_weight=pos_weight
+            prior_pos_weight=pos_weight,
+            beta=cfg.train.get("balancer_beta", 0.9995) # [SOTA] Slow down adaptation for long epochs
         )
         # [v25.4 FIX] Initial Log-Var Reset: Start with balanced weights (sigma=1.0)
         if self.balancing_mode == "sota_2025":
@@ -438,7 +440,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
         
         # [PMS] Manifold Stability Monitoring
         self.register_buffer("grad_norm_ema", torch.tensor(1.0))
-        self.grad_ema_decay = 0.95
+        # [v26.5 SOTA FIX] Expose decay for stabilization on large datasets
+        self.grad_ema_decay = cfg.train.get("grad_ema_decay", 0.99) # Default increased to 0.99 for stability
         
         # [PMS] MGP: EMA Foundation Gradient Storage for projection
         # Flattened size based on encoder hidden dim (e.g., 512, 1024)
@@ -450,6 +453,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
     def on_train_epoch_start(self):
         """[Phase 3/4] Update AWR Horizon and SOTA v4.2 Warmup."""
+        # [v26.4 SOTA FIX] Force Sampler Synchronization
+        # Eliminates "Sampler Amnesia" by actively pushing the epoch state.
+        if hasattr(self.trainer, "train_dataloader") and self.trainer.train_dataloader is not None:
+            dls = self.trainer.train_dataloader
+            if not isinstance(dls, list): dls = [dls]
+            for dl in dls:
+                if hasattr(dl, "sampler") and hasattr(dl.sampler, "set_epoch"):
+                    dl.sampler.set_epoch(self.current_epoch)
+
         new_gamma = self.horizon_scheduler.get_gamma(self.current_epoch)
         self.awr_calculator.gamma = new_gamma
         
@@ -464,7 +476,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
         else:
             curr_beta = end_beta
             
-        self.awr_calculator.beta.fill_(curr_beta)
+        # [v26.4 SOTA FIX] Beta Lock: Respect Adaptive Engine
+        # Prevents "Resumption Shock" where tuned beta is overwritten by linear schedule.
+        if not self.awr_calculator.adaptive_beta:
+            self.awr_calculator.beta.fill_(curr_beta)
+        else:
+            # Log the active beta to confirm survival
+            pass # Logger handles this in adaptive engine updates
         
         # [v4.2 SOTA Pillar 2 & 4] Synchronized Risk Warmup
         # Goal: Slowly introduce CVaR pessimism and Safety Envelope constraints.
@@ -958,13 +976,25 @@ class ICUGeneralistWrapper(pl.LightningModule):
             alpha_t = self.model.scheduler.alphas_cumprod[t][:, None, None]
             x0_approx = (noisy_fut - torch.sqrt(1 - alpha_t) * pred_noise) / torch.sqrt(alpha_t).clamp(min=1e-5)
             
+            # [v26.3 SOTA FIX] Install Manifold Governance Bridge
+            # This squashes 100,000x error amplification outliers early in training.
+            # Without this, physics losses on x0-hallucinations explode to 161+ GN.
+            x0_approx = self.model.governance(x0_approx)
+            
             # [PHASE 2] Safety envelope operates on clinical units. Denormalize x0 first.
             # [CRITICAL FIX] Use MODEL normalizer (Calibrated)
             normalizer = self.model.normalizer
             x0_clinical = normalizer.denormalize(x0_approx)
             
-            phys_violation = self.safety_envelope(x0_clinical, risk_coef)
+            # [v26.2 SOTA FIX] Unified Physics Manifold (Merge Schism)
+            # Includes both Vital Boundaries (clinical) and Global Consistency (normalized)
+            phys_violation = self.safety_envelope(x0_clinical, risk_coef) + self.model.phys_loss(x0_approx)
             phys_loss = phys_violation * curr_phys_weight
+
+            # [v26.3 SOTA FIX] Extended Defensive Clamping (Part II Remediation)
+            # Ported and extended to Epoch 15 to allow stabilization under the bridge.
+            if self.current_epoch < 15:
+                phys_loss = torch.clamp(phys_loss, max=10.0)
             
             # [v5.1.3 SOTA] Unit Normalization (The "Regime Alignment")
             # Proactively scales major regression tasks into the [1.0, 15.0] range.
@@ -1229,12 +1259,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
 
             
-            # [PMS] SCS: Manifold Health Monitoring
-            with torch.no_grad():
-                # Efficiently compute total gradient norm
-                total_norm = OrthogonalGuard.sanitize_gradients(self.model)
-                self.grad_norm_ema = self.grad_ema_decay * self.grad_norm_ema + (1 - self.grad_ema_decay) * total_norm
-                self.log("train/manifold_norm_ema", self.grad_norm_ema, on_step=True, prog_bar=True)
+
             
             gn_loss = torch.tensor(0.0, device=self.device)
             
@@ -1298,17 +1323,20 @@ class ICUGeneralistWrapper(pl.LightningModule):
             
             # Combine physics components
             phys_loss = l_phys + l_envelope
-            
-            # Defensive Clamp: Don't let huge physics loss destroy the gradients early on
-            if self.current_epoch < 5:
+            if self.current_epoch < 15:
                 phys_loss = torch.clamp(phys_loss, max=10.0)
 
             self.manual_backward(phys_loss)
-            
-            # [PMS] SCS: Physics Manifold Monitoring
-            with torch.no_grad():
-                phys_norm = OrthogonalGuard.sanitize_gradients(self.model)
-                self.grad_norm_ema = self.grad_ema_decay * self.grad_norm_ema + (1 - self.grad_ema_decay) * phys_norm
+
+        # [v26.2 SOTA FIX] Unified Manifold Observation logic.
+        # Moved here to eliminate the "Transparency Trap" (Reporting Bias).
+        # This ensures the EMA sees the FINAL combined manifold after all
+        # Sepsis Projections and Physics restorations are complete.
+        with torch.no_grad():
+            # Efficiently compute total gradient pressure (pre-optimizer clip)
+            current_grad_pressure = OrthogonalGuard.sanitize_gradients(self.model)
+            self.grad_norm_ema = self.grad_ema_decay * self.grad_norm_ema + (1 - self.grad_ema_decay) * current_grad_pressure
+            self.log("train/manifold_norm_ema", self.grad_norm_ema, on_step=True, prog_bar=True)
 
         # --- 5. Accumulation-Aware Step & Cleanup ---
         # [SOTA 2025] Manually manage accumulation for precise DDP synchronization

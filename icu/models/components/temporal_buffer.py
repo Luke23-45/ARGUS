@@ -42,6 +42,10 @@ class TemporalContrastiveBuffer(nn.Module):
         """
         Updates the buffer with new negative samples.
         """
+        # [v26.0 SAFETY] NaN Guard
+        if torch.isnan(keys).any() or torch.isinf(keys).any():
+            return
+
         # [v4.0 PERFECT] Ensure keys are normalized before storage
         keys = F.normalize(keys, dim=1)
         

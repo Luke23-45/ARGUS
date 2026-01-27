@@ -160,7 +160,8 @@ class ICUAdvantageCalculator(nn.Module):
             focal_alpha: float = 0.25,      # Negative reward emphasis
             qsofa_thresholds: Optional[Dict[str, float]] = None,  # Override defaults
             adaptive_beta: bool = True,     # [SOTA 2025] Enabled by default for fresh start
-            adaptive_clipping: bool = True  # [SOTA 2025] Enabled by default for fresh start
+            adaptive_clipping: bool = True, # [SOTA 2025] Enabled by default for fresh start
+            beta_momentum: float = 0.90     # [SOTA] Default momentum (exposed for tuning)
         ):
         """
         Initialize the Advantage Calculator.
@@ -176,6 +177,7 @@ class ICUAdvantageCalculator(nn.Module):
             qsofa_thresholds: Override default qSOFA thresholds
             adaptive_beta: Enable dynamic beta scaling (std-based)
             adaptive_clipping: Enable dynamic weight clipping (quantile-based)
+            beta_momentum: Momentum for adaptive beta updates (0.90-0.999)
         """
         super().__init__()
         self.register_buffer("beta", torch.tensor(1.0).float()) # Fresh Start: Default to 1.0
@@ -194,7 +196,7 @@ class ICUAdvantageCalculator(nn.Module):
         # [SOTA 2025] Adaptive Hyperparameters
         self.adaptive_beta = adaptive_beta
         self.adaptive_clipping = adaptive_clipping
-        self.beta_momentum = 0.90      # Faster updates (was 0.95)
+        self.beta_momentum = beta_momentum      # [SOTA FIX] Configurable
         self.clip_momentum = 0.90
         self.min_beta = 0.01           # Allow sharper peaks
         self.max_beta = 10.0

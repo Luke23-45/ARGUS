@@ -143,6 +143,11 @@ class SepsisGhostBank(nn.Module):
             vitals, masks, labels, latents = vitals[active_mask], masks[active_mask], labels[active_mask], latents[active_mask]
             if uncertainties is not None: uncertainties = uncertainties[active_mask]
         
+        # [v26.0 SAFETY CRITICAL] Sanity Gate: Reject Poisoned Updates
+        # If the model explodes (NaN/Inf), we MUST NOT pollute the memory bank.
+        if torch.isnan(latents).any() or torch.isinf(latents).any():
+            return
+
         B_orig = vitals.shape[0]
         if B_orig == 0: return
 
