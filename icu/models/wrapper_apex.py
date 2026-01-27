@@ -94,7 +94,8 @@ from icu.models.apex_moe_planner import APEX_MoE_Planner
 from icu.utils.train_utils import (
     configure_robust_optimizer, 
     SurgicalCheckpointLoader, 
-    get_cosine_schedule_with_warmup
+    get_cosine_schedule_with_warmup,
+    ScalingSteward
 )
 from icu.utils.advantage_calculator import ICUAdvantageCalculator
 from icu.utils.metrics_advanced import (
@@ -308,6 +309,27 @@ class ICUSpecialistWrapper(pl.LightningModule):
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Inference Forward (Soft-Gated Sampling with PGS)."""
         return self.model.sample(batch, use_physics_guidance=True)
+
+    def on_train_start(self):
+        """[SOTA v2026] Unified Mathematical Hyperparameter Scaling for Phase 2."""
+        n_curr = self.trainer.num_training_batches
+        
+        logger.info(f"⚡ [SOTA] Phase 2 Scaling: Unifying dynamics for {n_curr} steps (Ref: {ScalingSteward.REF_STEPS})")
+        
+        # 1. Scale AWR Engine (Advantage-Weighted Regression)
+        # Specialist training depends heavily on these weights.
+        self.awr_calculator.scale_dynamics(n_curr)
+        
+        # 2. Scale Warmup Steps (Linear)
+        # baseline for 200 batches (~5-10 epochs depending on config)
+        # Specialist training usually has shorter warmup than generalist
+        ref_warmup = self.cfg.train.get("warmup_steps", 1500)
+        self.trainer.warmup_steps = ScalingSteward.get_steps(ref_warmup, n_curr)
+        
+        logger.info(
+            f"⚡ [SOTA] Phase 2 Scaling Complete: awr_beta_mom={self.awr_calculator.beta_momentum:.6f}, "
+            f"warmup={self.trainer.warmup_steps} steps"
+        )
 
     # =========================================================================
     # PRE-FLIGHT CHECKS (Safety Critical - DDP Safe)

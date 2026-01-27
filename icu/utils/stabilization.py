@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Optional, List, Dict, Union, Tuple
+from .train_utils import ScalingSteward
 
 # ==============================================================================
 # 1. STABLE CONTRASTIVE LOSS (The "Hard Fix" for ACL)
@@ -41,6 +42,12 @@ class StableContrastiveLoss(nn.Module):
         # Buffer, not Parameter -> No Gradients on Centroids directly
         self.register_buffer('centroids', F.normalize(torch.randn(num_classes, d_model), dim=1))
         self.register_buffer('initialized', torch.zeros(1, dtype=torch.bool))
+
+    def scale_dynamics(self, n_curr: int):
+        """[SOTA v2026] Unifies contrastive momentum across step densities."""
+        if n_curr <= 0: return
+        # Baseline 0.99 for 200 steps
+        self.momentum = ScalingSteward.get_decay(0.99, n_curr)
 
     def forward(self, features: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
@@ -171,9 +178,14 @@ class RobustLossScaler(nn.Module):
         # Learnable log_vars (s_i in paper)
         self.log_vars = nn.Parameter(torch.zeros(num_tasks))
         
-        # EMA tracking for stability monitoring
         self.register_buffer("loss_emas", torch.zeros(num_tasks))
         self.decay = decay
+
+    def scale_dynamics(self, n_curr: int):
+        """[SOTA v2026] Unifies uncertainty decay across step densities."""
+        if n_curr <= 0: return
+        # Baseline 0.99 for 200 steps
+        self.decay = ScalingSteward.get_decay(0.99, n_curr)
 
     def forward(self, losses: List[torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
         total_loss = 0.0

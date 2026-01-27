@@ -82,6 +82,43 @@ except ImportError:
 
 
 # =============================================================================
+# 0. MATHEMATICAL UNIFICATION: THE SCALING STEWARD
+# =============================================================================
+
+class ScalingSteward:
+    """
+    [v2026 SOTA] Centralized engine for Hyperparameter Unification.
+    
+    Ensures that training dynamics (effective memory windows, adaptation rates, 
+    and capacity) are invariant to the number of training steps per epoch.
+    
+    Laws:
+    1. Exponential Invariance: Scales decays/momentum for epoch-level parity.
+    2. Linear Volume: Scales capacities/steps for data-coverage parity.
+    """
+    REF_STEPS = 200 # Stable baseline from M_short run
+
+    @staticmethod
+    def get_decay(ref_decay: float, n_curr: int) -> float:
+        """
+        Scales an EMA decay factor to maintain identical half-life in epoch terms.
+        Formula: v_curr = v_ref^(N_ref / N_curr)
+        """
+        if n_curr <= 0: return ref_decay
+        # v1.0: Use log-space/power laws for numerical stability on extreme densities
+        return float(ref_decay ** (ScalingSteward.REF_STEPS / n_curr))
+
+    @staticmethod
+    def get_steps(ref_steps: int, n_curr: int) -> int:
+        """
+        Scales a step count or capacity linearly with batch density.
+        Formula: v_curr = v_ref * (N_curr / N_ref)
+        """
+        if n_curr <= 0: return ref_steps
+        return int(ref_steps * (n_curr / ScalingSteward.REF_STEPS))
+
+
+# =============================================================================
 # 1. DISTRIBUTED HARDWARE GUARDRAILS
 # =============================================================================
 

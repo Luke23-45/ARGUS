@@ -18,6 +18,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict
+from icu.utils.train_utils import ScalingSteward
+import logging
+
+logger = logging.getLogger("APEX_TCB")
 
 class TemporalContrastiveBuffer(nn.Module):
     def __init__(self, d_model: int, capacity: int = 1024, temperature: float = 0.07):
@@ -36,6 +40,25 @@ class TemporalContrastiveBuffer(nn.Module):
         # We store normalized embeddings [Capacity, D_model]
         self.register_buffer("queue", F.normalize(torch.randn(capacity, d_model), dim=1))
         self.register_buffer("queue_ptr", torch.tensor(0, dtype=torch.long))
+
+    def scale_dynamics(self, n_curr: int):
+        """[SOTA v2026] Unifies buffer capacity across step densities."""
+        if n_curr <= 0: return
+        
+        new_capacity = ScalingSteward.get_steps(self.capacity, n_curr)
+        if new_capacity != self.capacity:
+             logger.info(f"⚡ [TCB] Scaling Capacity: {self.capacity} -> {new_capacity}")
+             # Save current state
+             old_queue = self.queue.clone()
+             
+             num_to_keep = min(self.capacity, new_capacity)
+             self.capacity = new_capacity
+             
+             self.register_buffer("queue", F.normalize(torch.randn(new_capacity, self.d_model), dim=1))
+             
+             # Copy old data
+             self.queue.data[:num_to_keep] = old_queue[:num_to_keep]
+             self.queue_ptr.fill_(num_to_keep % new_capacity)
 
     @torch.no_grad()
     def _dequeue_and_enqueue(self, keys: torch.Tensor, scores: Optional[torch.Tensor] = None):

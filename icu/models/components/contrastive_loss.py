@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from icu.utils.train_utils import ScalingSteward
 
 class AsymmetricContrastiveLoss(nn.Module):
     """
@@ -24,6 +25,12 @@ class AsymmetricContrastiveLoss(nn.Module):
         # This prevents "fighting" between the encoder and the centroids
         self.register_buffer('centroids', F.normalize(torch.randn(num_classes, d_model), dim=1))
         self.register_buffer('initialized', torch.zeros(1, dtype=torch.bool))
+
+    def scale_dynamics(self, n_curr: int):
+        """[SOTA v2026] Unifies contrastive momentum across step densities."""
+        if n_curr <= 0: return
+        # Baseline 0.99 for 200 steps
+        self.momentum = ScalingSteward.get_decay(0.99, n_curr)
 
     def forward(self, z: torch.Tensor, y: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         """

@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional, Tuple
+from icu.utils.train_utils import ScalingSteward
 
 class SepsisGhostBank(nn.Module):
     def __init__(
@@ -80,6 +81,47 @@ class SepsisGhostBank(nn.Module):
         
         # Rescale to unit hypersphere for stable similarity mapping
         self.prototype_ema.copy_(F.normalize(self.prototype_ema, dim=1))
+
+    def scale_dynamics(self, n_curr: int):
+        """[SOTA v2026] Unifies bank capacity and decay across step densities."""
+        if n_curr <= 0: return
+        
+        # 1. Scale EMA Decay
+        self.prototype_ema_decay = ScalingSteward.get_decay(0.99, n_curr)
+        
+        # 2. Scale Capacity Linearly
+        # Note: We re-allocate buffers to maintain identical epoch-time coverage.
+        # This is safe because on_train_start runs after on_load_checkpoint.
+        new_capacity = ScalingSteward.get_steps(self.capacity, n_curr)
+        if new_capacity != self.capacity:
+            # Re-allocate with current data preservation
+            old_raw_vitals = self.raw_vitals
+            old_raw_masks = self.raw_masks
+            old_raw_labels = self.raw_labels
+            old_latent_anchors = self.latent_anchors
+            old_uncertainties = self.uncertainties
+            
+            num_to_keep = min(self.capacity, new_capacity)
+            self.capacity = new_capacity
+            
+            self.register_buffer("raw_vitals", torch.zeros(new_capacity, self.history_len, self.feature_dim))
+            self.register_buffer("raw_masks", torch.zeros(new_capacity, self.history_len, self.feature_dim))
+            self.register_buffer("raw_labels", torch.zeros(new_capacity, dtype=torch.long))
+            self.register_buffer("latent_anchors", torch.zeros(new_capacity, self.latent_dim))
+            self.register_buffer("uncertainties", torch.zeros(new_capacity, 1))
+            
+            # Copy old data
+            self.raw_vitals[:num_to_keep] = old_raw_vitals[:num_to_keep]
+            self.raw_masks[:num_to_keep] = old_raw_masks[:num_to_keep]
+            self.raw_labels[:num_to_keep] = old_raw_labels[:num_to_keep]
+            self.latent_anchors[:num_to_keep] = old_latent_anchors[:num_to_keep]
+            self.uncertainties[:num_to_keep] = old_uncertainties[:num_to_keep]
+            
+            # Update pointers
+            new_size = min(int(self.size), new_capacity)
+            self.size.fill_(new_size)
+            self.ptr.fill_(new_size % new_capacity)
+            self.is_full.fill_(new_size == new_capacity)
 
     def _find_lvp_index(self) -> int:
         """

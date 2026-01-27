@@ -52,7 +52,8 @@ from icu.utils.train_utils import (
     is_main_process, 
     get_world_size,
     RotationalSaver,
-    TieredEMA
+    TieredEMA,
+    ScalingSteward
 )
 
 # [FIX: Robust Import for RichProgressBarTheme (Colab/Older PL versions)]
@@ -791,6 +792,11 @@ def get_sota_callbacks(cfg: DictConfig) -> List[Callback]:
     
     # [SOTA] Only create EMACallback if use_teacher is enabled
     if cfg.model.get("use_teacher", False) and ema_decay > 0:
+        # [v2026] Scale EMA decay for epoch-level parity
+        n_curr = trainer.num_training_batches if trainer is not None else ScalingSteward.REF_STEPS
+        if n_curr > 0:
+            ema_decay = ScalingSteward.get_decay(ema_decay, n_curr)
+            
         callbacks.append(EMACallback(
             decay=ema_decay, 
             update_every=ema_update_every

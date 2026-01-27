@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple
+from icu.utils.train_utils import ScalingSteward
 
 class BayesianProjectedScaler(nn.Module):
     """
@@ -23,6 +24,11 @@ class BayesianProjectedScaler(nn.Module):
         # EMA tracking for UW-SO stability
         self.register_buffer("loss_emas", torch.ones(num_tasks))
         self.decay = decay
+        
+    def scale_dynamics(self, n_curr: int):
+        """[SOTA v2026] Unifies uncertainty decay across step densities."""
+        if n_curr <= 0: return
+        self.decay = ScalingSteward.get_decay(0.99, n_curr)
         
     def forward(self, loss_dict: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
         """

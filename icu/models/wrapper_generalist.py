@@ -73,7 +73,7 @@ from icu.core.robust_losses import (
 
 # Project Imports
 from icu.models.diffusion import ICUUnifiedPlanner, ClinicalResidualHead, ICUConfig, PhysiologicalConsistencyLoss
-from icu.utils.train_utils import EMA
+from icu.utils.train_utils import EMA, ScalingSteward
 from icu.utils.advantage_calculator import ICUAdvantageCalculator
 from icu.utils.metrics_advanced import (
     compute_policy_entropy, 
@@ -289,7 +289,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         self.class_balancer = DynamicClassBalancer(
             num_classes=cfg.model.get("num_phases", 3),
             prior_pos_weight=pos_weight,
-            beta=cfg.train.get("balancer_beta", 0.9995) # [SOTA] Slow down adaptation for long epochs
+            beta=cfg.train.get("balancer_beta", 0.9995)
         )
         # [v25.4 FIX] Initial Log-Var Reset: Start with balanced weights (sigma=1.0)
         if self.balancing_mode == "sota_2025":
@@ -440,8 +440,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         
         # [PMS] Manifold Stability Monitoring
         self.register_buffer("grad_norm_ema", torch.tensor(1.0))
-        # [v26.5 SOTA FIX] Expose decay for stabilization on large datasets
-        self.grad_ema_decay = cfg.train.get("grad_ema_decay", 0.99) # Default increased to 0.99 for stability
+        self.grad_ema_decay = cfg.train.get("grad_ema_decay", 0.99)
         
         # [PMS] MGP: EMA Foundation Gradient Storage for projection
         # Flattened size based on encoder hidden dim (e.g., 512, 1024)
@@ -450,6 +449,41 @@ class ICUGeneralistWrapper(pl.LightningModule):
         
         # [SOTA DDP] Zero-Copy Gatherer
         self.ddp_gatherer = None 
+    
+    def on_train_start(self):
+        """[SOTA v2026] Unified Mathematical Hyperparameter Scaling."""
+        # Detect the actual number of iterations per epoch (e.g., 1176 vs 200)
+        # We unify all dynamics using the ScalingSteward (Reference: 200 steps)
+        n_curr = self.trainer.num_training_batches
+        
+        logger.info(f"⚡ [SOTA] Scaling Steward: Unifying dynamics for {n_curr} steps (Ref: {ScalingSteward.REF_STEPS})")
+        
+        # 1. Manifold & Core Scaling
+        # grad_ema_decay (Baseline 0.99)
+        self.grad_ema_decay = ScalingSteward.get_decay(0.99, n_curr)
+        
+        # class_balancer.beta (Baseline 0.9995)
+        self.class_balancer.beta = ScalingSteward.get_decay(0.9995, n_curr)
+        
+        # 2. Linear Scaling (Warmup Steps)
+        # baseline steps for 200-batch epoch (~7.5 epochs)
+        ref_warmup = 1500 
+        self.trainer.warmup_steps = ScalingSteward.get_steps(ref_warmup, n_curr)
+        
+        # 3. Component-Specific Scaling (Modular Intercepts)
+        self.awr_calculator.scale_dynamics(n_curr)
+        self.ghost_bank.scale_dynamics(n_curr)
+        self.tcb_buffer.scale_dynamics(n_curr)
+        self.sepsis_acl.scale_dynamics(n_curr)
+        
+        if hasattr(self, "loss_scaler"):
+            self.loss_scaler.scale_dynamics(n_curr)
+        
+        logger.info(
+            f"⚡ [SOTA] Scaling Complete: grad_ema={self.grad_ema_decay:.4f}, "
+            f"balancer_beta={self.class_balancer.beta:.6f}, "
+            f"warmup={self.trainer.warmup_steps} steps"
+        )
 
     def on_train_epoch_start(self):
         """[Phase 3/4] Update AWR Horizon and SOTA v4.2 Warmup."""
@@ -744,7 +778,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
                         self._fnd_grad_ema = dir_fnd.detach().clone()
                     else:
                         self._fnd_grad_ema = self._fnd_grad_ema.to(grad_fnd.device)
-                        self._fnd_grad_ema.mul_(0.9).add_(dir_fnd.detach(), alpha=0.1)
+                        # [SOTA v2026] Scale-Aware Directional Stability
+                        # Automatically scales the baseline 0.90 decay to maintain 
+                        # identical manifold memory across different batch densities.
+                        fnd_momentum = ScalingSteward.get_decay(0.90, self.trainer.num_training_batches)
+                        self._fnd_grad_ema.mul_(fnd_momentum).add_(dir_fnd.detach(), alpha=1.0 - fnd_momentum)
                 return grad_fnd
 
             if ctx_seq.requires_grad:
@@ -2172,7 +2210,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # [v15.4] Robusified: Calibration Mode Toggle
             num_samples = len(dataset)
             mode = self.cfg.train.get("awr_calibration_mode", "full")
-            max_samples = self.cfg.train.get("awr_max_samples", 5000)
+            # [SOTA FIX] Population Coverage Boost (10k -> 60k)
+            max_samples = self.cfg.train.get("awr_max_samples", 60000)
 
             if mode == "sample":
                 if max_samples >= num_samples:

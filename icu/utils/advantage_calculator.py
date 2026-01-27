@@ -72,6 +72,7 @@ import numpy as np
 import logging
 import math
 import torch.distributed as dist
+from icu.utils.train_utils import ScalingSteward
 from typing import Optional, Tuple, Dict, List, Union, Any
 
 logger = logging.getLogger("APEX_Advantage_Ultimate")
@@ -198,6 +199,11 @@ class ICUAdvantageCalculator(nn.Module):
         self.adaptive_clipping = adaptive_clipping
         self.beta_momentum = beta_momentum      # [SOTA FIX] Configurable
         self.clip_momentum = 0.90
+        
+        # [SOTA v2026] Internal Scaled Constants (Initialized with Defaults for 200 steps)
+        self.ess_ema_decay = 0.95
+        self.beta_growth_factor = 1.5
+        
         self.min_beta = 0.01           # Allow sharper peaks
         self.max_beta = 10.0
         
@@ -282,6 +288,28 @@ class ICUAdvantageCalculator(nn.Module):
                 )
                 return False
         return True
+
+    def scale_dynamics(self, n_curr: int):
+        """[SOTA v2026] Unifies AWR adaptation rates across step densities."""
+        if n_curr <= 0: return
+        
+        logger.info(f"⚡ [AWR] Scaling Dynamics for {n_curr} steps (Ref: {ScalingSteward.REF_STEPS})")
+        
+        # 1. Scale Momentum Decays
+        # Matches the 'awr_momentum' from config (e.g., 0.999)
+        self.beta_momentum = ScalingSteward.get_decay(self.beta_momentum, n_curr)
+        self.clip_momentum = ScalingSteward.get_decay(0.90, n_curr) 
+        
+        # 2. Scale Telemetry Buffers
+        self.ess_ema_decay = ScalingSteward.get_decay(0.95, n_curr)
+        
+        # 3. Scale Growth Rates (Baseline: 1.5)
+        self.beta_growth_factor = float(1.5 ** (ScalingSteward.REF_STEPS / n_curr))
+        
+        logger.info(
+            f"⚡ [AWR] Scaling Results: beta_mom={self.beta_momentum:.6f}, "
+            f"ess_ema={self.ess_ema_decay:.4f}, growth={self.beta_growth_factor:.4f}"
+        )
 
     # =========================================================================
     # CLINICAL REWARD FUNCTION
@@ -820,16 +848,20 @@ class ICUAdvantageCalculator(nn.Module):
                     correction = max(0.5, min(2.0, correction))
                     new_beta = self.beta * correction
                     
-                    # Momentum Update (Reduced lag)
-                    self.beta.copy_((0.80 * self.beta) + (0.20 * new_beta))
+                    # [SOTA FIX] Respect Config-Driven Momentum (awr_momentum: 0.999)
+                    # Prevents "Step-Density Compression" in long epochs.
+                    mom = self.beta_momentum
+                    self.beta.copy_((mom * self.beta) + ((1.0 - mom) * new_beta))
                 
                 # [FIX 5] ESS Safety Floor: If ESS critically low, force-warm beta
                 if current_ess < 0.05:
-                    self.beta.copy_(self.beta * 1.5)
+                    self.beta.copy_(self.beta * self.beta_growth_factor)
 
                 # [v25.6 SOTA] ESS Momentum Buffer
                 # Stabilizes telemetry across jittery batches.
-                self.ess_momentum_buffer.copy_(0.95 * self.ess_momentum_buffer + 0.05 * current_ess)
+                # [v2026] Uses Scaled Decay
+                ema_d = self.ess_ema_decay
+                self.ess_momentum_buffer.copy_(ema_d * self.ess_momentum_buffer + (1.0 - ema_d) * current_ess)
                 
                 self.beta.copy_(self.beta.clamp(min=self.min_beta, max=self.max_beta))
 
