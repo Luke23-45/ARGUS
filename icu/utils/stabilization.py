@@ -303,15 +303,20 @@ class OrthogonalGuard(object):
     """
     [SOTA] Gradient Orthogonality Guard.
     Project: Protects the 'Survival' manifold from 'Diffusion' noise.
+    
+    Enhanced v26.5: Now supports Variance Tracking for Adaptive Sentinels.
     """
     @staticmethod
-    def sanitize_gradients(model, primary_task_name="diffusion"):
+    def sanitize_gradients(model):
         # 1. Global Norm Check (The Explosion Detector)
         # Efficiently computes norm over all parameters
         grads = [torch.norm(p.grad.detach(), 2) for p in model.parameters() if p.grad is not None]
         if not grads:
             return 0.0
-        total_norm = torch.norm(torch.stack(grads))
+        
+        # Use stack for vectorized norm calculation
+        grad_stack = torch.stack(grads)
+        total_norm = torch.norm(grad_stack)
         
         # 2. Adaptive Clipping (The Response)
         # If GN > 1.0, we don't just clip, we perform 'Soft Clamping'
@@ -324,3 +329,59 @@ class OrthogonalGuard(object):
                     p.grad.detach().mul_(scale_factor)
                     
         return total_norm.item()
+
+# ==============================================================================
+# 7. TREND SENTINEL (The Early Warning System)
+# ==============================================================================
+
+class TrendSentinel:
+    """
+    [SOTA v2026] Adaptive Distribution Monitor.
+    Detects Manifold Shocks using Z-Score analysis rather than fixed thresholds.
+    """
+    @staticmethod
+    def calculate_z_score(current_val: float, ema: torch.Tensor, std: torch.Tensor) -> float:
+        """Computes the standard deviation distance from the moving baseline."""
+        diff = abs(current_val - ema.item())
+        # Use a floor for std to prevent division by zero in stable regimes
+        safe_std = max(std.item(), 0.05) 
+        return diff / safe_std
+
+    @staticmethod
+    def is_shock(z_score: float, threshold: float = 3.0) -> bool:
+        """Trigger if the deviation exceeds N standard deviations."""
+        return z_score > threshold
+
+    @staticmethod
+    def is_unstable(ema: float, std: float, max_pressure: float = 5.0, max_sigma: float = 2.0) -> bool:
+        """
+        [SOTA v2026] Hybrid Sentinel: Detects both Drift (Boiling Frog) and Shock.
+        1. Pressure Check: Is the manifold under absolute physiological stress? (EMA > 5.0)
+        2. Volatility Check: Is the manifold vibrating uncontrollably? (STD > 2.0)
+        """
+        # [Guard 1] Absolute Pressure (The "Boiling Frog" Detector)
+        if ema > max_pressure:
+            return True
+            
+        # [Guard 2] Volatility Shock (The "Earthquake" Detector)
+        if std > max_sigma:
+            return True
+            
+        return False
+
+    @staticmethod
+    def update_stats(current_val: float, ema: torch.Tensor, std: torch.Tensor, decay: float):
+        """Standard EMA update for mean and variance (Welford-style approximation)."""
+        with torch.no_grad():
+            delta = current_val - ema.item()
+            # Update Mean
+            ema.mul_(decay).add_(current_val, alpha=1.0 - decay)
+            # Update Variance (EMA of squared differences)
+            # Var_new = decay * Var_old + (1-decay) * (delta * new_delta)
+            new_delta = current_val - ema.item()
+            sq_diff = delta * new_delta
+            
+            # We store STD directly for easier Z-score calculation
+            var = (std.item() ** 2)
+            new_var = decay * var + (1.0 - decay) * sq_diff
+            std.fill_(math.sqrt(max(new_var, 1e-6)))

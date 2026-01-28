@@ -54,7 +54,9 @@ class TemporalContrastiveBuffer(nn.Module):
              num_to_keep = min(self.capacity, new_capacity)
              self.capacity = new_capacity
              
-             self.register_buffer("queue", F.normalize(torch.randn(new_capacity, self.d_model), dim=1))
+             # [SOTA FIX] Capture device to prevent CPU mismatch after resize
+             device = self.queue.device
+             self.register_buffer("queue", F.normalize(torch.randn(new_capacity, self.d_model, device=device), dim=1))
              
              # Copy old data
              self.queue.data[:num_to_keep] = old_queue[:num_to_keep]

@@ -78,9 +78,11 @@ from icu.utils.advantage_calculator import ICUAdvantageCalculator
 from icu.utils.metrics_advanced import (
     compute_policy_entropy, 
     compute_ece, 
+    compute_expected_calibration_error,
     compute_explained_variance, 
     compute_overconfidence_error
 )
+from icu.utils.logging_utils import BufferedCSVLogger
 from icu.utils.safety import OODGuardian
 from icu.utils.stability import ForensicStabilityAuditor
 from icu.models.components.loss_scaler import BayesianProjectedScaler
@@ -93,7 +95,8 @@ from icu.utils.stabilization import (
     GradientThrottler, 
     adaptive_gradient_clip_,
     LinearManifoldSentinel,
-    OrthogonalGuard
+    OrthogonalGuard,
+    TrendSentinel
 )
 from icu.models.components.contrastive_loss import AsymmetricContrastiveLoss
 from icu.models.components.safety_envelope import PhysiologicalSafetyEnvelope
@@ -438,9 +441,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
         self.register_buffer("curr_tau", torch.tensor(0.5))
         self.register_buffer("curr_sigma_scale", torch.tensor(3.50))
         
-        # [PMS] Manifold Stability Monitoring
+        # [PMS] Manifold Stability Monitoring (v26.5 SOTA)
         self.register_buffer("grad_norm_ema", torch.tensor(1.0))
+        self.register_buffer("grad_norm_std", torch.tensor(0.5)) # Standard Deviation for Z-scoring
         self.grad_ema_decay = cfg.train.get("grad_ema_decay", 0.99)
+        
+        # [PMS] Resumption Grace Period (Circuit Breaker)
+        # Prevents "False Shocks" as the first few batches settle after resume.
+        self.register_buffer("resumption_grace_steps", torch.tensor(0))
         
         # [PMS] MGP: EMA Foundation Gradient Storage for projection
         # Flattened size based on encoder hidden dim (e.g., 512, 1024)
@@ -449,6 +457,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
         
         # [SOTA DDP] Zero-Copy Gatherer
         self.ddp_gatherer = None 
+        
+        # [v2026] Intra-Epoch Telemetry
+        # Efficient percentages logging (e.g. "Epoch 6: 5%")
+        self.csv_log_interval = cfg.train.get("csv_log_interval_percent", 5.0)
+        self.csv_logger = None
+        if self.csv_log_interval > 0:
+            # Lazy init to handle DDP rank checks later or just write from all ranks (filtered usually)
+            pass
+        
+        self.last_logged_bucket = -1
     
     def on_train_start(self):
         """[SOTA v2026] Unified Mathematical Hyperparameter Scaling."""
@@ -479,10 +497,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
         if hasattr(self, "loss_scaler"):
             self.loss_scaler.scale_dynamics(n_curr)
         
+        # [PMS] Resumption Trauma Mitigation (v26.5)
+        # We always set a grace period at startup to allow the manifold 
+        # statistics to settle before the sentinel begins patrolling.
+        self.resumption_grace_steps.fill_(50)
+        
         logger.info(
             f"⚡ [SOTA] Scaling Complete: grad_ema={self.grad_ema_decay:.4f}, "
             f"balancer_beta={self.class_balancer.beta:.6f}, "
-            f"warmup={self.trainer.warmup_steps} steps"
+            f"warmup={self.trainer.warmup_steps} steps | Sentinel Grace: 50 steps"
         )
 
     def on_train_epoch_start(self):
@@ -521,14 +544,28 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # [v4.2 SOTA Pillar 2 & 4] Synchronized Risk Warmup
         # Goal: Slowly introduce CVaR pessimism and Safety Envelope constraints.
         
-        # [PMS] SCS: Synchronized Curriculum Smoothing
-        # We check the 'Manifold Health' (Gradient Variance).
-        # If the brain is in 'Shock' (Norm > 5.0), we freeze the ramp.
-        if self.grad_norm_ema > 5.0:
-            logger.warning(f"[PMS] Manifold Shock Detected (GN={self.grad_norm_ema:.2f}). Freezing Curriculum Ramp.")
+        # [PMS] SCS: Hybrid Sentinel (v26.5 SOTA)
+        # Health Check: Triggers on Absolute Pressure (Boiling Frog) OR Volatility Shock.
+        # 1. EMA > 5.0 (Absolute Limit) - catches slow drift
+        # 2. STD > 2.0 (Volatility Limit) - catches sudden earthquakes
+        is_shock = TrendSentinel.is_unstable(
+            ema=self.grad_norm_ema.item(),
+            std=self.grad_norm_std.item(),
+            max_pressure=5.0, 
+            max_sigma=2.0
+        )
+        
+        if is_shock and self.resumption_grace_steps == 0:
+            logger.warning(
+                f"[PMS] Manifold Shock Detected (GN={self.grad_norm_ema:.2f}). "
+                "Freezing Curriculum Ramp."
+            )
             # Keep current tau and sigma_scale (No increment)
             pass 
         else:
+            if self.resumption_grace_steps > 0:
+                logger.info(f"[PMS] Resumption Grace Period Active ({self.resumption_grace_steps.item()} steps remaining). Sentinel Muted.")
+            
             ramp_epochs = 10.0
             if self.current_epoch >= 5:
                 tau_progress = min(1.0, (self.current_epoch - 5) / ramp_epochs)
@@ -1373,8 +1410,58 @@ class ICUGeneralistWrapper(pl.LightningModule):
         with torch.no_grad():
             # Efficiently compute total gradient pressure (pre-optimizer clip)
             current_grad_pressure = OrthogonalGuard.sanitize_gradients(self.model)
-            self.grad_norm_ema = self.grad_ema_decay * self.grad_norm_ema + (1 - self.grad_ema_decay) * current_grad_pressure
+            
+            # [v26.5 SOTA] Adaptive Statistics Update
+            # Automatically scales with step density via Scaled Decay
+            TrendSentinel.update_stats(
+                current_grad_pressure, 
+                self.grad_norm_ema, 
+                self.grad_norm_std, 
+                self.grad_ema_decay
+            )
+            
+            # Tick down Resumption Grace period
+            if self.resumption_grace_steps > 0:
+                self.resumption_grace_steps.sub_(1)
+
             self.log("train/manifold_norm_ema", self.grad_norm_ema, on_step=True, prog_bar=True)
+            self.log("train/manifold_norm_std", self.grad_norm_std, on_step=True)
+
+            # [v2026 SOTA] Efficient Intra-Epoch CSV Logging
+            # Log every N% (e.g., 5%, 10%, 15%) without syscall latency
+            if self.csv_log_interval > 0:
+                # 1. Initialize Logger on First Step (Rank 0 Only)
+                if self.csv_logger is None and (not dist.is_initialized() or dist.get_rank() == 0):
+                     log_dir = self.trainer.logger.log_dir if self.trainer.logger else "logs/fallback"
+                     self.csv_logger = BufferedCSVLogger(log_dir)
+
+                # 2. Check Interval bucket
+                # e.g., pct = 5, interval = 5 -> bucket 1
+                total_batches = self.trainer.num_training_batches
+                if total_batches > 0:
+                     pct = int(((batch_idx + 1) / total_batches) * 100)
+                     # Only log if we crossed a new interval bucket (5, 10, 15...)
+                     # and haven't logged it yet.
+                     if pct % int(self.csv_log_interval) == 0 and pct > self.last_logged_bucket:
+                         if self.csv_logger:
+                             # Gather lightweight metrics (CPU tensors OK here, infrequent)
+                             row = {
+                                 "epoch": self.current_epoch,
+                                 "pct": pct,
+                                 "step": self.global_step,
+                                 "loss": total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss,
+                                 "gn": current_grad_pressure, # already float
+                                 "ess": weights_awr_log.get("train/awr_ess", 0.0),
+                                 "ev": self.train_explained_var.compute().item(),
+                                 "lr": opt[0].param_groups[0]['lr'] if opt else 0.0
+                             }
+                             # Add component losses
+                             for k, v in loss_dict.items():
+                                 row[f"loss_{k}"] = v.item() if isinstance(v, torch.Tensor) else v
+                                 
+                             self.csv_logger.log(row)
+                             self.last_logged_bucket = pct
+            self.log("train/manifold_norm_std", self.grad_norm_std, on_step=True)
 
         # --- 5. Accumulation-Aware Step & Cleanup ---
         # [SOTA 2025] Manually manage accumulation for precise DDP synchronization

@@ -104,11 +104,14 @@ class SepsisGhostBank(nn.Module):
             num_to_keep = min(self.capacity, new_capacity)
             self.capacity = new_capacity
             
-            self.register_buffer("raw_vitals", torch.zeros(new_capacity, self.history_len, self.feature_dim))
-            self.register_buffer("raw_masks", torch.zeros(new_capacity, self.history_len, self.feature_dim))
-            self.register_buffer("raw_labels", torch.zeros(new_capacity, dtype=torch.long))
-            self.register_buffer("latent_anchors", torch.zeros(new_capacity, self.latent_dim))
-            self.register_buffer("uncertainties", torch.zeros(new_capacity, 1))
+            # [SOTA FIX] Capture device to prevent CPU mismatch after resize
+            device = self.raw_vitals.device
+            
+            self.register_buffer("raw_vitals", torch.zeros(new_capacity, self.history_len, self.feature_dim, device=device))
+            self.register_buffer("raw_masks", torch.zeros(new_capacity, self.history_len, self.feature_dim, device=device))
+            self.register_buffer("raw_labels", torch.zeros(new_capacity, dtype=torch.long, device=device))
+            self.register_buffer("latent_anchors", torch.zeros(new_capacity, self.latent_dim, device=device))
+            self.register_buffer("uncertainties", torch.zeros(new_capacity, 1, device=device))
             
             # Copy old data
             self.raw_vitals[:num_to_keep] = old_raw_vitals[:num_to_keep]
