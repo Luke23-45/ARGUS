@@ -13,9 +13,9 @@ class BayesianProjectedScaler(nn.Module):
     2. PGD Projection: Ensures log_vars stay in the differentiable zone [-2, 5].
     3. Gradient Entropy Preservation: No forward-pass clamping.
     """
-    def __init__(self, num_tasks: int = 6, decay: float = 0.99):
+    def __init__(self, num_tasks: int = 7, decay: float = 0.99):
         super().__init__()
-        self.keys = ['diffusion', 'critic', 'aux', 'acl', 'bgsl', 'tcb']
+        self.keys = ['diffusion', 'critic', 'aux', 'acl', 'bgsl', 'tcb', 'phys']
         self.num_tasks = num_tasks
         
         # Learnable log_vars (Homoscedastic uncertainty)
@@ -30,7 +30,7 @@ class BayesianProjectedScaler(nn.Module):
         if n_curr <= 0: return
         self.decay = ScalingSteward.get_decay(0.99, n_curr)
         
-    def forward(self, loss_dict: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def forward(self, loss_dict: Dict[str, torch.Tensor], stability_factor: float = 1.0, phys_multiplier: float = 1.0) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Unified weighting pass with Dynamic Priority.
         """
@@ -73,10 +73,12 @@ class BayesianProjectedScaler(nn.Module):
             # Primary tasks (aux, acl): Higher weight for sepsis detection
             # Secondary tasks (diff, critic): Lower weight for generative quality
             clinical_weights = torch.tensor(
-                [0.5, 0.5, 1.5, 1.5, 1.0, 1.0],  # [diff, critic, aux, acl, bgsl, tcb]
+                [0.5, 0.5, 1.5, 1.5, 1.0, 1.0, phys_multiplier],  # [diff, critic, aux, acl, bgsl, tcb, phys]
                 device=losses_tensor.device
             )
-            uw_weights = clinical_weights[indices]
+            # Apply Adaptive Governor: 1.0 (Stable) -> ~Near Neutral (Shock)
+            # Rationale: Dampens high-priority (1.5x) tasks back toward 1.0 during shocks.
+            uw_weights = clinical_weights[indices] * stability_factor + (1.0 - stability_factor)
         
         # 2. Bayesian Weighting (Kendall et al.)
         # NO CLAMPING in forward to preserve gradient flow
@@ -115,11 +117,14 @@ class BayesianProjectedScaler(nn.Module):
         self.log_vars.clamp_(min=-2.0, max=5.0)
         
         # 2. [PRUW] Clinical Ranking Enforcement
-        # Keys: ['diffusion', 'critic', 'aux', 'acl', 'bgsl', 'tcb']
-        # indices: diff=0, aux=2, acl=3
+        # Keys: ['diffusion', 'critic', 'aux', 'acl', 'bgsl', 'tcb', 'phys']
+        # indices: diff=0, aux=2, acl=3, phys=6
         diff_log_var = self.log_vars[0]
         
         # Sepsis tasks (aux, acl) must be at least as certain as the foundation
         # log_var_aux <= log_var_diff
         self.log_vars[2].clamp_(max=diff_log_var.item())
         self.log_vars[3].clamp_(max=diff_log_var.item())
+        
+        # Physics task (6) should also be constrained to prevent explosion
+        self.log_vars[6].clamp_(max=5.0) 

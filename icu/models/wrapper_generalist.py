@@ -53,6 +53,7 @@ Dependencies:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 import pytorch_lightning as pl
 from tqdm.auto import tqdm
 from typing import Any, Dict, Optional, Tuple, List, Union
@@ -78,7 +79,6 @@ from icu.utils.advantage_calculator import ICUAdvantageCalculator
 from icu.utils.metrics_advanced import (
     compute_policy_entropy, 
     compute_ece, 
-    compute_expected_calibration_error,
     compute_explained_variance, 
     compute_overconfidence_error
 )
@@ -250,9 +250,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # [v12.8.3 SOTA FIX] Direct Attachment
             # Attaching to self instead of self.model to ensure safe device movement
             # and registration within the LightningModule, avoiding torch.compile issues.
-            # [v4.0 FIX] Initialized with 6 tasks: [diffusion, critic, aux, acl, bgsl, tcb]
-            self.loss_scaler = BayesianProjectedScaler(num_tasks=6)
-            logger.info("Using Model's BayesianProjectedScaler for balancing (6 tasks).")
+            # [v4.0 FIX] Initialized with 7 tasks: [diffusion, critic, aux, acl, bgsl, tcb, phys]
+            self.loss_scaler = BayesianProjectedScaler(num_tasks=7)
+            logger.info("Using Model's BayesianProjectedScaler for balancing (7 tasks).")
         
         # Authority check: EMACallback will attach here as self.ema
         self.ema = None 
@@ -276,9 +276,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # =====================================================================
         self.gradnorm = None
         if self.balancing_mode == "legacy_surgical" or True: # [v25.7] Force enable for ACL expansion
-            # GradNorm dynamically weights [Diffusion, Critic, Aux, ACL, BGSL, TCB]
+            # GradNorm dynamically weights [Diffusion, Critic, Aux, ACL, BGSL, TCB, Phys]
             self.gradnorm = GradNormBalancer(
-                num_tasks=6, 
+                num_tasks=7, 
                 shared_params=self.model.encoder.parameters(),
                 alpha=cfg.train.get("gradnorm_alpha", 1.5)
             ).to(self.device)
@@ -306,6 +306,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 0.0,    # acl
                 0.5,    # bgsl
                 0.5,    # tcb
+                0.5,    # phys: Standard prior for physics constraints
             ])
             # Ensure device compatibility if loaded later
             self.loss_scaler.log_vars.data.copy_(initial_log_vars)
@@ -443,7 +444,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
         
         # [PMS] Manifold Stability Monitoring (v26.5 SOTA)
         self.register_buffer("grad_norm_ema", torch.tensor(1.0))
-        self.register_buffer("grad_norm_std", torch.tensor(0.5)) # Standard Deviation for Z-scoring
+        self.register_buffer("grad_norm_std", torch.tensor(0.5)) 
+        self.register_buffer("grad_norm_step_count", torch.tensor(0))
         self.grad_ema_decay = cfg.train.get("grad_ema_decay", 0.99)
         
         # [PMS] Resumption Grace Period (Circuit Breaker)
@@ -548,16 +550,25 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # Health Check: Triggers on Absolute Pressure (Boiling Frog) OR Volatility Shock.
         # 1. EMA > 5.0 (Absolute Limit) - catches slow drift
         # 2. STD > 2.0 (Volatility Limit) - catches sudden earthquakes
+        
+        # [v2026 SOTA] Use Bias-Corrected stats for decision making
+        ema_bc, std_bc = TrendSentinel.get_stats(
+            ema=self.grad_norm_ema,
+            std=self.grad_norm_std,
+            decay=self.grad_ema_decay,
+            step_tensor=self.grad_norm_step_count
+        )
+        
         is_shock = TrendSentinel.is_unstable(
-            ema=self.grad_norm_ema.item(),
-            std=self.grad_norm_std.item(),
+            ema=ema_bc,
+            std=std_bc,
             max_pressure=5.0, 
             max_sigma=2.0
         )
         
         if is_shock and self.resumption_grace_steps == 0:
             logger.warning(
-                f"[PMS] Manifold Shock Detected (GN={self.grad_norm_ema:.2f}). "
+                f"[PMS] Manifold Shock Detected (GN={ema_bc:.2f}). "
                 "Freezing Curriculum Ramp."
             )
             # Keep current tau and sigma_scale (No increment)
@@ -1061,15 +1072,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
             normalizer = self.model.normalizer
             x0_clinical = normalizer.denormalize(x0_approx)
             
-            # [v26.2 SOTA FIX] Unified Physics Manifold (Merge Schism)
-            # Includes both Vital Boundaries (clinical) and Global Consistency (normalized)
-            phys_violation = self.safety_envelope(x0_clinical, risk_coef) + self.model.phys_loss(x0_approx)
-            phys_loss = phys_violation * curr_phys_weight
+            # [v26.4 FIX] Physics Loss (Unweighted)
+            # Rationale: Violation is passed to the Bayesian Scaler which handles weighting.
+            # Manual weighting here would lead to double-counting.
+            phys_loss = self.safety_envelope(x0_clinical, risk_coef) + self.model.phys_loss(x0_approx)
 
-            # [v26.3 SOTA FIX] Extended Defensive Clamping (Part II Remediation)
-            # Ported and extended to Epoch 15 to allow stabilization under the bridge.
-            if self.current_epoch < 15:
-                phys_loss = torch.clamp(phys_loss, max=10.0)
+            # [v26.4 REMOVED] Logic moved to L1215 after final redefinition to prevent shadowing.
             
             # [v5.1.3 SOTA] Unit Normalization (The "Regime Alignment")
             # Proactively scales major regression tasks into the [1.0, 15.0] range.
@@ -1125,7 +1133,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 true_state_aligned,  
                 past,               
                 risk_coef=risk_coef.view(B, 1, 1), 
-                mask=mask_aligned
+                mask=mask_aligned,
+                stability_factor=stability_factor
             )
             l_bgsl = bgsl_out["loss"]
             
@@ -1167,28 +1176,52 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 )
             l_tcb = tcb_out["loss"]
 
-            # [Point 2] Adaptive Gradient Dynamics (Fan 2025)
-            # Rebalance Diffusion vs Sepsis to ensure clinical priority.
-            # Rationale: D=0.250 while A=0.006. We need to normalize their 'pull'.
+            # [SOTA Governor] Closed-Loop Stability Control (Nash-Inspired)
             with torch.no_grad():
-                # We use a moving average ratio to prevent gradient jitter
-                # If d_loss is 40x a_loss, we want alpha ~ 0.025
-                d_ema = self.loss_scaler.loss_emas[0] # diffusion is key 0
-                a_ema = self.loss_scaler.loss_emas[2] # aux is key 2
+                ema_val, _ = TrendSentinel.get_stats(
+                    ema=self.grad_norm_ema,
+                    std=self.grad_norm_std,
+                    decay=self.grad_ema_decay,
+                    step_tensor=self.grad_norm_step_count
+                )
+                # Factor is 1.0 if EMA <= 5.0, drops exponentially to 0.1 as pressure increases
+                # Formula: stability_factor = exp(-max(0, EMA - 5.0))
+                stability_factor = torch.exp(-torch.clamp(ema_val - 5.0, min=0.0)).item()
                 
-                # Adaptive Factor: Scales D down to A's regime
-                # [v17.4 Hardened] Alpha Guard: Prevent foundation gradient collapse
-                # Relaxation: Allow Bayesian Scaler to handle full task balancing.
+                # [TELEMETRY] Governor State
+                self.log("gov/stability_factor", stability_factor, on_step=True)
+                self.log("gov/gamma_effective", 1.0 + (self.risk_aware_loss.gamma_neg - 1.0) * stability_factor, on_step=True)
+
+            # [Point 2] Adaptive Graduate Dynamics
+            with torch.no_grad():
+                d_ema = self.loss_scaler.loss_emas[0]
+                a_ema = self.loss_scaler.loss_emas[2]
                 alpha = (a_ema / (d_ema + 1e-8)).clamp(min=1e-4, max=1.0)
                 
             loss_dict['diffusion'] = diff_loss * alpha
             loss_dict['bgsl'] = l_bgsl
             loss_dict['tcb'] = l_tcb
+            
+            # [v26.4 FIX] Unified Physics Manifold (Merge Schism)
+            # Rationale: We reuse 'phys_loss' for the unweighted sum. 
+            # Note: We use curr_sigma_scale curriculum here.
+            phys_loss = self.model.phys_loss(x0_approx) + self.safety_envelope(x0_clinical, risk_coef, sigma_scale=self.curr_sigma_scale)
+            
+            # [v26.3 SOTA FIX] Extended Defensive Clamping (Part II Remediation)
+            # Ported and extended to Epoch 15 to allow stabilization under the bridge.
+            if self.current_epoch < 15:
+                phys_loss = torch.clamp(phys_loss, max=10.0)
+                
+            loss_dict['phys'] = phys_loss
 
             # [SOTA 2025] Exclusive Uncertainty Scaling
-            # phys_loss is a hard constraint (Curriculum), not aleatoric noise.
-            # Task balancing should be stable from __init__ (6 tasks).
-            scaled_total, logs = self.loss_scaler(loss_dict)
+            # phys_loss is now a managed task in the conflict loop.
+            # [v26.5 FIX] Pass curriculum-based physics multiplier to the scaler.
+            scaled_total, logs = self.loss_scaler(
+                loss_dict, 
+                stability_factor=stability_factor,
+                phys_multiplier=curr_phys_weight
+            )
             
             # [v25.7 FIX] Accumulation-Aware A-GEM Backup
             # Rationale: l_batch + l_ref = total_loss for the gradient projection.
@@ -1201,71 +1234,50 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # [v14.1 FIX] Correct math to prevent sign-flip. aux_loss already includes 0.5*cga.
             l_ref = (w_aux * 0.5 * aux_loss) if (num_ghosts > 0 or batch_has_sepsis) else None
             
-            total_loss = scaled_total + phys_loss
+            # [v26.4 FIX] Mathematical Integrity Check
+            # total_loss is DERIVED FROM scaled_total. 
+            # scaled_total already contains the weighted physics loss from the scaler.
+            total_loss = scaled_total 
             l_batch = total_loss - (l_ref if l_ref is not None else 0.0)
 
-            # [v25.7 FIX] Accumulation-Aware A-GEM Backup
+            # [v26.5 SOTA FIX] DDP Synchronization Guard & Manual Scaling
+            # Rationale: manual_backward automatically all-reduces gradients on every rank.
+            # During accumulation, we MUST bypass this except for the final batch AND
+            # manually scale the loss by 1/acc_batches.
             acc_batches = self.trainer.accumulate_grad_batches
             is_accumulating = (batch_idx % acc_batches != 0)
-
-            # [FIX 1.1] Normalize for Gradient Accumulation (Manual Optimization)
-            # CRITICAL: We create NEW variables for the backward pass to preserve
-            # original values for correct logging.
+            
+            # [FIX 1.1] Normalize for Gradient Accumulation
             if acc_batches > 1:
                 accum_scale = 1.0 / acc_batches
-                
-                # Scaled variables for BACKWARD only
-                scaled_total_bwd = scaled_total * accum_scale
-                phys_loss_bwd = phys_loss * accum_scale
+                total_loss_bwd = scaled_total * accum_scale
                 # scale aux_loss for l_ref calculation in backward path
-                aux_loss_bwd = aux_loss * accum_scale 
+                l_ref_bwd = (w_aux * 0.5 * aux_loss * accum_scale) if (num_ghosts > 0 or batch_has_sepsis) else None
             else:
-                scaled_total_bwd = scaled_total
-                phys_loss_bwd = phys_loss
-                aux_loss_bwd = aux_loss
+                total_loss_bwd = scaled_total
+                l_ref_bwd = (w_aux * 0.5 * aux_loss) if (num_ghosts > 0 or batch_has_sepsis) else None
 
-            # Recalculate l_ref for BACKWARD pass using scaled aux
-            l_ref_bwd = (w_aux * 0.5 * aux_loss_bwd) if (num_ghosts > 0 or batch_has_sepsis) else None
-
-            # Compute the total backward loss (Scaled)
-            total_loss_bwd = scaled_total_bwd + phys_loss_bwd
             l_batch_bwd = total_loss_bwd - (l_ref_bwd if l_ref_bwd is not None else 0.0)
 
-            # [LOGGING PRESERVATION]
-            # Ensure total_loss / l_batch remain UNSCALED for telemetry
-            # (acc_batches cancellation logic applies only to gradients, not metric value)
-            if 'l_ref' not in locals():
-                 # calculate the unscaled reference if not present (though it was calculated above at L1093)
-                 l_ref = (w_aux * 0.5 * aux_loss) if (num_ghosts > 0 or batch_has_sepsis) else None
-            
-            # total_loss and l_batch are already calculated UNSCALED at line 1095-1096.
-            # We DO NOT overwrite them. We use the _bwd variants for manual_backward.
-
+            # [Optimization Context]
+            # Use no_backward_sync if we are in DDP and NOT on the stepping batch.
+            sync_context = contextlib.nullcontext()
+            if is_accumulating and torch.distributed.is_initialized():
+                sync_context = self.trainer.strategy.no_backward_sync(self)
 
             if l_ref_bwd is not None and l_ref_bwd.grad_fn is not None:
                 # A. Ghost Pass (Reference)
                 # Protects the Clinical Memory Manifold
                 # [v25.9 FIX] Safer Reference Pass that respects Accumulation
-                # We do NOT zero gradients here. Instead we compute gradients directly 
-                # for the reference loss using autograd.grad, shielding the accumulated .grad buffers.
+                with sync_context:
+                    ref_grads = torch.autograd.grad(
+                        l_ref_bwd, 
+                        [p for p in self.parameters() if p.requires_grad],
+                        retain_graph=True,
+                        allow_unused=True
+                    )
                 
-                # However, since we need to project *against* these, we need them as tensors.
-                # Standard 'manual_backward' populates .grad which is destructive.
-                # So we use a temporary zeroing ONLY if we are NOT accumulating, 
-                # OR we accept that for the Reference Pass we calculate gradients separately.
-                
-                # [Optimization] Since we need per-parameter gradients for projection,
-                # and A-GEM requires G_ref vs G_batch, we can just use autograd.grad 
-                # for the reference pass to keep .grad clean for the batch pass.
-                
-                ref_grads = torch.autograd.grad(
-                    l_ref_bwd, 
-                    [p for p in self.parameters() if p.requires_grad],
-                    retain_graph=True,
-                    allow_unused=True
-                )
-                
-                # Map tuple back to dict for projection lookup
+                # ... Map tuple back to dict for projection lookup ...
                 g_ref = {}
                 idx = 0
                 for name, p in self.named_parameters():
@@ -1276,8 +1288,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
                         idx += 1
                 
                 # B. Batch Pass (Standard Backward - populates .grad)
-                # This adds to the accumulated signals if is_accumulating is True
-                self.manual_backward(l_batch_bwd)
+                # [Distributed Guard]
+                with sync_context:
+                    self.manual_backward(l_batch_bwd)
                 
                 # C. [SOTA v10.2] Vectorized Layer-Wise A-GEM Projection
                 # Optimization: Horizontal Fusion via torch._foreach operations
@@ -1345,7 +1358,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 logs.get('weight/aux', torch.tensor(1.0, device=self.device)),
                 logs.get('weight/acl', torch.tensor(1.0, device=self.device)),
                 logs.get('weight/bgsl', torch.tensor(1.0, device=self.device)),
-                logs.get('weight/tcb', torch.tensor(1.0, device=self.device))
+                logs.get('weight/tcb', torch.tensor(1.0, device=self.device)),
+                logs.get('weight/phys', torch.tensor(1.0, device=self.device))
             ]
             
         else:
@@ -1377,31 +1391,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 accumulate=not is_start_of_accum
             )
             
-            # 4. Post-Surgery Constraint Optimization (Physics)
-            curr_phys_weight = self._get_curr_physics_weight()
-            alpha_t = self.model.scheduler.alphas_cumprod[t][:, None, None]
-            x0_approx = (noisy_fut - torch.sqrt(1 - alpha_t) * pred_noise) / torch.sqrt(alpha_t).clamp(min=1e-5)
-            
-            # [v4.2 SOTA Pillar 4] Adaptive Safety Envelope with Warmup
-            # [PHASE 1 FIX] Restore x0_approx visibility for Physics Checks
-            normalizer = self.model.normalizer
-            
-            # 1. Denormalize Student Trajectory for Physics Checks
-            student_traj_denorm = normalizer.denormalize(x0_approx)
-            
-            # 2. Physics Loss (MSE) usually expects normalized space for gradient stability
-            l_phys = self.model.phys_loss(x0_approx) 
-            
-            # 3. Safety Envelope (Bio-Constraints) expect PHYSICAL units (mmHg)
-            # This was the cause of massive loss explosions (checking 0.5 vs 65.0)
-            l_envelope = self.safety_envelope(student_traj_denorm, risk_coef, sigma_scale=self.curr_sigma_scale)
-            
-            # Combine physics components
-            phys_loss = l_phys + l_envelope
-            if self.current_epoch < 15:
-                phys_loss = torch.clamp(phys_loss, max=10.0)
-
-            self.manual_backward(phys_loss)
+            # [v26.1 Unified Fix] 
+            # physics_loss is now part of the scaled_total within loss_dict.
+            # No separate backward pass is required.
 
         # [v26.2 SOTA FIX] Unified Manifold Observation logic.
         # Moved here to eliminate the "Transparency Trap" (Reporting Bias).
@@ -1411,21 +1403,34 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Efficiently compute total gradient pressure (pre-optimizer clip)
             current_grad_pressure = OrthogonalGuard.sanitize_gradients(self.model)
             
-            # [v26.5 SOTA] Adaptive Statistics Update
-            # Automatically scales with step density via Scaled Decay
-            TrendSentinel.update_stats(
+            # [v26.5 SOTA] Bias-Corrected Statistics Update with AdaEMA
+            # AdaEMA: Uses a snapier decay (0.90) for the first 300 steps of resumption
+            # to clear 'Resumption Trauma' faster, then settles to grad_ema_decay.
+            ada_decay_threshold = 300
+            if self.grad_norm_step_count < ada_decay_threshold:
+                active_decay = 0.90
+            else:
+                active_decay = self.grad_ema_decay
+
+            ema_bc, std_bc = TrendSentinel.update_stats(
                 current_grad_pressure, 
                 self.grad_norm_ema, 
                 self.grad_norm_std, 
-                self.grad_ema_decay
+                active_decay,
+                step_tensor=self.grad_norm_step_count
             )
             
             # Tick down Resumption Grace period
             if self.resumption_grace_steps > 0:
                 self.resumption_grace_steps.sub_(1)
 
-            self.log("train/manifold_norm_ema", self.grad_norm_ema, on_step=True, prog_bar=True)
-            self.log("train/manifold_norm_std", self.grad_norm_std, on_step=True)
+            self.log("train/manifold_norm_ema", ema_bc, on_step=True, prog_bar=True)
+            self.log("train/manifold_norm_std", std_bc, on_step=True)
+            
+            # [v2026 SOTA] Decoupled Telemetry
+            # Pressure = Raw unstable magnitude (what we see in ema)
+            # Impact = Actual weight change (safely clipped to 1.0)
+            self.log("train/manifold_norm_eff", min(current_grad_pressure, 1.0), on_step=True)
 
             # [v2026 SOTA] Efficient Intra-Epoch CSV Logging
             # Log every N% (e.g., 5%, 10%, 15%) without syscall latency
@@ -1444,16 +1449,18 @@ class ICUGeneralistWrapper(pl.LightningModule):
                      # and haven't logged it yet.
                      if pct % int(self.csv_log_interval) == 0 and pct > self.last_logged_bucket:
                          if self.csv_logger:
-                             # Gather lightweight metrics (CPU tensors OK here, infrequent)
+                             # [SOTA FIX] Handle Single vs Multi Optimizer safely
+                             current_opt = opt[0] if isinstance(opt, list) else opt
+                             
                              row = {
                                  "epoch": self.current_epoch,
                                  "pct": pct,
                                  "step": self.global_step,
-                                 "loss": total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss,
-                                 "gn": current_grad_pressure, # already float
+                                 "loss": total_loss.item() if (isinstance(total_loss, torch.Tensor) and total_loss.dim() == 0) else float(total_loss),
+                                 "gn": current_grad_pressure,
                                  "ess": weights_awr_log.get("train/awr_ess", 0.0),
                                  "ev": self.train_explained_var.compute().item(),
-                                 "lr": opt[0].param_groups[0]['lr'] if opt else 0.0
+                                 "lr": current_opt.param_groups[0]['lr'] if current_opt else 0.0
                              }
                              # Add component losses
                              for k, v in loss_dict.items():
@@ -2490,7 +2497,49 @@ class ICUGeneralistWrapper(pl.LightningModule):
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]):
         """
         [SOTA v3.1] Restore Normalizer and Stats.
+        [v26.5 SOTA FIX] Legacy Checkpoint Compatibility for Sentinel Buffers.
         """
+        # 1. Backward Compatibility Injection
+        # If resuming from Pre-Sentinel checkpoint, we must inject missing buffers
+        # to prevent strict load_state_dict failure.
+        state_dict = checkpoint.get("state_dict", {})
+        
+        if "grad_norm_std" not in state_dict:
+            # Initialize with safe default (0.5)
+            # Use type_as from another buffer if available, or just create tensor
+            # We use CPU tensor; load_state_dict handles device transfer
+            state_dict["grad_norm_std"] = torch.tensor(0.5)
+            
+        if "grad_norm_ema" not in state_dict:
+            state_dict["grad_norm_ema"] = torch.tensor(1.0)
+
+        if "grad_norm_step_count" not in state_dict:
+            # [CRITICAL FIX] For legacy checkpoints, we assume the EMA is already "warm".
+            # Initializing step_count to 0 would cause Bias Correction (1 - beta^t) 
+            # to explode the value. We set it to a very high value to bypass correction.
+            state_dict["grad_norm_step_count"] = torch.tensor(1_000_000)      
+        if "resumption_grace_steps" not in state_dict:
+            # Initialize with 50 (SOTA Grace)
+            state_dict["resumption_grace_steps"] = torch.tensor(50)
+
+        # [v26.1 FIX] 6-to-7 Task Transition Safety Padding
+        # Rationale: We added 'phys' as the 7th task. Old checkpoints only have 6.
+        # Strict loading will fail unless we pad with neutral priors.
+        for prefix in ["loss_scaler.", "gradnorm."]:
+            key = f"{prefix}log_vars" if prefix == "loss_scaler." else f"{prefix}weights"
+            if key in state_dict and state_dict[key].shape[0] == 6:
+                # Pad log_vars with 0.5 (neutral/standard loss magnitude)
+                # Pad gradnorm weights with 1.0 (neutral)
+                pad_val = 0.5 if prefix == "loss_scaler." else 1.0
+                state_dict[key] = torch.cat([state_dict[key], torch.tensor([pad_val])])
+                logger.info(f"[RESUME] Padded {key} to 7 tasks (Unit Neutralization).")
+            
+            # Pad EMA buffers
+            ema_key = f"{prefix}loss_emas" if prefix == "loss_scaler." else f"{prefix}initial_losses"
+            if ema_key in state_dict and state_dict[ema_key].shape[0] == 6:
+                state_dict[ema_key] = torch.cat([state_dict[ema_key], torch.tensor([1.0])])
+                logger.info(f"[RESUME] Padded {ema_key} to 7 tasks.")
+            
         # [v2.0 Refactor] Restore PMS Gradient EMA
         if "normalizer_state" in checkpoint:
             self.pending_normalizer_state = checkpoint["normalizer_state"]
@@ -2499,6 +2548,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
         if "fnd_grad_ema" in checkpoint:
             self._fnd_grad_ema = checkpoint["fnd_grad_ema"]
             logger.info("[RESUME] PMS Gradient EMA restored.")
+            
+        # Ensure grace period is active (log check)
+        logger.info("🛡️ [PMS] Resumption Detected. Sentinel hibernated for 50 settling steps.")
 
         # [CRITICAL FIX] Capture Optimizer & Scheduler States for Manual Restoration
         # Standard PL sometimes drops these when using manual_optimization=True

@@ -32,11 +32,12 @@ class RiskAwareAsymmetricLoss(nn.Module):
         self.eps = eps
         self.critical_multiplier = critical_multiplier
 
-    def forward(self, x, y, risk_coef: torch.Tensor, class_weights: Optional[torch.Tensor] = None):
+    def forward(self, x, y, risk_coef: torch.Tensor, class_weights: Optional[torch.Tensor] = None, stability_factor: float = 1.0):
         """
         x: logits [B, C]
         y: targets [B, C]
         risk_coef: [B] risk normalized to [0, 1]
+        stability_factor: [0.1, 1.0] used to dampen aggressive Focal Gamma during instability
         class_weights: Optional [C] weights for each class
         """
         # 1. Probabilities
@@ -52,8 +53,12 @@ class RiskAwareAsymmetricLoss(nn.Module):
         loss_neg = (1 - y) * torch.log(xs_neg.clamp(min=self.eps))
         
         # 4. Asymmetric Focusing (Standard ASL)
+        # [v26.4 SOTA FIX] Adaptive Focal Relaxation
+        # Rationale: Relaxes gamma_neg to 1.0 (Neutral CE) during manifold shocks.
+        gamma_neg_eff = 1.0 + (self.gamma_neg - 1.0) * stability_factor
+        
         pt = xs_pos * y + xs_neg * (1 - y)
-        one_sided_gamma = self.gamma_pos * y + self.gamma_neg * (1 - y)
+        one_sided_gamma = self.gamma_pos * y + gamma_neg_eff * (1 - y)
         one_sided_w = torch.pow(1 - pt, one_sided_gamma)
         
         # 5. Base ASL Loss (Unreduced) [B, C]

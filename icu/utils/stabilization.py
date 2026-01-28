@@ -370,18 +370,43 @@ class TrendSentinel:
         return False
 
     @staticmethod
-    def update_stats(current_val: float, ema: torch.Tensor, std: torch.Tensor, decay: float):
-        """Standard EMA update for mean and variance (Welford-style approximation)."""
+    def get_stats(ema: torch.Tensor, std: torch.Tensor, decay: float, step_tensor: torch.Tensor) -> Tuple[float, float]:
+        """[SOTA v2026] Returns bias-corrected statistics without updating."""
+        t = step_tensor.item()
+        bias_correction = 1.0 - (decay ** t) if t > 0 else 1.0
+        corrected_ema = ema.item() / max(bias_correction, 1e-8)
+        corrected_std = std.item() / math.sqrt(max(bias_correction, 1e-8))
+        return corrected_ema, corrected_std
+
+    @staticmethod
+    def update_stats(current_val: float, ema: torch.Tensor, std: torch.Tensor, decay: float, step_tensor: Optional[torch.Tensor] = None) -> Tuple[float, float]:
+        """[SOTA v2026] Bias-Corrected EMA update for mean and variance."""
         with torch.no_grad():
+            if step_tensor is not None:
+                step_tensor.add_(1)
+                t = step_tensor.item()
+                bias_correction = 1.0 - (decay ** t) if t > 0 else 1.0
+            else:
+                bias_correction = 1.0
+
             delta = current_val - ema.item()
-            # Update Mean
+            # Update Mean (Uncorrected)
             ema.mul_(decay).add_(current_val, alpha=1.0 - decay)
-            # Update Variance (EMA of squared differences)
-            # Var_new = decay * Var_old + (1-decay) * (delta * new_delta)
+            
+            # Update Variance (Uncorrected)
             new_delta = current_val - ema.item()
             sq_diff = delta * new_delta
             
             # We store STD directly for easier Z-score calculation
             var = (std.item() ** 2)
             new_var = decay * var + (1.0 - decay) * sq_diff
+            
+            # Update memory buffers in-place (Uncorrected)
             std.fill_(math.sqrt(max(new_var, 1e-6)))
+
+            # Return Bias-Corrected values for Logging/Sentinels
+            # Formula: Corrected = Uncorrected / (1 - beta^t)
+            corrected_ema = ema.item() / max(bias_correction, 1e-8)
+            corrected_std = std.item() / math.sqrt(max(bias_correction, 1e-8))
+            
+            return corrected_ema, corrected_std

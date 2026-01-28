@@ -43,15 +43,16 @@ class BGSLLoss(nn.Module):
         self.register_buffer("w_t", torch.tensor(trend_coef))
         self.register_buffer("w_h", torch.tensor(shock_coef))
 
-    def state_loss_fn(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def state_loss_fn(self, logits: torch.Tensor, targets: torch.Tensor, stability_factor: float = 1.0) -> torch.Tensor:
         """
         [v4.5 PERFECT] Robust ASL with Logit Clamping and Configurable Gamma.
         """
         # [v5.1 SOTA] Removed hard-clamping to restore signal integrity. 
         # Analytical stability is handled by BCEWithLogitsLoss.
         
-        # 2. Use Configured Gamma
-        gamma_neg = self.gamma # Use self.gamma (usually 4.0)
+        # 2. Use Configured Gamma with Stability Damping
+        # Adaptive Focal Relaxation: gamma_neg drops to 1.0 (Neutral CE) during shocks
+        gamma_neg = 1.0 + (self.gamma - 1.0) * stability_factor
         gamma_pos = 1.0        # Constant for positive class focus
         clip = 0.05
         
@@ -88,7 +89,8 @@ class BGSLLoss(nn.Module):
         true_state: torch.Tensor, 
         past_vitals: torch.Tensor,
         risk_coef: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None
+        mask: Optional[torch.Tensor] = None,
+        stability_factor: float = 1.0
     ) -> Dict[str, torch.Tensor]:
         """
         [v4.5 PERFECT] Triple Gradient Objective with Robust Numerics.
@@ -97,7 +99,7 @@ class BGSLLoss(nn.Module):
         # Smoothing and hierarchical clipping handle stability without blinding.
         
         # --- 1. State Loss (Hard-Negative Aware ASL) ---
-        l_state_unreduced = self.state_loss_fn(pred_state, true_state)
+        l_state_unreduced = self.state_loss_fn(pred_state, true_state, stability_factor=stability_factor)
         
         # Apply Risk-Aware Critical Penalty (v4.0 PERFECT Integration)
         if risk_coef is not None:
