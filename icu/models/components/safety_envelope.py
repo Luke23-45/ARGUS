@@ -41,12 +41,11 @@ class PhysiologicalSafetyEnvelope(nn.Module):
         
         dynamic_bounds = {}
         for feature, (f_min, f_max, base_sigma) in self.envelopes.items():
-            # Contraction logic
-            # risk_coef closer to 1 -> multiplier closer to 0.5
-            multiplier = 1.0 - (risk_coef * 0.5) 
-            
-            # [B]
-            eff_sigma = torch.full((B,), base_sigma, device=device) * multiplier
+            # [v71.0 SOTA FIX] Neutralize Clinical Recoil (Smoking Gun #71)
+            # Rationale: Tightening bounds for sick patients (0.5x multiplier)
+            # penalizes the model for predicting correctly unhealthy values.
+            # Fix: Keep a FIXED base_sigma for all patients (multiplier = 1.0).
+            eff_sigma = torch.full((B,), base_sigma, device=device)
             low_bound = torch.full((B,), f_min, device=device)
             high_bound = torch.full((B,), f_max, device=device)
             
@@ -83,4 +82,10 @@ class PhysiologicalSafetyEnvelope(nn.Module):
             
             total_violation += (v_low + v_high)
             
-        return total_violation.mean() # Combined violation scalar
+        # [v71.1] Apply Risk-Based Magnitude Multiplier
+        # Rationale: Instead of tightening the bounds (which causes gradient shocks), 
+        # we SCALE the resulting violation loss. High risk patients get 2x attention.
+        violation_per_sample = total_violation.mean(dim=1) # [B]
+        weighted_violation = violation_per_sample * (1.0 + risk_coef) # [1.0, 2.0] range
+        
+        return weighted_violation.mean() # Combined violation scalar

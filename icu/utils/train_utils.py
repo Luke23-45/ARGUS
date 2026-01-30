@@ -99,18 +99,12 @@ class ScalingSteward:
     REF_STEPS = 200 # Stable baseline from M_short run
 
     @staticmethod
-    def get_decay(ref_decay: float, n_curr: int, mode: str = "epoch") -> float:
+    def get_decay(ref_decay: float, n_curr: int) -> float:
         """
-        Scales an EMA decay factor to maintain identical half-life.
-        
-        Args:
-            ref_decay: The baseline decay (at REF_STEPS).
-            n_curr: Total steps in the current epoch.
-            mode: 'epoch' for epoch-level parity, 'step' for absolute step invariance.
+        Scales an EMA decay factor to maintain identical half-life in epoch terms.
+        Formula: v_curr = v_ref^(N_ref / N_curr)
         """
-        if mode == "step" or n_curr <= 0:
-            return ref_decay
-            
+        if n_curr <= 0: return ref_decay
         # v1.0: Use log-space/power laws for numerical stability on extreme densities
         return float(ref_decay ** (ScalingSteward.REF_STEPS / n_curr))
 
@@ -825,6 +819,70 @@ class RotationalSaver:
             self._shutdown_event.set()
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=10.0)
+
+
+class SOTA_DistributedGatherer:
+    """
+    [v30.5 SOTA] Asymmetric Collective Engine.
+    
+    RATIONALE (Smoking Gun #14):
+    Standard torch.distributed.all_gather requires identical tensor shapes on all ranks.
+    If Rank 0 has a full batch (32) and Rank 1 has a partial batch (14) at epoch-end,
+    the training will crash or deadlock.
+    
+    This gatherer implements Automatic Padding & Masking to safely gather 
+    asymmetric tensors across the DDP world.
+    """
+    
+    @staticmethod
+    @torch.no_grad()
+    def gather_asymmetric(tensor: torch.Tensor) -> List[torch.Tensor]:
+        """
+        Safely gathers tensors of different sizes across ranks.
+        
+        Args:
+            tensor: Local tensor to gather [N, D1, D2, ...]
+            
+        Returns:
+            List of tensors [Rank0_tensor, Rank1_tensor, ...]
+        """
+        if not dist.is_initialized():
+            return [tensor]
+            
+        device = tensor.device
+        world_size = dist.get_world_size()
+        local_size = torch.tensor(list(tensor.shape), device=device, dtype=torch.long)
+        
+        # 1. Gather all shapes
+        all_sizes = [torch.zeros_like(local_size) for _ in range(world_size)]
+        dist.all_gather(all_sizes, local_size)
+        
+        # 2. Determine max shape
+        max_size = torch.stack(all_sizes).max(dim=0).values
+        
+        # 3. Pad local tensor to max shape
+        pad_size = (max_size - local_size).tolist()
+        if any(p > 0 for p in pad_size):
+            # Create padding config for F.pad (reversed: last dim first, pairs of [front, back])
+            padding = []
+            for p in reversed(pad_size):
+                padding.extend([0, p])
+            padded_tensor = torch.nn.functional.pad(tensor, padding)
+        else:
+            padded_tensor = tensor
+            
+        # 4. Gather padded tensors
+        gathered_tensors = [torch.zeros(list(max_size), device=device, dtype=tensor.dtype) for _ in range(world_size)]
+        dist.all_gather(gathered_tensors, padded_tensor)
+        
+        # 5. Un-pad to original local sizes
+        final_tensors = []
+        for i, size in enumerate(all_sizes):
+            # Slice back to original size
+            slices = [slice(0, int(s)) for s in size]
+            final_tensors.append(gathered_tensors[i][slices])
+            
+        return final_tensors
 
 
 # =============================================================================

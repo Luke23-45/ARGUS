@@ -37,10 +37,11 @@ class TemporalContrastiveBuffer(nn.Module):
         self.capacity = capacity
         self.temperature = temperature
         
-        # [v4.0 SOTA] The Queue (Memory Bank)
-        # We store normalized embeddings [Capacity, D_model]
-        self.register_buffer("queue", F.normalize(torch.randn(capacity, d_model), dim=1))
+        # [v27.0 FIX] Zero-initialize queue instead of random
+        # This prevents meaningless InfoNCE contrasts during warmup
+        self.register_buffer("queue", torch.zeros(capacity, d_model))
         self.register_buffer("queue_ptr", torch.tensor(0, dtype=torch.long))
+        self.register_buffer("queue_filled", torch.tensor(0, dtype=torch.long))
 
     def scale_dynamics(self, n_curr: int):
         """[SOTA v2026] Unifies buffer capacity across step densities."""
@@ -57,36 +58,81 @@ class TemporalContrastiveBuffer(nn.Module):
              
              # [SOTA FIX] Capture device to prevent CPU mismatch after resize
              device = self.queue.device
-             self.register_buffer("queue", F.normalize(torch.randn(new_capacity, self.d_model, device=device), dim=1))
+             # [v27.0 FIX] Zero-initialize new queue slots
+             new_queue = torch.zeros(new_capacity, self.d_model, device=device)
              
              # Copy old data
-             self.queue.data[:num_to_keep] = old_queue[:num_to_keep]
+             new_queue[:num_to_keep] = old_queue[:num_to_keep]
+             self.register_buffer("queue", new_queue)
              self.queue_ptr.fill_(num_to_keep % new_capacity)
+             # Preserve filled count (capped at new capacity)
+             self.queue_filled.fill_(min(int(self.queue_filled), num_to_keep))
 
     @torch.no_grad()
     def _dequeue_and_enqueue(self, keys: torch.Tensor, scores: Optional[torch.Tensor] = None):
         """
         Updates the buffer with new negative samples.
+        [v20.0 SOTA FIX] Global Memory Bank Parity (Smoking Gun #171)
         """
-        # [v26.0 SAFETY] NaN Guard
-        if torch.isnan(keys).any() or torch.isinf(keys).any():
+        # [v23.0 SOTA FIX] Synchronized Poison Check (Smoking Gun #241)
+        # Rationale: All ranks MUST agree to return early or all ranks HANG.
+        has_poison = torch.tensor([float(torch.isnan(keys).any() or torch.isinf(keys).any())], device=keys.device)
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(has_poison, op=torch.distributed.ReduceOp.MAX)
+        
+        if has_poison.item() > 0:
             return
 
-        # [v4.0 PERFECT] Ensure keys are normalized before storage
-        keys = F.normalize(keys, dim=1)
+        import torch.distributed as dist
         
+        # 1. Gather keys from all ranks to prevent bank divergence
+        if dist.is_initialized():
+             # Asymmetric All-Gather: Ranks may have different numbers of negatives
+             local_b = torch.tensor([keys.shape[0]], device=keys.device)
+             all_b = [torch.zeros(1, dtype=torch.long, device=keys.device) for _ in range(dist.get_world_size())]
+             dist.all_gather(all_b, local_b)
+             
+             max_b = max(b.item() for b in all_b)
+             if max_b > 0:
+                 padded = torch.zeros(max_b, self.d_model, device=keys.device)
+                 padded[:keys.shape[0]] = keys
+                 gathered = [torch.zeros(max_b, self.d_model, device=keys.device) for _ in range(dist.get_world_size())]
+                 dist.all_gather(gathered, padded)
+                 
+                 # Reconstruct global pool
+                 pool = []
+                 for i, b in enumerate(all_b):
+                      if b.item() > 0:
+                           pool.append(gathered[i][:b.item()])
+                 keys = torch.cat(pool, dim=0)
+             else:
+                 return # Nothing to store on any rank
+        
+        # 2. Synchronized Shuffle (Smoking Gun #176)
+        # Ensures all ranks pick the same subset if hard mining or queue limit is hit
+        if keys.shape[0] > 1:
+            if dist.is_initialized():
+                indices = torch.randperm(keys.shape[0], device=keys.device)
+                dist.broadcast(indices, src=0)
+                keys = keys[indices]
+            else:
+                indices = torch.randperm(keys.shape[0], device=keys.device)
+                keys = keys[indices]
+
+        # 3. Normalization & Storage
+        keys = F.normalize(keys, dim=1)
         batch_size = keys.shape[0]
         ptr = int(self.queue_ptr)
         
-        if scores is not None:
-            # scores: [B, Capacity]
-            # We want to pick keys from the current batch (dim 0) that are 
-            # most similar to the EXISTING buffer.
-            hard_scores = scores.mean(dim=1) # [B]
+        # Hard mining selection (if scores provided)
+        if scores is not None and keys.shape[0] == scores.shape[0]:
+            # Rationale: Only use scores if they align with keys (local mode mostly)
+            hard_scores = scores.mean(dim=1)
             _, indices = torch.topk(hard_scores, k=min(batch_size, self.capacity))
             keys = keys[indices]
             batch_size = keys.shape[0]
 
+        # Standard Queue Update
         if ptr + batch_size > self.capacity:
             remaining = self.capacity - ptr
             self.queue.data[ptr:] = keys[:remaining]
@@ -95,6 +141,9 @@ class TemporalContrastiveBuffer(nn.Module):
         else:
             self.queue.data[ptr : ptr + batch_size] = keys
             self.queue_ptr.fill_((ptr + batch_size) % self.capacity)
+        
+        new_filled = min(self.capacity, int(self.queue_filled) + batch_size)
+        self.queue_filled.fill_(new_filled)
 
     def forward(
         self, 
@@ -104,42 +153,53 @@ class TemporalContrastiveBuffer(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """
         Calculates InfoNCE loss and Uniformity Regularization.
-        
-        Args:
-            q_expert: Student query [B, D]
-            k_positive: Teacher positive key [B, D]
-            enqueue_mask: Optional mask [B] to pick which k_positive to store (standard: only negatives)
         """
+        import torch.distributed as dist
         B, D = q_expert.shape
         q = F.normalize(q_expert, dim=1)
         k = F.normalize(k_positive, dim=1)
         
-        # 1. InfoNCE Logits (Student vs Teacher + Buffer)
+        # [v20.0 SOTA FIX] entry barrier consensus (Smoking Gun #172)
+        # Rationale: Critical for DDP ranks to agree on the state of the bank.
+        if dist.is_initialized():
+             dist.all_reduce(self.queue_filled, op=dist.ReduceOp.MIN)
+
+        filled = int(self.queue_filled)
+        if filled < 32:
+            # Entry logic
+            zero_loss = torch.tensor(0.0, device=q.device, requires_grad=True)
+            if enqueue_mask is not None:
+                k_to_store = k[enqueue_mask]
+                self._dequeue_and_enqueue(k_to_store)
+            else:
+                self._dequeue_and_enqueue(k)
+            return {"loss": zero_loss, "nce_loss": zero_loss, "uniformity": zero_loss}
+        
+        # InfoNCE path
+        effective_queue = self.queue[:filled].detach()
         l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1) # [B, 1]
-        l_neg = torch.einsum('nc,kc->nk', [q, self.queue.detach()]) # [B, Capacity]
+        l_neg = torch.einsum('nc,kc->nk', [q, effective_queue]) # [B, filled]
         
         logits = torch.cat([l_pos, l_neg], dim=1) / self.temperature
         labels = torch.zeros(logits.shape[0], dtype=torch.long, device=q.device)
         nce_loss = F.cross_entropy(logits, labels)
         
-        # 2. [SOTA 2025] Uniformity Regularization (Wang & Isola)
-        # Penalizes collapse in the buffer.
-        sample_size = min(128, self.capacity)
-        # [SOTA FIX] Deterministic Uniformity Sampling (DDP Parity)
-        # We need a generator to ensure all ranks pick the same subset
-        if not hasattr(self, '_rng'):
-             self._rng = torch.Generator(device='cpu')
-             self._rng.manual_seed(42) # Fixed seed is fine for uniformity
-        
-        subset = self.queue[torch.randperm(self.capacity, generator=self._rng)[:sample_size]]
+        # [v20.0 SOTA FIX] Synchronized Uniformity Sampling
+        sample_size = min(128, filled)
+        if dist.is_initialized():
+             idx_uniform = torch.randperm(filled, device=q.device)[:sample_size]
+             dist.broadcast(idx_uniform, src=0)
+             subset = effective_queue[idx_uniform]
+        else:
+             subset = effective_queue[torch.randperm(filled, device=q.device)[:sample_size]]
+             
         sim_matrix = torch.matmul(subset, subset.t())
         uniformity_loss = torch.log(torch.exp(sim_matrix).mean() + 1e-6)
         
-        # 3. Update Buffer with Teacher Negatives
+        # Buffer update
         if enqueue_mask is not None:
              k_to_store = k[enqueue_mask]
-             if k_to_store.shape[0] > 0:
-                  self._dequeue_and_enqueue(k_to_store, scores=None) # Hard Mining disabled here for speed
+             self._dequeue_and_enqueue(k_to_store)
         else:
              self._dequeue_and_enqueue(k, scores=l_neg.detach())
         

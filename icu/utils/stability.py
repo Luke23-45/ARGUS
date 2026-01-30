@@ -1,4 +1,5 @@
 import torch
+import torch.distributed
 import torch.nn as nn
 from typing import Dict, Any, Optional
 
@@ -8,29 +9,51 @@ class DynamicThresholding(nn.Module):
     
     Prevents "Manifold Collapse" by rescaling latent vectors based on their 
     statistical distribution instead of hard clipping.
+    
+    [v27.0 FIX] Added EMA smoothing to reduce batch-to-batch scale variance.
     """
-    def __init__(self, percentile: float = 0.995, threshold: float = 3.0):
+    def __init__(self, percentile: float = 0.995, threshold: float = 3.0, ema_decay: float = 0.99):
         super().__init__()
         self.percentile = percentile
         self.threshold = threshold
+        self.ema_decay = ema_decay
+        
+        # [v27.0 FIX] EMA-smoothed percentile for gradient stability
+        self.register_buffer("ema_s", torch.tensor(threshold))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, update_ema: bool = True) -> torch.Tensor:
         B = x.shape[0]
         abs_x = torch.abs(x)
         flat_abs = abs_x.view(B, -1)
         
         # [FIX] torch.quantile requires float32 or float64.
         # Calculate s-th percentile. Detach to avoid graph retention.
-        s = torch.quantile(flat_abs.detach().float(), self.percentile, dim=1).view(B, 1, 1)
+        batch_s = torch.quantile(flat_abs.detach().float(), self.percentile, dim=1).mean()
         
-        # Scale factor
-        s = torch.clamp(s, min=self.threshold)
+        # [v67.0 SOTA FIX] DDP Governance Consensus (Smoking Gun #67)
+        # Rationale: EMA buffers MUST be identical across ranks to ensure 
+        # consistent manifold scaling, otherwise gradients will 'fight' after AllReduce.
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(batch_s, op=torch.distributed.ReduceOp.SUM)
+            batch_s /= torch.distributed.get_world_size()
+
+        # [v27.0 FIX] EMA smoothing for gradient stability
+        # [v2026 SOTA] Accumulation Guard: Only update on stepping batches during training.
+        if update_ema and self.training:
+            with torch.no_grad():
+                self.ema_s.mul_(self.ema_decay).add_(batch_s * (1 - self.ema_decay))
+        
+        # Scale factor using smoothed percentile
+        s = torch.clamp(self.ema_s, min=self.threshold)
         scale = self.threshold / s
         
-        if x.dim() == 2:
-            scale = scale.squeeze(-1)
-            
-        return x * scale
+        # Handle different tensor dimensions
+        if x.dim() == 3:
+            return x * scale.view(1, 1, 1)
+        elif x.dim() == 2:
+            return x * scale.view(1, 1)
+        else:
+            return x * scale
 
 class ForensicStabilityAuditor(nn.Module):
     """

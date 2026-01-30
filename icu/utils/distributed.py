@@ -16,13 +16,56 @@ class SOTA_DistributedGatherer:
     
     Performance: <5ms latency (vs 500ms+ for Pickle).
     """
-    def __init__(self, device, world_size):
+    def __init__(self, device: torch.device, world_size: int):
         self.device = device
         self.world_size = world_size
         
         # [Cache] Pre-allocate handshake buffers
         self._local_count = torch.zeros(1, dtype=torch.long, device=device)
         self._global_counts = torch.zeros(world_size, dtype=torch.long, device=device)
+
+    @staticmethod
+    @torch.no_grad()
+    def gather_asymmetric(tensor: torch.Tensor) -> list:
+        """
+        [v30.5 SOTA] Asymmetric Collective Engine.
+        Safely gathers tensors of different sizes across ranks.
+        """
+        if not dist.is_initialized():
+            return [tensor]
+            
+        device = tensor.device
+        world_size = dist.get_world_size()
+        local_size = torch.tensor(list(tensor.shape), device=device, dtype=torch.long)
+        
+        # 1. Gather all shapes
+        all_sizes = [torch.zeros_like(local_size) for _ in range(world_size)]
+        dist.all_gather(all_sizes, local_size)
+        
+        # 2. Determine max shape
+        max_size = torch.stack(all_sizes).max(dim=0).values
+        
+        # 3. Pad local tensor to max shape
+        pad_size = (max_size - local_size).tolist()
+        if any(p > 0 for p in pad_size):
+            padding = []
+            for p in reversed(pad_size):
+                padding.extend([0, p])
+            padded_tensor = torch.nn.functional.pad(tensor, padding)
+        else:
+            padded_tensor = tensor
+            
+        # 4. Gather padded tensors
+        gathered_tensors = [torch.zeros(list(max_size), device=device, dtype=tensor.dtype) for _ in range(world_size)]
+        dist.all_gather(gathered_tensors, padded_tensor)
+        
+        # 5. Un-pad to original local sizes
+        final_tensors = []
+        for i, size in enumerate(all_sizes):
+            slices = [slice(0, int(s)) for s in size]
+            final_tensors.append(gathered_tensors[i][slices])
+            
+        return final_tensors
 
     def gather_fused_batch(self, local_tensors: dict) -> torch.Tensor:
         """
@@ -62,15 +105,20 @@ class SOTA_DistributedGatherer:
             fused_local = torch.cat(processed_tensors, dim=1)
             n_local, dim_total = fused_local.shape
         else:
-            n_local = 0
-            dim_total = 0 # This might be risky if we need to participate in gather of non-zero dims.
-            # But if n_local is 0, we simply don't contribute logic.
-            # We still need to know 'dim_total' to allocate buffers if OTHERS have data.
-            # TODO: If strictly empty everywhere, we return empty.
-            # If we are empty but others are not, we need 'dim_total' from them.
-            # We'll implement a Dim Broadcast if needed, but usually system ensures consistent schema.
-            # For this implementation, we assume we receive properly shaped empty tensors [0, D] if empty.
-            fused_local = torch.empty(0, 0, device=self.device)
+            dim_total = 0 
+        
+        # [v23.0 SOTA FIX] Dim Consensus (Smoking Gun #243)
+        # Rationale: Ranks with 0 samples MUST know the packet width (D) 
+        # of ranks with samples to participate in all_gather_into_tensor.
+        if torch.distributed.is_initialized():
+             dim_tensor = torch.tensor([float(dim_total)], device=self.device)
+             dist.all_reduce(dim_tensor, op=dist.ReduceOp.MAX)
+             dim_total = int(dim_tensor.item())
+
+        if len(processed_tensors) > 0:
+            fused_local = torch.cat(processed_tensors, dim=1)
+        else:
+            fused_local = torch.empty(0, dim_total, device=self.device)
 
         # --- PHASE 1: HANDSHAKE (Size Discovery) ---
         self._local_count[0] = n_local

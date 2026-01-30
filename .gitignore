@@ -96,7 +96,7 @@ audit_physics_v20.json
 
 legacy
 
-tests/
+
 
 plan
 sepsis_clinical_28
@@ -133,3 +133,4 @@ l.md
 l2.md
 errror.md
 README.md
+# tests/

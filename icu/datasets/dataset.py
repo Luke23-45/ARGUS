@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple, Union
 from torch.utils.data import Dataset, default_collate, Sampler, WeightedRandomSampler
 from huggingface_hub import snapshot_download
+from tqdm import tqdm
 
 # --- Configuration & Constants ---
 logger = logging.getLogger("APEX_Data_Frontier")
@@ -560,36 +561,70 @@ def create_sepsis_aware_sampler(
     # Initialize weights (default = 1.0 for normal samples)
     weights = torch.ones(n_samples)
     
-    # Compute weights by scanning dataset (cached, so reasonably fast)
-    logger.info(f"[Sampler] Computing sample weights for {n_samples:,} windows...")
+    # [v129.0 SOTA FIX] Global Sepsis Index (Smoking Gun #129)
+    # Rationale: Regional scanning (100k limit) ignores 98% of sepsis cases.
+    # Fix: Build a persistent global index for 100% coverage.
+    index_name = f"{dataset.split}_sepsis_index.npy"
+    index_path = dataset.root_path / index_name
     
-    # For efficiency, we only scan a subset to estimate prevalence
-    scan_count = min(n_samples, max_samples)
-    indices_to_scan = np.linspace(0, n_samples - 1, scan_count, dtype=int)
-    
-    sepsis_count = 0
-    for idx in indices_to_scan:
-        try:
-            sample = dataset[int(idx)]
-            if sample is not None:
-                phase = sample.get("phase_label", torch.tensor(0))
-                if isinstance(phase, torch.Tensor):
-                    phase = phase.item()
+    if index_path.exists():
+        logger.info(f"[Sampler] Loading cached Sepsis Index: {index_path}")
+        is_sepsis = np.load(index_path)
+        if len(is_sepsis) != n_samples:
+            logger.warning("[Sampler] Index size mismatch! Rebuilding...")
+            index_path.unlink()
+            return create_sepsis_aware_sampler(dataset, sepsis_boost_factor)
+    else:
+        logger.info(f"[Sampler] Building Global Sepsis Index (100% Coverage, N={n_samples:,})...")
+        is_sepsis = np.zeros(n_samples, dtype=bool)
+        
+        # Ensure LMDB is initialized for the main process
+        dataset._init_lmdb()
+        
+        # Global window pointer
+        global_ptr = 0
+        
+        # Iterate over episodes to minimize LMDB reads (SoA speed)
+        for ep_idx in tqdm(range(len(dataset.episode_metadata)), desc="Indexing Sepsis"):
+            ep_meta = dataset.episode_metadata[ep_idx]
+            n_chunks = dataset.chunks_per_episode[ep_idx]
+            
+            if n_chunks <= 0:
+                continue
                 
-                # Phase > 0 means PRESHOCK or SHOCK (sepsis-related)
+            # Fetch full labels for the episode
+            l_meta = ep_meta["modalities"]["labels"]
+            labels = dataset._fetch_numpy(
+                l_meta["key"], 
+                l_meta.get("dtype", "float32"),
+                tuple(l_meta["shape"])
+            )
+            
+            # For each window in this episode
+            for local_idx in range(n_chunks):
+                # Derive phase label for this window
+                # labels[local_idx : local_idx + window_size]
+                window = labels[local_idx : local_idx + dataset.window_size]
+                phase = dataset._get_phase_label(window)
+                
                 if phase > 0:
-                    weights[int(idx)] = sepsis_boost_factor
-                    sepsis_count += 1
-        except Exception:
-            pass  # Skip problematic samples
+                    is_sepsis[global_ptr + local_idx] = True
+            
+            global_ptr += n_chunks
+            
+        # Save for future runs
+        try:
+            np.save(index_path, is_sepsis)
+            logger.info(f"[Sampler] Sepsis Index saved to {index_path}")
+        except Exception as e:
+            logger.warning(f"[Sampler] Could not save Sepsis Index: {e}")
+            
+    # Apply weights
+    weights[is_sepsis] = sepsis_boost_factor
+    sepsis_count = int(is_sepsis.sum())
+    rate = sepsis_count / n_samples
     
-    # Extrapolate weights to unscanned samples
-    # Assume same distribution as scanned subset
-    if scan_count < n_samples:
-        logger.info(f"[Sampler] Scanned {scan_count:,} samples, extrapolating to full dataset")
-    
-    estimated_sepsis_rate = sepsis_count / scan_count if scan_count > 0 else 0.0
-    logger.info(f"[Sampler] Estimated sepsis rate: {estimated_sepsis_rate*100:.2f}% | Boost factor: {sepsis_boost_factor}x")
+    logger.info(f"[Sampler] Coverage: 100% | Sepsis Detected: {sepsis_count:,} | Rate: {rate*100:.2f}% | Boost factor: {sepsis_boost_factor}x")
     
     # Create the weighted sampler
     # replacement=True allows oversampling of rare sepsis windows

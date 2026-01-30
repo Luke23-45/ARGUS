@@ -320,6 +320,11 @@ class SequenceAuxHead(nn.Module):
         else:
             cls_out = x_seq[:, 0, :]
             logits = self.head(cls_out)
+            
+        # [v89.0 SOTA FIX] Evidential Logit Clamping (Smoking Gun #89)
+        # Rationale: Large positive logits cause lgamma overflow in EDL loss.
+        # Fixed range [-20, 20] ensures stable evidence for gradient computation.
+        logits = torch.clamp(logits, min=-20.0, max=20.0)
         
         # 5. [SOTA 2025] Evidential Deep Learning (EDL)
         # alpha = evidence + 1. We use Softplus for evidence to ensure non-negativity.

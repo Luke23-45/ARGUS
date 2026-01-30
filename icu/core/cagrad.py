@@ -43,13 +43,15 @@ class CAGrad(torch.optim.Optimizer):
     def _get_flat_grad(self):
         """Helper to flatten and concatenate gradients."""
         views = []
-        for group in self.param_groups: # [FIX] Use self.param_groups (which is linked to inner)
+        for group in self.param_groups:
             for p in group['params']:
-                if p.grad is None:
-                    view = p.data.new(p.data.numel()).fill_(0)
-                else:
-                    view = p.grad.data.view(-1)
-                views.append(view)
+                if p.requires_grad:
+                    if p.grad is None:
+                        # [v23.0 SOTA FIX] Safe initialization for missing grads
+                        view = p.data.new(p.data.numel()).fill_(0)
+                    else:
+                        view = p.grad.data.view(-1)
+                    views.append(view)
         return torch.cat(views, 0)
 
     def pc_backward(self, losses, backward_fn=None, accumulate=False):

@@ -29,7 +29,8 @@ class SepsisGhostBank(nn.Module):
         feature_dim: int = 28, 
         latent_dim: int = 512,
         similarity_threshold: float = 0.98,
-        prototype_ema_decay: float = 0.99
+        prototype_ema_decay: float = 0.99,
+        latent_adapter_strength: float = 0.05
     ):
         """
         Args:
@@ -48,6 +49,7 @@ class SepsisGhostBank(nn.Module):
         self.latent_dim = latent_dim
         self.similarity_threshold = similarity_threshold
         self.prototype_ema_decay = prototype_ema_decay
+        self.latent_adapter_strength = latent_adapter_strength
 
         # [v17.3 Hardened] Replay-Aware Buffers
         # Storing raw trajectories forces the model to perform a full forward pass
@@ -70,11 +72,36 @@ class SepsisGhostBank(nn.Module):
 
     @torch.no_grad()
     def _update_prototype(self, new_latents: torch.Tensor):
-        """Updates the global manifold centroid using EMA."""
-        if new_latents.shape[0] == 0:
-            return
+        """
+        [v161.0 SOTA FIX] Global Prototype Parity (Smoking Gun #161)
+        Rationale: Updates must occur identically on all ranks. If only one rank
+        has sepsis samples, we must still synchronize the result to prevent drift.
+        """
+        if torch.distributed.is_initialized():
+            # 1. Coalesce local signal
+            local_sum = new_latents.sum(dim=0, keepdim=True) if new_latents.shape[0] > 0 else torch.zeros(1, self.latent_dim, device=self.prototype_ema.device)
+            local_count = torch.tensor([float(new_latents.shape[0])], device=self.prototype_ema.device)
+            
+            # 2. Synchronize across cluster
+            # Buffer: [SUM_D1, ..., SUM_DN, COUNT]
+            sync_buffer = torch.cat([local_sum.flatten(), local_count])
+            torch.distributed.all_reduce(sync_buffer, op=torch.distributed.ReduceOp.SUM)
+            
+            global_sum = sync_buffer[:-1].view(1, -1)
+            global_count = sync_buffer[-1].item()
+            
+            if global_count <= 1e-6:
+                return
+            batch_avg = global_sum / global_count
+        else:
+            if new_latents.shape[0] == 0:
+                return
+            batch_avg = new_latents.mean(dim=0, keepdim=True)
+            
+        # [v51.0 SOTA FIX] NaN-Resistant Manifold Prototype (Smoking Gun #51)
+        if not torch.isfinite(batch_avg).all():
+            return # Skip update for non-finite data
         
-        batch_avg = new_latents.mean(dim=0, keepdim=True)
         if self.prototype_ema.abs().sum() == 0:
             self.prototype_ema.copy_(batch_avg)
         else:
@@ -331,10 +358,18 @@ class SepsisGhostBank(nn.Module):
         
         # [v20.0] Prioritized Uncertainty Sampling
         if uncertainty_weighted:
-            # Temperature scale (0.1) to strongly bias towards higher uncertainty
+            # [v23.0 SOTA FIX] Entropy Injection (Smoking Gun #23)
+            # Rationale: Pure prioritization (temp=0.1) leads to seeing only 
+            # 5% of the bank, causing representation collapse.
+            # Fix: Inject 5% pure uniform noise to ensure exploration.
             logits = self.uncertainties[:self.size].squeeze(-1) / 0.1
-            # [SOTA FIX] Move probs to CPU for multinomial with CPU generator
-            probs = torch.softmax(logits, dim=0).cpu()
+            # Move probs to CPU for multinomial
+            probs_prioritized = torch.softmax(logits, dim=0).cpu()
+            
+            # 5% uniform base
+            probs_uniform = torch.ones_like(probs_prioritized) / probs_prioritized.shape[0]
+            probs = 0.95 * probs_prioritized + 0.05 * probs_uniform
+            
             idx1 = torch.multinomial(probs, num_ghosts, replacement=True, generator=rng)
         else:
             # Sample indices for 'Base Ghosts'
@@ -351,6 +386,11 @@ class SepsisGhostBank(nn.Module):
             "uncertainties": self.uncertainties[idx1],
             "valid": torch.ones(num_ghosts, dtype=torch.bool, device=self.raw_vitals.device)
         }
+        
+        # [v21.5 SOTA] Ghost Demographic Preservation
+        # Extract static context (Demographics) from the canonical vital stream (Columns 22-27).
+        # This prevents "Demographic Amnesia" where ghosts were re-injected with zeros.
+        out["static"] = out["vitals"][:, 0, 22:].clone()
 
         # [v19.0] Path B: Manifold Mixup
         if mixup_alpha > 0:
@@ -368,6 +408,13 @@ class SepsisGhostBank(nn.Module):
             out["anchors"] = lam * self.latent_anchors[idx1] + (1 - lam) * self.latent_anchors[idx2]
             out["labels"] = lam.squeeze(-1) * self.raw_labels[idx1].float() + (1 - lam).squeeze(-1) * self.raw_labels[idx2].float()
             out["uncertainties"] = lam * self.uncertainties[idx1] + (1 - lam) * self.uncertainties[idx2]
+
+        # [v135.0 SOTA FIX] Ghost Latent Adapter (Smoking Gun #135)
+        # Rationale: Historical anchors drift as the model trains. 
+        # Fix: Soft-Align sampled anchors toward the current prototype EMA to maintain relevance.
+        if self.latent_adapter_strength > 0 and self.prototype_ema.abs().sum() > 0:
+            out["anchors"] = (1.0 - self.latent_adapter_strength) * out["anchors"] + \
+                             self.latent_adapter_strength * self.prototype_ema
 
         return out
 
