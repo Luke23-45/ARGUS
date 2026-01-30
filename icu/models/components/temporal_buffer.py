@@ -33,6 +33,7 @@ class TemporalContrastiveBuffer(nn.Module):
         """
         super().__init__()
         self.d_model = d_model
+        self.base_capacity = capacity # [v26.1 FIX] Store Base for Idempotency
         self.capacity = capacity
         self.temperature = temperature
         
@@ -45,7 +46,7 @@ class TemporalContrastiveBuffer(nn.Module):
         """[SOTA v2026] Unifies buffer capacity across step densities."""
         if n_curr <= 0: return
         
-        new_capacity = ScalingSteward.get_steps(self.capacity, n_curr)
+        new_capacity = ScalingSteward.get_steps(self.base_capacity, n_curr)
         if new_capacity != self.capacity:
              logger.info(f"⚡ [TCB] Scaling Capacity: {self.capacity} -> {new_capacity}")
              # Save current state

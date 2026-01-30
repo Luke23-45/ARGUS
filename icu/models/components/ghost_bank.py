@@ -41,6 +41,7 @@ class SepsisGhostBank(nn.Module):
             prototype_ema_decay: Decay for the global manifold centroid.
         """
         super().__init__()
+        self.base_capacity = capacity # [v26.1 FIX] Store Base for Idempotency
         self.capacity = capacity
         self.history_len = history_len
         self.feature_dim = feature_dim
@@ -92,7 +93,7 @@ class SepsisGhostBank(nn.Module):
         # 2. Scale Capacity Linearly
         # Note: We re-allocate buffers to maintain identical epoch-time coverage.
         # This is safe because on_train_start runs after on_load_checkpoint.
-        new_capacity = ScalingSteward.get_steps(self.capacity, n_curr)
+        new_capacity = ScalingSteward.get_steps(self.base_capacity, n_curr)
         if new_capacity != self.capacity:
             # Re-allocate with current data preservation
             old_raw_vitals = self.raw_vitals

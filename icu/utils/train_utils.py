@@ -99,12 +99,18 @@ class ScalingSteward:
     REF_STEPS = 200 # Stable baseline from M_short run
 
     @staticmethod
-    def get_decay(ref_decay: float, n_curr: int) -> float:
+    def get_decay(ref_decay: float, n_curr: int, mode: str = "epoch") -> float:
         """
-        Scales an EMA decay factor to maintain identical half-life in epoch terms.
-        Formula: v_curr = v_ref^(N_ref / N_curr)
+        Scales an EMA decay factor to maintain identical half-life.
+        
+        Args:
+            ref_decay: The baseline decay (at REF_STEPS).
+            n_curr: Total steps in the current epoch.
+            mode: 'epoch' for epoch-level parity, 'step' for absolute step invariance.
         """
-        if n_curr <= 0: return ref_decay
+        if mode == "step" or n_curr <= 0:
+            return ref_decay
+            
         # v1.0: Use log-space/power laws for numerical stability on extreme densities
         return float(ref_decay ** (ScalingSteward.REF_STEPS / n_curr))
 

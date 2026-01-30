@@ -48,6 +48,7 @@ class EpisodeAwareSampler(Sampler[int]):
         self.seed = seed
         self.drop_last = drop_last
         self.epoch = 0
+        self.processed_samples = 0 # [v4.2] Tracks steps completed in current epoch
         
         # --- 1. DDP Setup ---
         if dist.is_available() and dist.is_initialized():
@@ -126,6 +127,12 @@ class EpisodeAwareSampler(Sampler[int]):
         else:
             local_stream = local_stream[:self.num_samples]
             
+        # [SOTA FIX v4.2] Skip already processed samples for exact resumption
+        # This prevents 'Resumption Trauma' caused by repeating seen data.
+        if self.processed_samples > 0:
+            logger.info(f"[Sampler Rank {self.rank}] Skipping {self.processed_samples} processed samples.")
+            return iter(local_stream[self.processed_samples:])
+            
         return iter(local_stream)
     
     def __len__(self) -> int:
@@ -133,19 +140,22 @@ class EpisodeAwareSampler(Sampler[int]):
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
+        self.processed_samples = 0 # Reset for new epoch
 
     def state_dict(self) -> Dict[str, int]:
         """v4.2: Persist state for exact resumption."""
         return {
             "epoch": self.epoch,
-            "seed": self.seed
+            "seed": self.seed,
+            "processed_samples": self.processed_samples
         }
 
     def load_state_dict(self, state_dict: Dict[str, int]):
         """v4.2: Restore state."""
         self.epoch = state_dict.get("epoch", 0)
         self.seed = state_dict.get("seed", self.seed)
-        logger.info(f"[Sampler] State Restored: Epoch={self.epoch}")
+        self.processed_samples = state_dict.get("processed_samples", 0)
+        logger.info(f"[Sampler] State Restored: Epoch={self.epoch}, Processed={self.processed_samples}")
 
 
 class WeightedEpisodeSampler(EpisodeAwareSampler):

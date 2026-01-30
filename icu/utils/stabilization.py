@@ -371,21 +371,35 @@ class TrendSentinel:
 
     @staticmethod
     def get_stats(ema: torch.Tensor, std: torch.Tensor, decay: float, step_tensor: torch.Tensor) -> Tuple[float, float]:
-        """[SOTA v2026] Returns bias-corrected statistics without updating."""
+        """
+        [SOTA 2025] Returns bias-corrected statistics without updating.
+        Robustified with a correction floor to prevent 'Infinite Gain' artifacts.
+        """
         t = step_tensor.item()
-        bias_correction = 1.0 - (decay ** t) if t > 0 else 1.0
+        # [v32.0 FIX] Floor correction at 0.1 to limit gain to 10x during startup
+        bias_correction = max(1.0 - (decay ** t), 0.1) if t > 0 else 1.0
+        
         corrected_ema = ema.item() / max(bias_correction, 1e-8)
         corrected_std = std.item() / math.sqrt(max(bias_correction, 1e-8))
         return corrected_ema, corrected_std
 
     @staticmethod
     def update_stats(current_val: float, ema: torch.Tensor, std: torch.Tensor, decay: float, step_tensor: Optional[torch.Tensor] = None) -> Tuple[float, float]:
-        """[SOTA v2026] Bias-Corrected EMA update for mean and variance."""
+        """[SOTA v2026] Bias-Corrected EMA update with DDP Synchronization."""
         with torch.no_grad():
+            # [v32.0 SOTA] DDP Sentinel Synchronization
+            # Rationale: All ranks must agree on the manifold 'Shock' state (Max Pressure).
+            # This prevents individual ranks from diverging during curriculum shocks.
+            if torch.distributed.is_initialized():
+                val_tensor = torch.as_tensor(current_val, device=ema.device)
+                torch.distributed.all_reduce(val_tensor, op=torch.distributed.ReduceOp.MAX)
+                current_val = val_tensor.item()
+
             if step_tensor is not None:
                 step_tensor.add_(1)
                 t = step_tensor.item()
-                bias_correction = 1.0 - (decay ** t) if t > 0 else 1.0
+                # Use robust correction consistent with get_stats
+                bias_correction = max(1.0 - (decay ** t), 0.1) if t > 0 else 1.0
             else:
                 bias_correction = 1.0
 

@@ -19,6 +19,7 @@ class AsymmetricContrastiveLoss(nn.Module):
         self.d_model = d_model
         self.num_classes = num_classes
         self.temperature = temperature
+        self.base_momentum = 0.99 # [v26.1 FIX] Store Base for Idempotency
         self.momentum = 0.99 # [SOTA] Fixed slow momentum for stability
         
         # Buffer, not Parameter -> No Gradients on Centroids directly
@@ -30,7 +31,7 @@ class AsymmetricContrastiveLoss(nn.Module):
         """[SOTA v2026] Unifies contrastive momentum across step densities."""
         if n_curr <= 0: return
         # Baseline 0.99 for 200 steps
-        self.momentum = ScalingSteward.get_decay(0.99, n_curr)
+        self.momentum = ScalingSteward.get_decay(self.base_momentum, n_curr)
 
     def forward(self, z: torch.Tensor, y: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         """

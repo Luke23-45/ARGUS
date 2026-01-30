@@ -80,3 +80,28 @@ python icu/train/train_specialist.py
 
 ## 🛠️ Maintained by
 **Team Redhot** - Advanced Agentic Coding Research.
+
+
+ Investigation Result: Why Gradient Norm (GN) Increases
+I have traced the cause of the rising Gradient Norm. It is mechanically enforced by your Physics Curriculum.
+
+The Mechanism
+In wrapper_generalist.py (lines 2141-2156), you have a _get_curr_physics_weight function:
+
+python
+if current_step < warmup_steps:
+    progress = current_step / float(max(1, warmup_steps))
+    return 0.01 + (self.base_phys_weight - 0.01) * progress
+Curriculum Ramping: You explicitly ramp the physics loss weight from 0.01 (1%) to 1.0 (100%) (assuming base=1.0) over the first 50% of training.
+Gradient Scaling: The gradient norm contribution from physics is directly proportional to this weight: Grad_Phys = Weight(t) * Grad(Loss).
+Result: Even if the model's physics error stays constant, the gradient norm will rise 100x over the first half of training because you are pressing the accelerator pedal harder and harder.
+Is this a bug?
+Technically, no. It is the intended behavior of a curriculum (start gentle, get strict).
+
+The Problem: If determining x0_approx (the physical state) is hard—especially at high noise levels—the raw phys_loss might remain large. Result: Multiplying a large constant error by an increasing weight = Exploding Gradients.
+Recommendation
+If this instability is hurting convergence (GN > 100):
+
+Reduce Ramping: Start at 0.1 instead of 0.01 to reduce the relative spike.
+Cap the Loss: Ensure phys_loss is normalized or clamped more aggressively in diffusion.py.
+The code is doing exactly what you told it to do: applying 100x more pressure on physics as time goes on.

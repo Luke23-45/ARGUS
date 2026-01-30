@@ -30,9 +30,10 @@ class BayesianProjectedScaler(nn.Module):
         if n_curr <= 0: return
         self.decay = ScalingSteward.get_decay(0.99, n_curr)
         
-    def forward(self, loss_dict: Dict[str, torch.Tensor], stability_factor: float = 1.0, phys_multiplier: float = 1.0) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def forward(self, loss_dict: Dict[str, torch.Tensor], stability_factor: float = 1.0, phys_multiplier: float = 1.0, should_step: bool = True) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Unified weighting pass with Dynamic Priority.
+        [v32.0 FIX] should_step: Only update EMA when we are about to optimize.
         """
         losses = []
         active_keys = []
@@ -61,11 +62,14 @@ class BayesianProjectedScaler(nn.Module):
         
         # 1. Soft Optimal Uncertainty Weighting (UW-SO)
         # Update EMA using global average losses
+        # [v32.0 SOTA] Phase-Locked update: Only update uncertainty history on stepping batches.
+        if self.training and should_step:
+            with torch.no_grad():
+                curr_emas = self.loss_emas[indices]
+                updated_emas = self.decay * curr_emas + (1 - self.decay) * avg_losses
+                self.loss_emas[indices] = updated_emas
+        
         with torch.no_grad():
-            curr_emas = self.loss_emas[indices]
-            updated_emas = self.decay * curr_emas + (1 - self.decay) * avg_losses
-            self.loss_emas[indices] = updated_emas
-            
             # [PATCH 3] Fixed Clinical Priority Weights
             # Original: Softmax priority creates zero-sum game where one task spike starves others
             # Evidence: A dropped from 0.043 (E0) to 0.0007 (E8)

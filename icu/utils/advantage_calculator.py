@@ -201,6 +201,7 @@ class ICUAdvantageCalculator(nn.Module):
         self.clip_momentum = 0.90
         
         # [SOTA v2026] Internal Scaled Constants (Initialized with Defaults for 200 steps)
+        self.base_beta_momentum = float(beta_momentum) # [v26.1 FIX] Store Base for Idempotency
         self.ess_ema_decay = 0.95
         self.beta_growth_factor = 1.5
         
@@ -295,16 +296,17 @@ class ICUAdvantageCalculator(nn.Module):
         
         logger.info(f"⚡ [AWR] Scaling Dynamics for {n_curr} steps (Ref: {ScalingSteward.REF_STEPS})")
         
-        # 1. Scale Momentum Decays
-        # Matches the 'awr_momentum' from config (e.g., 0.999)
-        self.beta_momentum = ScalingSteward.get_decay(self.beta_momentum, n_curr)
-        self.clip_momentum = ScalingSteward.get_decay(0.90, n_curr) 
+        # 1. Scale Momentum Decays (Step-Invariant for SOTA)
+        # Rationale: AWR statistics are properties of the distribution, not the epoch.
+        # We use mode='step' to ensure adaptation speed is independent of batch density.
+        self.beta_momentum = ScalingSteward.get_decay(self.base_beta_momentum, n_curr, mode="step")
+        self.clip_momentum = ScalingSteward.get_decay(0.90, n_curr, mode="step") 
         
-        # 2. Scale Telemetry Buffers
-        self.ess_ema_decay = ScalingSteward.get_decay(0.95, n_curr)
+        # 2. Scale Telemetry Buffers (Epoch-Aligned for Progress Bar)
+        self.ess_ema_decay = ScalingSteward.get_decay(0.95, n_curr, mode="epoch")
         
-        # 3. Scale Growth Rates (Baseline: 1.5)
-        self.beta_growth_factor = float(1.5 ** (ScalingSteward.REF_STEPS / n_curr))
+        # 3. Scale Growth Rates (Fixed to 1.5 to prevent warmup lag)
+        self.beta_growth_factor = 1.5
         
         logger.info(
             f"⚡ [AWR] Scaling Results: beta_mom={self.beta_momentum:.6f}, "
