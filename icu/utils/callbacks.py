@@ -502,7 +502,13 @@ class EMACallback(Callback):
 
             # Apply deferred state if available
             if self._deferred_ema_state:
-                logger.info("EMA: Applying deferred state_dict from Checkpoint.")
+                # [v112.0 SOTA] Forensic restoration logging
+                stats = ""
+                if "weight" in self._deferred_ema_state:
+                    w = self._deferred_ema_state["weight"]
+                    stats = f" (W: mean={w.mean():.4f}, std={w.std():.4f})"
+                
+                logger.info(f"EMA: Applying deferred state_dict from Checkpoint.{stats}")
                 self.ema.load_state_dict(self._deferred_ema_state)
                 self._deferred_ema_state = None # Clear after applying
 

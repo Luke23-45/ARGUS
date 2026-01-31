@@ -28,16 +28,13 @@ def test_bayesian_rank_divergence_fix():
         # and total batch size is 2.
         
         def mock_all_reduce_side_effect(buffer, op=None):
-            # Fill buffer with global averages multiplied by total batch size (2)
-            # indices: 0, 1, 2, 3, 4, 5, 6, 7(batch_size)
-            buffer[0] = 2.0 # 1.0 * 2
-            buffer[1] = 0.0
-            buffer[2] = 1.0 # 0.5 * 2
-            buffer[3] = 0.0
-            buffer[4] = 0.0
-            buffer[5] = 0.0
-            buffer[6] = 0.0
-            buffer[7] = 2.0
+            # Simulated global buffer: [Sum_0, Sum_1, ..., Count_0, Count_1, ..., BatchSize]
+            # indices: 0-6 (sums), 7-13 (counts), 14 (batch_size) for num_tasks=7
+            buffer[0] = 2.0 # Task 0 sum
+            buffer[2] = 1.0 # Task 2 sum
+            buffer[7] = 2.0 # Task 0 count
+            buffer[9] = 1.0 # Task 2 count
+            buffer[14] = 2.0 # Total Batch Size
             return None
 
         mock_all_reduce.side_effect = mock_all_reduce_side_effect

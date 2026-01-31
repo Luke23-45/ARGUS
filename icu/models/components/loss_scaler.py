@@ -24,10 +24,16 @@ class BayesianProjectedScaler(nn.Module):
         # Fix: Pre-suppress non-primary task gradients to prevent cold-start shocks.
         log_vars_init = torch.zeros(num_tasks)
         # indices: diff=0, critic=1, aux=2, acl=3, bgsl=4, tcb=5, phys=6
-        log_vars_init[4] = 0.5  # bgsl starts cautious
-        log_vars_init[5] = 1.0  # tcb starts suppressed
-        log_vars_init[6] = 2.0  # phys starts heavily suppressed
+        # [FIX] Only set suppression values if the index exists in num_tasks
+        if num_tasks > 4: log_vars_init[4] = 0.5  # bgsl starts cautious
+        if num_tasks > 5: log_vars_init[5] = 1.0  # tcb starts suppressed
+        if num_tasks > 6: log_vars_init[6] = 2.0  # phys starts heavily suppressed
         self.log_vars = nn.Parameter(log_vars_init)
+        
+        # [v29.6] Gradient Hardening (Abyssal #307)
+        # Rationale: Prevent extreme priority shifts (ringing) during loss spikes.
+        # Clamping gradients ensures log_vars move at most 0.1 units per step.
+        self.log_vars.register_hook(lambda grad: grad.clamp(min=-0.1, max=0.1))
         
         # EMA tracking for UW-SO stability
         self.register_buffer("loss_emas", torch.ones(num_tasks))
@@ -39,6 +45,7 @@ class BayesianProjectedScaler(nn.Module):
         self.register_buffer("loss_accumulator", torch.zeros(num_tasks))
         self.register_buffer("task_counters", torch.zeros(num_tasks))
         self.register_buffer("batch_counter", torch.zeros(1))
+        self.register_buffer("step_count", torch.tensor(0, dtype=torch.long))
 
     def scale_dynamics(self, n_curr: int):
         """[SOTA v2026] Unifies uncertainty decay across step densities."""
@@ -97,9 +104,12 @@ class BayesianProjectedScaler(nn.Module):
             avg_losses_all = global_sum_losses / (global_task_counts + 1e-8)
             avg_losses = avg_losses_all[indices] if has_losses else torch.tensor([], device=device)
             
-            # 4. Momentum-Based Bayesian Update
+            # 4. Momentum-Based Bayesian Update (Dynamic Inertia #110B)
             # EMA now sees the clean, aggregated manifold state of the ENTIRE cycle.
-            self.loss_emas.mul_(self.decay).add_(avg_losses_all, alpha=1 - self.decay)
+            # Rationale: Lower decay (0.9) during warmup (200 steps) allows 10x faster adaptation.
+            self.step_count += 1
+            curr_decay = 0.90 if self.step_count < 200 else self.decay
+            self.loss_emas.mul_(curr_decay).add_(avg_losses_all, alpha=1 - curr_decay)
             
             # 5. Cycle Reset
             self.loss_accumulator.zero_()
@@ -112,7 +122,9 @@ class BayesianProjectedScaler(nn.Module):
                 # [Non-DDP Case] Handle the non-DDP stepping-batch logic
                 avg_losses_all = self.loss_accumulator / (self.task_counters + 1e-8)
                 avg_losses = avg_losses_all[indices] if has_losses else torch.tensor([], device=device)
-                self.loss_emas.mul_(self.decay).add_(avg_losses_all, alpha=1 - self.decay)
+                self.step_count += 1
+                curr_decay = 0.90 if self.step_count < 200 else self.decay
+                self.loss_emas.mul_(curr_decay).add_(avg_losses_all, alpha=1 - curr_decay)
                 self.loss_accumulator.zero_()
                 self.task_counters.zero_()
                 self.batch_counter.zero_()

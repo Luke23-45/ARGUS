@@ -30,7 +30,7 @@ class SepsisGhostBank(nn.Module):
         latent_dim: int = 512,
         similarity_threshold: float = 0.98,
         prototype_ema_decay: float = 0.99,
-        latent_adapter_strength: float = 0.05
+        latent_adapter_strength: float = 0.15 # [v29.6] Increased base to 0.15 (Abyssal #303)
     ):
         """
         Args:
@@ -49,6 +49,7 @@ class SepsisGhostBank(nn.Module):
         self.latent_dim = latent_dim
         self.similarity_threshold = similarity_threshold
         self.prototype_ema_decay = prototype_ema_decay
+        self.base_latent_adapter_strength = latent_adapter_strength # [v29.6 FIX] Store Base
         self.latent_adapter_strength = latent_adapter_strength
 
         # [v17.3 Hardened] Replay-Aware Buffers
@@ -114,8 +115,12 @@ class SepsisGhostBank(nn.Module):
         """[SOTA v2026] Unifies bank capacity and decay across step densities."""
         if n_curr <= 0: return
         
-        # 1. Scale EMA Decay
+        # 1. Scale EMA Decays
         self.prototype_ema_decay = ScalingSteward.get_decay(0.99, n_curr)
+        # Adapt mix rate: (1 - strength) is the retention factor.
+        retention_ref = 1.0 - self.base_latent_adapter_strength
+        retention_curr = ScalingSteward.get_decay(retention_ref, n_curr)
+        self.latent_adapter_strength = 1.0 - retention_curr
         
         # 2. Scale Capacity Linearly
         # Note: We re-allocate buffers to maintain identical epoch-time coverage.
@@ -328,6 +333,53 @@ class SepsisGhostBank(nn.Module):
                 self.latent_anchors[lvp_indices] = dlat[num_fill:num_fill+num_to_replace]
                 self.uncertainties[lvp_indices] = dunc[num_fill:num_fill+num_to_replace]
 
+    @torch.no_grad()
+    def refresh_anchors(self, encoder: nn.Module):
+        """
+        [v33.1 SOTA FIX] Anchor Refresh mechanism (Fix #356).
+        Re-encodes all stored trajectories to prevent latent representation drift.
+        
+        Rationale: As the encoder weights change, stored 'latent_anchors' become 
+        misaligned with the current manifold. Periodic refresh ensures 
+        diversity-based rejection remains accurate.
+        """
+        if self.size == 0:
+            return
+            
+        # Batched Refresh for VRAM efficiency
+        batch_size = 64
+        num_iters = (int(self.size) + batch_size - 1) // batch_size
+        
+        # [v33.1] Force Evaluation Mode for deterministic encoding
+        encoder_was_training = encoder.training
+        encoder.eval()
+        
+        try:
+            for i in range(num_iters):
+                start = i * batch_size
+                end = min(start + batch_size, int(self.size))
+                
+                v_batch = self.raw_vitals[start:end]
+                m_batch = self.raw_masks[start:end]
+                
+                # Re-encode using CURRENT encoder weights
+                # [v33.1 Hardened] We assume encoder is a callable that projects to latent space.
+                # If it's the APEX Planner, we might need to pass static data too.
+                # However, for the ghost bank, vitals/masks usually suffice for the base representation.
+                # In wrapper_generalist, we'll pass a lambda that handles the details.
+                new_anchors = encoder(v_batch, m_batch)
+                
+                # Standardize on unit hypersphere
+                self.latent_anchors[start:end].copy_(F.normalize(new_anchors, dim=1))
+        finally:
+            if encoder_was_training:
+                encoder.train()
+                
+        # Re-initialize prototype to match new latent space
+        if self.size > 0:
+            self.prototype_ema.fill_(0.0)
+            self._update_prototype(self.latent_anchors[:self.size])
+
     def sample(self, num_ghosts: int, seed: int, mixup_alpha: float = 0.0, uncertainty_weighted: bool = False) -> Dict[str, torch.Tensor]:
         """
         Harmonic Summoning with Manifold Mixup (v19.0) and Prioritized Sampling (v20.0).
@@ -348,7 +400,11 @@ class SepsisGhostBank(nn.Module):
                 "labels": torch.zeros(num_ghosts, dtype=torch.long, device=device),
                 "anchors": torch.zeros(num_ghosts, self.latent_dim, device=device),
                 "uncertainties": torch.zeros(num_ghosts, 1, device=device),
-                "valid": torch.zeros(num_ghosts, dtype=torch.bool, device=device)
+                "valid": torch.zeros(num_ghosts, dtype=torch.bool, device=device),
+                # [v39.0 SOTA FIX] Ghost Bank Incompleteness (Smoking Gun #46)
+                # Rationale: wrapper_generalist expects 'static' key even if bank is empty.
+                # Standard static dim is 6 (Columns 22-27 of vitals).
+                "static": torch.zeros(num_ghosts, 6, device=device)
             }
         
         # Use a local RNG with the global seed to ensure DDP parity

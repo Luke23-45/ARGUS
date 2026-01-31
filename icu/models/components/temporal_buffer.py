@@ -24,24 +24,28 @@ import logging
 logger = logging.getLogger("APEX_TCB")
 
 class TemporalContrastiveBuffer(nn.Module):
-    def __init__(self, d_model: int, capacity: int = 1024, temperature: float = 0.07):
-        """
-        Args:
-            d_model: Latent dimension of embeddings.
-            capacity: Max number of negative samples to store.
-            temperature: InfoNCE temperature hyperparameter.
-        """
+    def __init__(
+            self,
+            d_model: int, 
+            capacity: int = 1024, 
+            temperature: float = 0.07,
+            latent_adapter_strength: float = 0.10 # [v29.6] SOTA Manifold Alignment (Abyssal #304)
+        ):
         super().__init__()
         self.d_model = d_model
         self.base_capacity = capacity # [v26.1 FIX] Store Base for Idempotency
         self.capacity = capacity
         self.temperature = temperature
+        self.base_latent_adapter_strength = latent_adapter_strength
+        self.latent_adapter_strength = latent_adapter_strength
         
         # [v27.0 FIX] Zero-initialize queue instead of random
         # This prevents meaningless InfoNCE contrasts during warmup
         self.register_buffer("queue", torch.zeros(capacity, d_model))
         self.register_buffer("queue_ptr", torch.tensor(0, dtype=torch.long))
         self.register_buffer("queue_filled", torch.tensor(0, dtype=torch.long))
+        self.register_buffer("prototype_ema", torch.zeros(1, d_model)) # [v29.6] Manifold Anchor
+        self.register_buffer("prototype_momentum", torch.tensor(0.99)) # [v31.0] Adaptive Anchor
 
     def scale_dynamics(self, n_curr: int):
         """[SOTA v2026] Unifies buffer capacity across step densities."""
@@ -64,9 +68,17 @@ class TemporalContrastiveBuffer(nn.Module):
              # Copy old data
              new_queue[:num_to_keep] = old_queue[:num_to_keep]
              self.register_buffer("queue", new_queue)
-             self.queue_ptr.fill_(num_to_keep % new_capacity)
-             # Preserve filled count (capped at new capacity)
              self.queue_filled.fill_(min(int(self.queue_filled), num_to_keep))
+
+        # Scale adapter: (1 - strength) is the retention factor.
+        retention_ref = 1.0 - self.base_latent_adapter_strength
+        retention_curr = ScalingSteward.get_decay(retention_ref, n_curr)
+        self.latent_adapter_strength = 1.0 - retention_curr
+        
+        # [v31.0 SOTA FIX] Prototype Momentum Scaling (Smoking Gun #330)
+        # Rationale: Manifold anchoring must adapt at the same epoch-rate.
+        scaled_mom = ScalingSteward.get_decay(0.99, n_curr)
+        self.prototype_momentum.fill_(scaled_mom)
 
     @torch.no_grad()
     def _dequeue_and_enqueue(self, keys: torch.Tensor, scores: Optional[torch.Tensor] = None):
@@ -176,7 +188,14 @@ class TemporalContrastiveBuffer(nn.Module):
             return {"loss": zero_loss, "nce_loss": zero_loss, "uniformity": zero_loss}
         
         # InfoNCE path
+        # [v29.6 SOTA FIX] Ancestral Alignment (Abyssal #304)
+        # Rationale: Historical negatives drift. Soft-align them toward current prototype.
         effective_queue = self.queue[:filled].detach()
+        if self.latent_adapter_strength > 0 and self.prototype_ema.abs().sum() > 0:
+             effective_queue = (1.0 - self.latent_adapter_strength) * effective_queue + \
+                               self.latent_adapter_strength * self.prototype_ema
+             effective_queue = F.normalize(effective_queue, dim=1)
+
         l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1) # [B, 1]
         l_neg = torch.einsum('nc,kc->nk', [q, effective_queue]) # [B, filled]
         
@@ -202,6 +221,17 @@ class TemporalContrastiveBuffer(nn.Module):
              self._dequeue_and_enqueue(k_to_store)
         else:
              self._dequeue_and_enqueue(k, scores=l_neg.detach())
+        
+        # [v29.6] Update TCB Prototype
+        with torch.no_grad():
+             batch_avg = k.mean(dim=0, keepdim=True)
+             if self.prototype_ema.abs().sum() == 0:
+                  self.prototype_ema.copy_(batch_avg)
+             else:
+                  # [v31.0 SOTA FIX] Use scaled momentum for density-invariance
+                  mom = float(self.prototype_momentum)
+                  self.prototype_ema.mul_(mom).add_(batch_avg, alpha=1.0 - mom)
+             self.prototype_ema.copy_(F.normalize(self.prototype_ema, dim=1))
         
         return {
             "loss": nce_loss + 0.1 * uniformity_loss,

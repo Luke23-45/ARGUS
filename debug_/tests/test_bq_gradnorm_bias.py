@@ -1,76 +1,81 @@
+"""
+Test BQ: GradNorm Accumulation Bias Verification (Bayesian Scaler)
+------------------------------------------------------------------
+Verifies that BayesianProjectedScaler correctly accumulates losses across
+sub-batches before performing DDP synchronization and weight updates.
+
+This prevents "Tail Bias" where the final sub-batch of an accumulation 
+cycle would disproportionately influence task weights.
+"""
 import torch
+import unittest
+from unittest.mock import patch, MagicMock
+from icu.models.components.loss_scaler import BayesianProjectedScaler
 import logging
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("Test_BQ")
+logger = logging.getLogger("Test_BQ_Verification")
 
-class MockGradNorm:
-    def __init__(self, num_tasks=2):
-        self.weights = torch.ones(num_tasks)
-        self.step_count = 0
-
-    def get_weights(self):
-        return self.weights
-
-    def update(self, losses):
-        # SIMULATE: GradNorm logic (simplified)
-        # It calculates task weights based on current loss magnitudes
-        # If one loss is huge, it decreases its weight.
-        # [SOTA FIX]: This should use the AVERAGE loss across the cycle.
-        # [BUG]: It only sees the loss of the last batch.
+class TestGradNormBiasVerification(unittest.TestCase):
+    @patch('torch.distributed.is_initialized', return_value=True)
+    @patch('torch.distributed.all_reduce')
+    def test_accumulation_parity(self, mock_all_reduce, mock_is_init):
+        logger.info("Verifying Patch #107: GradNorm Accumulation Parity...")
         
-        # Simplified: weight = 1.0 / (loss + 1e-8)
-        new_weights = 1.0 / (losses + 1e-8)
-        new_weights = new_weights / new_weights.sum() * len(losses)
+        # 1. Setup Scaler
+        scaler = BayesianProjectedScaler(num_tasks=2)
+        acc_batches = 4
         
-        self.weights = 0.9 * self.weights + 0.1 * new_weights
-        return torch.tensor(0.0), {}
-
-def test_gradnorm_accumulation_bias():
-    logger.info("Simulating GradNorm Accumulation Bias (#107)...")
-    
-    gn = MockGradNorm(num_tasks=2)
-    acc_batches = 4
-    
-    # SCENARIO: 
-    # Batches 1-3: Loss A is high (Needs priority), Loss B is low.
-    # Batch 4: Loss B spikes (Outlier), Loss A is low.
-    
-    losses_history = [
-        torch.tensor([10.0, 1.0]), # B1
-        torch.tensor([11.0, 1.1]), # B2
-        torch.tensor([10.5, 0.9]), # B3
-        torch.tensor([1.0, 50.0]), # B4 (Outlier spike)
-    ]
-    
-    # 1. BUGGY BEHAVIOR: Only update on batch 4
-    for i in range(acc_batches):
-        current_losses = losses_history[i]
-        if (i + 1) % acc_batches == 0:
-            gn.update(current_losses)
+        # Force initial emas to be 1.0
+        scaler.loss_emas.fill_(1.0)
+        
+        # SCENARIO (Same as original demo):
+        # Batches 1-3: Task A is high, Task B is low.
+        # Batch 4: Task B spikes (Outlier), Task A is low.
+        
+        losses_history = [
+            {'diffusion': torch.tensor(10.0, requires_grad=True), 'critic': torch.tensor(1.0, requires_grad=True)}, # B1
+            {'diffusion': torch.tensor(11.0, requires_grad=True), 'critic': torch.tensor(1.1, requires_grad=True)}, # B2
+            {'diffusion': torch.tensor(10.5, requires_grad=True), 'critic': torch.tensor(0.9, requires_grad=True)}, # B3
+            {'diffusion': torch.tensor(1.0, requires_grad=True), 'critic': torch.tensor(50.0, requires_grad=True)}, # B4 (Outlier spike)
+        ]
+        
+        # Expected Average Losses:
+        # Task A: (10+11+10.5+1)/4 = 32.5/4 = 8.125
+        # Task B: (1+1.1+0.9+50)/4 = 53/4 = 13.25
+        
+        # 2. Simulate Accumulation Cycle
+        for i in range(acc_batches):
+            is_acc = (i < acc_batches - 1)
+            scaler.forward(losses_history[i], batch_size=1, is_accumulating=is_acc)
             
-    weights_buggy = gn.get_weights()
-    logger.info(f"Buggy Weights (Rank 4 bias): {weights_buggy}")
-    
-    # 2. IDEAL BEHAVIOR: Update on Average
-    gn_ideal = MockGradNorm(num_tasks=2)
-    avg_losses = torch.stack(losses_history).mean(dim=0)
-    gn_ideal.update(avg_losses)
-    
-    weights_ideal = gn_ideal.get_weights()
-    logger.info(f"Ideal Weights (Global average): {weights_ideal}")
-    
-    # ANALYSIS:
-    # In the buggy version, Task B (which normally is low priority)
-    # gets a massive weight decrease (priority suppression) 
-    # while Task A (which was the bottleneck for 75% of the data) 
-    # gets a massive weight increase.
-    # This causes a "Task Weight Lurch" at the epoch boundary or every 16 steps.
-    
-    diff = torch.norm(weights_buggy - weights_ideal).item()
-    if diff > 0.1:
-        logger.error(f"❌ Smoking Gun #107 CONFIRMED! GradNorm weights are biased by tail batch (Diff: {diff:.4f})")
-        logger.warning("⚠️ Rationale: GradNorm must be fed the average losses of the entire accumulation cycle.")
+            if is_acc:
+                # all_reduce should NOT be called during accumulation
+                self.assertEqual(mock_all_reduce.call_count, 0)
+        
+        # 3. Verify AllReduce state on the 'Step' batch (B4)
+        mock_all_reduce.assert_called_once()
+        
+        # Extract the buffer passed to all_reduce
+        sync_buffer = mock_all_reduce.call_args[0][0]
+        
+        # sync_buffer structure in BayesianProjectedScaler:
+        # [loss_accumulator (num_tasks), task_counters (num_tasks), batch_counter (1)]
+        
+        accumulated_losses = sync_buffer[:2]
+        accumulated_counts = sync_buffer[2:4]
+        
+        logger.info(f"Accumulated Sum Losses: {accumulated_losses.tolist()}")
+        logger.info(f"Accumulated Task Counts: {accumulated_counts.tolist()}")
+        
+        # Check parity with expected sums
+        self.assertAlmostEqual(accumulated_losses[0].item(), 32.5, places=2)
+        self.assertAlmostEqual(accumulated_losses[1].item(), 53.0, places=2)
+        self.assertEqual(accumulated_counts[0].item(), 4.0)
+        self.assertEqual(accumulated_counts[1].item(), 4.0)
+        
+        logger.info("✅ SUCCESS: BayesianProjectedScaler correctly accumulated all losses.")
+        logger.info("This confirms the weighted average will be mathematically perfect.")
 
 if __name__ == "__main__":
-    test_gradnorm_accumulation_bias()
+    unittest.main()

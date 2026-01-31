@@ -57,7 +57,7 @@ class GradNormBalancer(nn.Module):
         # [PATCH 8.2] Dynamic Initial Loss Anchoring (Smoking Gun #117 FIX)
         # Rationale: A fixed anchor (v30.5) causes extreme imbalance as tasks are solved.
         # Fix: Transition to a continuous slow-EMA anchor to maintain relative parity.
-        curr_loss_detached = meta_losses_val # Use synchronized values
+        curr_loss_detached = meta_losses_val.flatten() # [v35.1] Ensure 1D for broadcast safety
         if self.initial_losses.sum() == 0:
             self.initial_losses.data.copy_(curr_loss_detached)
         else:
@@ -104,19 +104,23 @@ class GradNormBalancer(nn.Module):
             else:
                 self.norm_emas[i] = (self.ema_alpha * self.norm_emas[i]) + ((1.0 - self.ema_alpha) * raw_grad_norm.detach())
                 
-            # 3. Explicitly multiply by weights[i] so gn_loss is differentiable w.r.t weight
-            norms.append(weights[i] * raw_grad_norm)
+            # [PHASE 35 SOTA FIX] GradNorm Damping (Smoking Gun #19)
+            # Rationale: Using the EMA-smoothed norm instead of the raw batch norm 
+            # prevents 'Meta-Weight Jitter' and ensures stable convergence.
+            norms.append(weights[i] * self.norm_emas[i])
 
         norms = torch.stack(norms)
 
         # 2. Relative inverse rates
         # Slower tasks (loss ratio higher) get more weight
-        # [SAFETY] Ensure initial_losses is never zero to prevent INF weights
-        safe_init = torch.where(self.initial_losses > 0, self.initial_losses, torch.ones_like(self.initial_losses))
+        # [PHASE 35 SOTA FIX] Epsilon Hardening (Smoking Gun #36)
+        # Rationale: 1e-8 can be too small for FP16, leading to 1.6e10+ weights.
+        # 1e-4 provides a robust numeric floor for stable divisions.
+        safe_init = torch.where(self.initial_losses > 1e-4, self.initial_losses, torch.ones_like(self.initial_losses) * 1e-4)
         # Use synchronized meta_losses_val for global parity
-        rel_rates = meta_losses_val / (safe_init + 1e-8)
+        rel_rates = meta_losses_val / (safe_init + 1e-4)
         avg_rate = rel_rates.mean()
-        rel_rates = rel_rates / (avg_rate + 1e-8)
+        rel_rates = rel_rates / (avg_rate + 1e-4)
 
         # 3. Target norms (The balance point)
         target = norms.mean() * (rel_rates ** self.alpha)

@@ -982,9 +982,12 @@ class TieredEMA:
                 else:
                     new_data = buffer.data.detach().to(device="cpu", non_blocking=True)
                 
-                # Integer buffers (steps) and Normalizer stats copy directly
-                # [v17.6 FIX] Prevent drift in Teacher's normalization bounds
-                if target_dtype in (torch.int64, torch.int32, torch.bool) or "normalizer." in name:
+                # Integer buffers (steps) and Normalizer/BN stats copy directly
+                # [v112.0 SOTA FIX] Prevent "Abyssal Lag" in Teacher BN (Smoking Gun #41)
+                # Rationale: EMA-ing BN stats with 0.9999 decay causes thousands of steps of lag.
+                # Copying directly ensures the teacher always uses converged distribution statistics.
+                direct_copy_names = ["normalizer.", "running_mean", "running_var", "num_batches_tracked"]
+                if target_dtype in (torch.int64, torch.int32, torch.bool) or any(d in name for d in direct_copy_names):
                     self.shadow[name].copy_(new_data)
                 else:
                     model_params.append(new_data)
@@ -1081,6 +1084,37 @@ class TieredEMA:
     def load_state_dict(self, state_dict: Dict[str, torch.Tensor]):
         """Loads EMA shadow weights from checkpoint."""
         self.shadow = state_dict
+
+    @torch.no_grad()
+    def synchronize(self):
+        """
+        [v110.0 SOTA] Teacher Consensus Protocol (Smoking Gun #38)
+        
+        Rationale: In DDP, local EMA updates diverge over time due to 
+        different data streams on different ranks. This method averages 
+        the shadow weights across all ranks to maintain a unified teacher manifold.
+        """
+        if not dist.is_initialized():
+            return
+            
+        world_size = dist.get_world_size()
+        
+        # 1. Sync shadow weights
+        for name, shadow_val in self.shadow.items():
+            # Move to model device for communication if it's on CPU
+            device = self.model_ref.device
+            temp_val = shadow_val.to(device, non_blocking=False)
+            
+            # Simple average: Sum and divide
+            dist.all_reduce(temp_val, op=dist.ReduceOp.SUM)
+            temp_val /= float(world_size)
+            
+            # Move back to shadow storage (CPU, pinned if possible)
+            new_val = temp_val.cpu()
+            if shadow_val.is_pinned():
+                new_val = new_val.pin_memory()
+            
+            self.shadow[name].copy_(new_val)
 
 
 # Alias for backward compatibility

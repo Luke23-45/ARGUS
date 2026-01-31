@@ -58,7 +58,9 @@ class BufferedCSVLogger:
 
             mode = 'a' if self.file_exists else 'w'
             
-            with open(self.filepath, mode, newline='') as f:
+            # [v39.1 SOTA FIX] Unicode Safety (Smoking Gun #47)
+            # Rationale: Standard CSV writer uses cp1252 on Windows, crashing on '⚡'
+            with open(self.filepath, mode, newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=self.headers)
                 
                 # Write header if new file

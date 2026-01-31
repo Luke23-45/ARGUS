@@ -208,8 +208,13 @@ class ICUAdvantageCalculator(nn.Module):
         self.beta_growth_factor = 1.5
         self.beta_growth_cooldown = 0  # [v27.1] Cooldown to prevent runaway growth
         
-        self.min_beta = 0.01           # Allow sharper peaks
+        self.min_beta = 0.1            # [v35.0 SOTA FIX] Raised floor from 0.01 to prevent selection explosion
         self.max_beta = 10.0
+        
+        # [v29.1 SOTA FIX] Whitening Momentum Stability (Abyssal #1)
+        # [v35.0 SOTA FIX] Faster Adaptation: 0.999 -> 0.99 (Smoking Gun #35)
+        self.whitening_momentum = 0.99 
+        self.base_whitening_momentum = 0.99
         
         # qSOFA thresholds
         if qsofa_thresholds is None:
@@ -324,9 +329,13 @@ class ICUAdvantageCalculator(nn.Module):
         # 3. Scale Growth Rates (Baseline: 1.5)
         self.beta_growth_factor = float(1.5 ** (ScalingSteward.REF_STEPS / n_curr))
         
+        # 4. Scale Whitening Momentum (Ref: 0.999)
+        self.whitening_momentum = ScalingSteward.get_decay(self.base_whitening_momentum, n_curr)
+        
         logger.info(
             f"⚡ [AWR] Scaling Results: beta_mom={self.beta_momentum:.6f}, "
-            f"ess_ema={self.ess_ema_decay:.4f}, growth={self.beta_growth_factor:.4f}"
+            f"ess_ema={self.ess_ema_decay:.4f}, growth={self.beta_growth_factor:.4f}, "
+            f"white_mom={self.whitening_momentum:.6f}"
         )
 
     # =========================================================================
@@ -765,12 +774,15 @@ class ICUAdvantageCalculator(nn.Module):
                     # Rationale: Increased floor from 1e-6 to 1e-5 for stable denominator
                     curr_sigma = torch.sqrt(curr_var.clamp(min=1e-5))
                     
-                    mom = 0.999 
+                    # [v29.1 SOTA FIX] Step-Density Aware Whitening (Abyssal #1)
+                    mom = self.whitening_momentum
                     self.stats_count.add_(1)
                     t = self.stats_count.float()
                     # [v23.0 SOTA FIX] Bias Correction Floor (Smoking Gun #245.2)
-                    # Rationale: Prevents extreme scaling (1000x+) on first few steps or resumption.
-                    bias_correction = torch.clamp(torch.tensor(1.0 - (mom ** t), device=t.device), min=1e-3)
+                    # [v29.2 SOTA FIX] Softened Floor (Abyssal #2)
+                    # Rationale: Increasing floor from 1e-3 to 0.01 prevents 
+                    # extreme 1000x Advantage scaling during early training/resumption.
+                    bias_correction = torch.clamp(torch.tensor(1.0 - (mom ** t.item()), device=t.device), min=0.01)
                     
                     # Update (Uncorrected)
                     self.adv_mean.mul_(mom).add_(curr_mu, alpha=1.0 - mom)
@@ -791,25 +803,38 @@ class ICUAdvantageCalculator(nn.Module):
             # [v96.2 SOTA FIX] Global Whitening Parity for Fresh Start
             # [v96.2 SOTA FIX] Global Whitening Parity for Fresh Start
             if adv_flat.numel() > 0:
-                l_mu = adv_flat.mean()
-                l_sigma = adv_flat.std()
-                l_count = torch.tensor([float(adv_flat.numel())], device=adv_flat.device)
+                l_sum = adv_flat.sum()
+                l_sq_sum = (adv_flat ** 2).sum()
+                l_count = torch.tensor(float(adv_flat.numel()), device=adv_flat.device)
             else:
                 # [v163.2 FIX] Neutral stats for empty ranks (Smoking Gun #163.2)
-                l_mu = torch.tensor(0.0, device=advantages.device)
-                l_sigma = torch.tensor(0.0, device=advantages.device)
+                l_sum = torch.tensor(0.0, device=advantages.device)
+                l_sq_sum = torch.tensor(0.0, device=advantages.device)
                 l_count = torch.tensor(0.0, device=advantages.device)
             
             if dist.is_initialized():
-                # [v163.2 SOTA FIX] Deadlock-Free Fresh Whitening (Smoking Gun #163.2)
-                stats = torch.stack([l_mu * l_count, l_sigma * l_count, l_count])
+                # [v96.2 SOTA FIX] Exact Global Variance (Smoking Gun #96)
+                # Replaced approximate mean-averaging with true Variance reduction.
+                stats = torch.stack([l_sum, l_sq_sum, l_count])
                 dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-                # [v165.0 SOTA FIX] Epsilon Hardening (Smoking Gun #165)
-                mu = stats[0] / (stats[2] + 1e-5)
-                sigma = stats[1] / (stats[2] + 1e-5) + 1e-5
+                
+                g_b_sum, g_b_sq_sum, g_b_count = stats[0], stats[1], stats[2]
+                
+                if g_b_count > 1:
+                    mu = g_b_sum / g_b_count
+                    var = (g_b_sq_sum / g_b_count) - (mu ** 2)
+                    sigma = torch.sqrt(var.clamp(min=1e-5))
+                else:
+                    mu, sigma = torch.tensor(0.0, device=advantages.device), torch.tensor(1.0, device=advantages.device)
             else:
                 # [v165.0 SOTA FIX] Epsilon Hardening (Smoking Gun #165)
-                mu, sigma = l_mu, l_sigma + 1e-5
+                # Local only
+                if l_count > 1:
+                    mu = l_sum / l_count
+                    var = (l_sq_sum / l_count) - (mu ** 2)
+                    sigma = torch.sqrt(var.clamp(min=1e-5))
+                else:
+                    mu, sigma = torch.tensor(0.0, device=advantages.device), torch.tensor(1.0, device=advantages.device)
             
             # [v23.0 SOTA FIX] Activate EMA Branch (Smoking Gun #245)
             # Rationale: Once we've seen at least one valid sample, we switch to EMA tracking.
@@ -930,8 +955,9 @@ class ICUAdvantageCalculator(nn.Module):
             self.clip_rate_buffer.fill_(clipped_rate)
             
             # [SOTA 2025] Adaptive Dynamics Update (Uses Global Statistics)
+            beta_raw = self.beta.item()
             if self.adaptive_beta or self.adaptive_clipping:
-                self._update_adaptive_stats(advantages, weights, ess, clipped_rate.item())
+                beta_raw = self._update_adaptive_stats(advantages, weights, ess, clipped_rate.item())
             
             # Weight Entropy (Information Theoretic)
             probs = weights_clipped / (sum_w + 1e-8)
@@ -965,16 +991,19 @@ class ICUAdvantageCalculator(nn.Module):
                     "weight_entropy": entropy.item(),
                     "fp16_clipped_ratio": self.clip_rate_buffer.item(),
                     "hard_clipped_ratio": hard_clipped_rate.item(),
-                    "beta_dynamic": self.beta.item(), # [Telemetry]
-                    "max_weight_dynamic": self.max_weight.item() # [Telemetry]
+                    "beta_dynamic": self.beta.item(),
+                    "beta_raw": beta_raw, # [Telemetry]
+                    "max_weight_dynamic": self.max_weight.item()
                 }
         
         return weights_clipped, diagnostics
 
-    def _update_adaptive_stats(self, advantages: torch.Tensor, weights: torch.Tensor, ess: torch.Tensor, clipped_rate: float):
+    def _update_adaptive_stats(self, advantages: torch.Tensor, weights: torch.Tensor, ess: torch.Tensor, clipped_rate: float) -> float:
         """
         [SOTA 2025] Dynamically adapts hyperparameters to squeeze performance.
+        Returns the raw (un-momentum-ed) beta target for forensics.
         """
+        beta_raw = self.beta.item()
         with torch.no_grad():
             # A. Adaptive Beta (Target ESS = 10%)
             if self.adaptive_beta:
@@ -991,12 +1020,14 @@ class ICUAdvantageCalculator(nn.Module):
                     # This fixes the "lazy adaptation" (33 steps -> 3 steps).
                     boost_factor = 1.0 + clipped_rate
                     self.beta = self.beta * boost_factor
-                else:
+                
+                # [FIX] current_ess must be defined unconditionally for use at line 1017
+                current_ess = ess.item()
+                
+                if clipped_rate <= 0.05:
                     # Standard ESS Control Mode
                     # Target 20% ESS (Robust balance between selection and diversity)
                     target_ess = 0.20
-                    current_ess = ess.item()
-                    
                     # P-Controller with Anti-Windup
                     error_ess = (target_ess - current_ess)
                     
@@ -1006,6 +1037,7 @@ class ICUAdvantageCalculator(nn.Module):
                     correction = math.exp(10.0 * error_ess * self.beta_gain)
                     correction = max(0.5, min(2.0, correction))
                     new_beta = self.beta * correction
+                    beta_raw = new_beta.item()
                     
                     # [v116.0 SOTA FIX]: Remove the 0.99 floor. 
                     # Use the momentum specified in config (default 0.90) for faster adaptation.
@@ -1072,6 +1104,8 @@ class ICUAdvantageCalculator(nn.Module):
                 metric_params /= dist.get_world_size()
                 self.ess_buffer.copy_(metric_params[0])
                 self.clip_rate_buffer.copy_(metric_params[1])
+            
+            return beta_raw
 
     def calculate_weights(
         self, 

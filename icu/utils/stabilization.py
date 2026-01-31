@@ -140,9 +140,12 @@ class LinearManifoldSentinel:
         # dot = sum(grad_aux * grad_foundation)
         dot = (grad_aux * grad_foundation).sum(dim=-1, keepdim=True) # [..., 1]
         
-        # Only project if conflict detected (dot < -0.1)
-        # Softened threshold for shared feature overlap
-        conflict_mask = (dot < -0.1)
+        # [v29.3 SOTA FIX] Zero-Safe Projection (Abyssal #3)
+        # Rationale: Using -0.1 as a threshold creates a 'cliff' where the 
+        # projection vector jumps from 0 to 10% of foundation magnitude.
+        # By using 0.0, the adjustment (dot/mag * fnd) naturally approaches 
+        # zero as the conflict disappears, preventing flickering.
+        conflict_mask = (dot < 0.0)
         
         if conflict_mask.any():
             mag_fnd = (grad_foundation * grad_foundation).sum() + 1e-8
@@ -314,15 +317,24 @@ class OrthogonalGuard(object):
     Enhanced v26.5: Now supports Variance Tracking for Adaptive Sentinels.
     """
     @staticmethod
-    def compute_grad_norm(model) -> float:
-        """[SOTA v3.1] Global Consensus Gradient Norm calculation."""
+    def compute_grad_norm(model, extra_params: Optional[List[nn.Parameter]] = None) -> float:
+        """
+        [SOTA v3.5] Global Consensus Gradient Norm calculation.
+        Now supports 'extra_params' (Meta-Parameters) to monitor system-wide pressure.
+        """
         with torch.no_grad():
             # Identify active gradients effectively
             grads = []
+            # 1. Main Model Parameters
             for p in model.parameters():
                 if p.grad is not None:
-                     # Sum of squares for global norm composition
                      grads.append(torch.sum(p.grad.detach()**2))
+            
+            # 2. Add Extra parameters (GradNorm/LossScaler)
+            if extra_params is not None:
+                for p in extra_params:
+                    if p.grad is not None:
+                        grads.append(torch.sum(p.grad.detach()**2))
             
             if not grads:
                 return 0.0
@@ -334,7 +346,7 @@ class OrthogonalGuard(object):
             if torch.distributed.is_initialized():
                 torch.distributed.all_reduce(local_sq_norm, op=torch.distributed.ReduceOp.SUM)
                 # PL manual optimization uses SUM for grad, so SUM of squares is consistent.
-                # Standard practice is to use the average gradient for the norm.
+                # Standard practice is to use the average gradient for the norm across DP.
                 total_norm = torch.sqrt(local_sq_norm / torch.distributed.get_world_size() + 1e-8)
             else:
                 total_norm = torch.sqrt(local_sq_norm + 1e-8)
@@ -421,7 +433,10 @@ class TrendSentinel:
             if step_tensor is not None:
                 step_tensor.add_(1)
                 t = step_tensor.item()
-                bias_correction = 1.0 - (decay ** t) if t > 0 else 1.0
+                # [v31.0 SOTA FIX] Resumption Robustness (Abyssal #319)
+                # Rationale: Clamping prevents 1000x+ amplification of noise during 
+                # early warmup or resumption shocks.
+                bias_correction = max(1.0 - (decay ** t), 0.01) if t > 0 else 1.0
             else:
                 bias_correction = 1.0
 

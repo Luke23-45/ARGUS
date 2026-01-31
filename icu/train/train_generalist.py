@@ -39,6 +39,16 @@ from __future__ import annotations
 
 import sys
 import os
+
+# [v39.4 SOTA FIX] Console Unicode Safety (Smoking Gun #47)
+# Rationale: Windows console defaults to cp1252, crashing on SOTA emojis (⚡).
+# We force UTF-8 reconfigurations immediately on launch.
+if sys.platform == "win32":
+    # Check for reconfigure (Python 3.7+)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding='utf-8')
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding='utf-8')
 import logging
 import traceback
 import collections

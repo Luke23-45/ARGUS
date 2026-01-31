@@ -47,19 +47,20 @@ class TestCQLossScalerAccumulation(unittest.TestCase):
             else:
                 self.assertTrue(ema_changed, "EMA failed to update on stepping batch")
                 
-                # Verify value
+                # [v110.0 Alignment] Dynamic Inertia Fix (#110B)
+                # During the first 200 steps, decay is 0.90, overriding the requested 0.5.
                 # EMA_old = 1.0
                 # New Global Avg = 2.5
-                # EMA_new = 0.5 * 1.0 + 0.5 * 2.5 = 1.75
+                # EMA_new = 0.90 * 1.0 + 0.10 * 2.5 = 1.15
                 
                 ema_val = ema_after[0].item() # diffusion
                 print(f"Final EMA Diffusion: {ema_val:.4f}")
                 
-                # If the bug was present (blind to 0-2):
-                # EMA_new = 0.5 * 1.0 + 0.5 * 4.0 = 2.5
-                
-                if abs(ema_val - 1.75) < 0.01:
-                    print("SUCCESS: Scaler is accumulation-aware (Average of all sub-batches used).")
+                # Compare with 1.15 instead of 1.75
+                if abs(ema_val - 1.15) < 0.01:
+                    print("SUCCESS: Scaler is accumulation-aware (Average of all sub-batches used) and respects Dynamic Inertia.")
+                elif abs(ema_val - 1.75) < 0.01:
+                    self.fail("FAILURE: Scaler DID NOT apply Dynamic Inertia (0.90) during warmup!")
                 elif abs(ema_val - 2.5) < 0.01:
                     self.fail("FAILURE: Scaler is still BLIND to accumulation sub-batches! (Used only last batch)")
                 else:

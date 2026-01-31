@@ -26,19 +26,27 @@ class ClinicalHorizonScheduler(nn.Module):
         self.ramp_epochs = ramp_epochs
         
     def get_gamma(self, current_epoch: int) -> float:
+        """Calculates gamma based on epoch (Legacy)."""
+        # [v29.5] Redirect to step-based logic using a default n_batches=200
+        return self.get_gamma_step(current_epoch * 200)
+
+    def get_gamma_step(self, total_steps: int) -> float:
         """
-        Calculates the current discount factor based on training progress.
+        [v29.5 SOTA FIX] Step-Invariant Horizon Ramp (Abyssal #5).
+        Uses ScalingSteward reference steps to ensure identical ramps across densities.
         """
-        if current_epoch < self.warmup_epochs:
+        # Ref: 200 steps = 1 epoch
+        warmup_steps = self.warmup_epochs * 200
+        ramp_steps = self.ramp_epochs * 200
+        
+        if total_steps < warmup_steps:
             return self.start_gamma
         
-        if current_epoch >= (self.warmup_epochs + self.ramp_epochs):
+        if total_steps >= (warmup_steps + ramp_steps):
             return self.end_gamma
             
-        # Linear Ramp
-        progress = (current_epoch - self.warmup_epochs) / self.ramp_epochs
+        progress = (total_steps - warmup_steps) / ramp_steps
         gamma = self.start_gamma + (self.end_gamma - self.start_gamma) * progress
-        
         return gamma
 
     def get_foresight_hours(self, gamma: float, timestep_mins: int = 60) -> float:
