@@ -1043,6 +1043,12 @@ class ICUAdvantageCalculator(nn.Module):
                     # Use the momentum specified in config (default 0.90) for faster adaptation.
                     mom = self.beta_momentum
                     self.beta.copy_((mom * self.beta) + ((1.0 - mom) * new_beta))
+                    
+                    # [PHASE 47] Unfreezing Telemetry
+                    # print(f"[AWR DEBUG] ESS={current_ess:.4f} | Target={target_ess} | Err={error_ess:.4f} | Corr={correction:.4f} | Beta: {self.beta.item():.4f}")
+                else:
+                    pass
+                    # print(f"[AWR DEBUG] Saturation Mode! ClipRate={clipped_rate:.4f} | Beta Boosting...")
                 
                 # [v27.1 FIX] ESS Safety Floor with Cooldown
                 # Prevents runaway multiplicative growth (166 clamps/200 steps → ~20)

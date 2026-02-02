@@ -351,8 +351,11 @@ class SepsisGhostBank(nn.Module):
         num_iters = (int(self.size) + batch_size - 1) // batch_size
         
         # [v33.1] Force Evaluation Mode for deterministic encoding
-        encoder_was_training = encoder.training
-        encoder.eval()
+        # [v42.0 SOTA FIX] Polymorphic Support (Module vs Function)
+        was_training = None
+        if isinstance(encoder, torch.nn.Module):
+             was_training = encoder.training
+             encoder.eval()
         
         try:
             for i in range(num_iters):
@@ -372,8 +375,9 @@ class SepsisGhostBank(nn.Module):
                 # Standardize on unit hypersphere
                 self.latent_anchors[start:end].copy_(F.normalize(new_anchors, dim=1))
         finally:
-            if encoder_was_training:
-                encoder.train()
+            # Restore training state
+            if was_training is not None:
+                encoder.train(was_training)
                 
         # Re-initialize prototype to match new latent space
         if self.size > 0:

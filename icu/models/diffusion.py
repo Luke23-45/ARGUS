@@ -1264,10 +1264,12 @@ class ICUUnifiedPlanner(nn.Module):
                     targets=batch["phase_label"].long()
                 )
                 logits = aux_out["logits"]
+                probs = aux_out["probs"]
                 aux_loss = aux_out["loss"]
                 uncertainty = aux_out["uncertainty"]
             else:
                 logits = None
+                probs = None
                 aux_loss = torch.tensor(0.0, device=past.device)
                 uncertainty = torch.tensor(0.0, device=past.device)
             
@@ -1315,6 +1317,7 @@ class ICUUnifiedPlanner(nn.Module):
             "diffusion_loss": diff_loss,
             "aux_loss": aux_loss,
             "aux_logits": logits,
+            "aux_probs": probs,
             "aux_uncertainty": uncertainty,
             "value_loss": value_loss,
             "pred_value": pred_val

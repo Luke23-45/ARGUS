@@ -865,7 +865,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
         
         diff_sq = (pred_noise - noise_eps) ** 2
         weighted_diff = diff_sq * self.model.importance_weights.view(1, 1, -1)
-        raw_diff_loss = weighted_diff.mean(dim=2) # [B, T]
+        
+        # [v2025 SOTA FIX] Training Manifold Disentanglement (Smoking Gun #468)
+        # Rationale: Static channels (22-27) are effectively constant (0.0). Training constraints 
+        # on them are wasted capacity and distract the encoder from dynamic features.
+        # We slice to Dynamic Channels (0-22) to align Training Loss with GMSE Validation Metric.
+        DYNAMIC_CHANNELS = 22
+        raw_diff_loss = weighted_diff[..., :DYNAMIC_CHANNELS].mean(dim=2) # [B, T]
 
         # B. Advantage Engine (DEFERRED to Fused Teacher Block)
         # We process AWR logic later to allow "One-Pass" Teacher execution.
@@ -1418,7 +1424,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 d_ema = self.loss_scaler.loss_emas[0]
                 a_ema = self.loss_scaler.loss_emas[2]
                 alpha = (a_ema / (d_ema + 1e-8)).clamp(min=1e-4, max=1.0)
-                
+            
             loss_dict['diffusion'] = diff_loss * alpha
             loss_dict['bgsl'] = l_bgsl
             loss_dict['tcb'] = l_tcb
@@ -1449,10 +1455,27 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 is_accumulating=is_accumulating
             )
             
+            # [v41.0 SOTA FIX] Explicit Loss Assignment (The Missing Link)
+            # Rationale: 'total_loss' must be updated from the scaler output to 
+            # ensure it is a Tensor for downstream .detach() calls.
+            total_loss = scaled_total
+            
             # [v25.7 FIX] Accumulation-Aware A-GEM Backup
             # Rationale: l_batch + l_ref = total_loss for the gradient projection.
             w_aux = logs.get('weight/aux', 1.0)
             p_aux = logs.get('priority/aux', 1.0)
+
+            # [PHASE 47] AWR Signal Unfreezing Telemetry
+            # Trace the adaptive beta to diagnose valid range issues.
+            loss_dict['beta'] = diag.get("beta_dynamic", self.awr_calculator.beta.item())
+            # "WA" corresponds to Weights Average
+            loss_dict['WA'] = diag.get("weights_mean", 1.0) 
+            loss_dict['W_Max'] = diag.get("weights_max", 1.0)
+            
+            # Add to progress bar for real-time monitoring
+            self.log("train/awr_beta", loss_dict['beta'], on_step=True, prog_bar=True)
+            self.log("train/wa_mean", loss_dict['WA'], on_step=True, prog_bar=True)
+            self.log("train/wa_max", loss_dict['W_Max'], on_step=True, prog_bar=True)
             
             # [v25.8 SOTA] Unified Clinical Branch
             # Rationale: New Sepsis discoveries must be protected, NOT suppressed.
@@ -2128,14 +2151,24 @@ class ICUGeneralistWrapper(pl.LightningModule):
             value_preds = out.get("pred_value", None)
             
             if logits is not None:
-                probs = F.softmax(logits, dim=-1)
+                # [v14.2 SOTA FIX] Direct Probability Extraction
+                # Rationale: Using probabilities computed by the head ensures 
+                # correct activation (Sigmoid vs Softmax) is used.
+                probs = out.get("aux_probs", None)
                 
-                # For binary AUROC: Sum sepsis-related probabilities
-                # Assuming index 0 = Stable, indices 1+ = Sepsis stages
-                if probs.shape[-1] > 1:
-                    risk_prob = probs[:, 1:].sum(dim=1)
+                if probs is not None:
+                    # Multi-class: Sum sepsis stages (Indices 1+)
+                    if probs.shape[-1] > 1:
+                        risk_prob = probs[:, 1:].sum(dim=1)
+                    else:
+                        risk_prob = probs.squeeze()
                 else:
-                    risk_prob = torch.sigmoid(logits.squeeze())
+                    # Fallback for old planners
+                    if logits.shape[-1] > 1:
+                        probs = F.softmax(logits, dim=-1)
+                        risk_prob = probs[:, 1:].sum(dim=1)
+                    else:
+                        risk_prob = torch.sigmoid(logits.squeeze())
                 
                 # Binary label for AUROC (0 = Stable, 1 = Sepsis/Shock)
                 # [FIX] Use phase_label > 0 (Stable=0, Pre=1, Shock=2) for robust binary target
@@ -2210,6 +2243,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
         if "outcome_label" in batch:
             result["preds"] = out.get("aux_logits", torch.zeros_like(batch["outcome_label"]))
             result["target"] = batch["outcome_label"]
+            
+            # [v14.3 SOTA FIX] Pass head-derived probs to callbacks
+            if "risk_prob" in locals():
+                result["sepsis_prob"] = risk_prob
+            if "uncertainty" in locals():
+                result["sepsis_uncertainty"] = uncertainty
+                
             # Store risk_prob and binary_label for epoch-end calibration
             if "risk_prob" in locals() and "binary_label" in locals():
                 self.validation_step_outputs.append({
@@ -2247,7 +2287,17 @@ class ICUGeneralistWrapper(pl.LightningModule):
         gt_safe = torch.nan_to_num(gt_phys, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-1e9, 1e9)
         
         # 3. Update MSE Metrics (Physical Units)
-        self.val_mse_global.update(pred_safe, gt_safe)
+        # [SOTA FIX] Manifold Disentanglement (GMSE Repair)
+        # Rationale: Static features (indices 22-27) are conditioning inputs, not generative outputs.
+        # Including them in MSE creates an irreducible error floor (~3700) that masks dynamic learning.
+        DYNAMIC_CHANNELS = 22 # Defined by Schema (0-22 are dynamic)
+
+        # Project to Dynamic Subspace
+        pred_dynamic = pred_safe[..., :DYNAMIC_CHANNELS].contiguous()
+        gt_dynamic = gt_safe[..., :DYNAMIC_CHANNELS].contiguous()
+
+        # Update Metric on Valid Subspace (Generative Error)
+        self.val_mse_global.update(pred_dynamic, gt_dynamic)
         
         if pred_safe.shape[-1] > 6:
             self.val_mse_hemo.update(pred_safe[..., :7].contiguous(), gt_safe[..., :7].contiguous())

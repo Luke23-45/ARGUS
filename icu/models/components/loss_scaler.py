@@ -153,11 +153,25 @@ class BayesianProjectedScaler(nn.Module):
         log_vars_clamped = torch.clamp(log_vars_active, min=-1.5)
         precision = torch.exp(-log_vars_clamped)
         
-        # 2. Kendall et al. Regularization: L_reg = sum(0.5 * log_var)
-        regularization = 0.5 * log_vars_clamped.sum()
+        # [v46.1 SOTA FIX] Option B (Preferred): Stabilized Forward + Softplus Guard
+        # Rationale: 
+        # 1. Preserves DDP Consensus (avg_losses) for stability.
+        # 2. Guarantees L > 0 via Softplus (Satisfies User Constraint).
+        # 3. Preserves Gradient Flow for negative tasks (unlike Clamp which zeroes grads).
+
+        # 1. Stabilized Forward (Global Average) + Gradient (Local)
+        stabilized_loss = avg_losses.clone() + (losses_tensor - losses_tensor.detach())
         
-        # [PATCH 1] Restrained Uncertainty Weighting (RUW)
-        weighted_losses = 0.5 * (precision * (losses_tensor - losses_tensor.detach() + avg_losses) * uw_weights) + regularization
+        # 2. Differentiable Positivity Guard (The "Soft" Sharpened Axe)
+        # Softplus ensures Forward > 0 while maintaining non-zero gradients.
+        stabilized_loss_pos = F.softplus(stabilized_loss)
+
+        # 3. RUW Weighting
+        # Regularization via Softplus (Positive)
+        regularization_per_task = F.softplus(log_vars_clamped)
+        
+        # Combined Weighted Loss (All terms structurally positive)
+        weighted_losses = 0.5 * precision * stabilized_loss_pos * uw_weights + regularization_per_task
         total_loss = weighted_losses.sum()
         
         # Logging
@@ -186,6 +200,11 @@ class BayesianProjectedScaler(nn.Module):
         # New bounds [-1.5, 3] create 90x ratio (12x improvement)
         # precision = exp(-log_var): exp(1.5)=4.48 to exp(-3)=0.05
         self.log_vars.clamp_(min=-1.5, max=3.0)
+        
+        # [v35.2 SOTA FIX] Diffusion Foundation Hardening (Fix #3666b)
+        # Rationale: Prevent "Scaler Dominance" where the scaler gives up on 
+        # the hard diffusion task. Max log_var 0.5 ensures weight >= 0.6.
+        self.log_vars[0].clamp_(max=0.5)
         
         # 2. [PRUW] Clinical Ranking Enforcement
         # Keys: ['diffusion', 'critic', 'aux', 'acl', 'bgsl', 'tcb', 'phys']

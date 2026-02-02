@@ -243,11 +243,28 @@ class SotaTransformerBlock(nn.Module):
 class SequenceAuxHead(nn.Module):
     """
     [Step 4] Sequence-Aware Classification Head - SOTA Version.
-    Features: CLS Token, RoPE Attention, SwiGLU FFN, RMSNorm, Asymmetric Loss.
+    Features: CLS Token, RoPE Attention, SwiGLU FFN, RMSNorm, AsymmetricLoss (v14.1).
+    
+    [v14.1 FORENSIC FIX] Reverted from EvidentialLoss to AsymmetricLoss.
+    Rationale: EvidentialLoss KL-term forces uniform distribution, directly
+    conflicting with Prior-Aware Initialization and causing collapse on skewed data (1.76% positive).
+    AsymmetricLoss correctly handles the 98% easy negatives without fighting the prior.
     """
-    def __init__(self, d_model: int, num_classes: int = 1, num_layers: int = 2, n_heads: int = 4, drop_path_prob: float = 0.1):
+    def __init__(
+        self, 
+        d_model: int, 
+        num_classes: int = 1, 
+        num_layers: int = 2, 
+        n_heads: int = 4, 
+        drop_path_prob: float = 0.1,
+        # [v14.1 PATCH] Configurable ASL hyperparameters
+        gamma_neg: float = 6.0,  # Heavy down-weighting of easy negatives
+        gamma_pos: float = 0.0,  # No down-weighting of precious positives
+        clip: float = 0.05       # Asymmetric clipping
+    ):
         super().__init__()
         self.d_model = d_model
+        self.num_classes = num_classes  # [v14.1] Store for activation selection
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         
         # SOTA Stack
@@ -284,77 +301,117 @@ class SequenceAuxHead(nn.Module):
             # Binary Case
             nn.init.constant_(final_layer.bias, bias_val)
         
+        # [v14.1 FORENSIC FIX] Revert to AsymmetricLoss (Smoking Gun #470)
+        # Rationale: EvidentialLoss KL-term forces uniform distribution, fighting
+        # the prior-aware init and causing collapse on skewed data (1.76% positive).
+        # AsymmetricLoss correctly handles the 98% easy negatives.
+        self.criterion = AsymmetricLoss(
+            gamma_neg=gamma_neg, 
+            gamma_pos=gamma_pos, 
+            clip=clip
+        )
 
-        
-        # [v14.0 PATCH] Replaced AsymmetricLoss with EvidentialLoss
-        # This allows the model to output *uncertainty* alongside probability.
-        # Critical for safety when inputs are 90% imputed.
-        self.criterion = EvidentialLoss(num_classes=num_classes, annealing_step=10)
-
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, targets: Optional[torch.Tensor] = None, epoch_num: int = None, return_sequence: bool = False) -> Dict[str, torch.Tensor]:
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        mask: Optional[torch.Tensor] = None, 
+        targets: Optional[torch.Tensor] = None, 
+        epoch_num: int = None,  # [API COMPAT] Kept for backward compatibility, unused with ASL
+        return_sequence: bool = False
+    ) -> Dict[str, torch.Tensor]:
         """
-        [SOTA 2025] Evidential Forward Pass.
+        [SOTA 2025] Sequence-Aware Forward Pass (ASL v14.1).
+        
         Returns:
-            Dict containing 'logits', 'alpha' (Dirichlet), 'uncertainty', and 'loss' (if targets)
+            Dict containing:
+                - 'logits': Raw logits [B, num_classes]
+                - 'probs': Probabilities [B, num_classes]
+                - 'alpha': None (Dirichlet not available with ASL, kept for API compat)
+                - 'uncertainty': Predictive entropy normalized to [0, 1], shape [B, 1]
+                - 'loss': Asymmetric Loss if targets provided, else None
         """
         B = x.shape[0]
-        # 1. Prepend CLS
+        
+        # 1. Prepend CLS token
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x_seq = torch.cat([cls_tokens, x], dim=1)
         
-        # 2. Adjust Mask
+        # 2. Adjust Mask for CLS token
         if mask is not None:
             cls_mask = torch.zeros((B, 1), dtype=torch.bool, device=mask.device)
             seq_mask = torch.cat([cls_mask, mask], dim=1) 
         else:
             seq_mask = None
             
-        # 3. Process Sequence
+        # 3. Process Sequence through Transformer blocks
         for block in self.blocks:
             x_seq = block(x_seq, mask=seq_mask)
         
-        # 4. Predict
+        # 4. Predict from CLS token or full sequence
         if return_sequence:
-            seq_out = x_seq[:, 1:, :] 
+            seq_out = x_seq[:, 1:, :]  # Exclude CLS
             logits = self.head(seq_out)
         else:
-            cls_out = x_seq[:, 0, :]
+            cls_out = x_seq[:, 0, :]  # CLS token only
             logits = self.head(cls_out)
             
-        # [v89.0 SOTA FIX] Evidential Logit Clamping (Smoking Gun #89)
-        # Rationale: Large positive logits cause lgamma overflow in EDL loss.
-        # Fixed range [-20, 20] ensures stable evidence for gradient computation.
+        # [v89.0] Logit Clamping (Safety) - prevents gradient explosion
         logits = torch.clamp(logits, min=-20.0, max=20.0)
         
-        # 5. [SOTA 2025] Evidential Deep Learning (EDL)
-        # alpha = evidence + 1. We use Softplus for evidence to ensure non-negativity.
-        evidence = F.softplus(logits)
-        alpha = evidence + 1
-        S = torch.sum(alpha, dim=-1, keepdim=True)
-        # Vacuous Uncertainty: Lower means the model is more confident in the distribution
-        uncertainty = logits.shape[-1] / S 
+        # 5. [v14.1] Probabilities - activation based on num_classes
+        if self.num_classes == 1:
+            probs = torch.sigmoid(logits)  # Binary classification
+        else:
+            probs = torch.softmax(logits, dim=-1)  # Multi-class classification
         
-        # 6. Loss
+        # 6. [v14.1 API COMPAT] Compute Predictive Entropy as Uncertainty Surrogate
+        # This replaces the vacuous uncertainty from EDL while maintaining
+        # identical downstream behavior (higher value = more uncertain).
+        eps = 1e-12
+        if self.num_classes == 1:
+            # Binary Entropy: H = -[p*log(p) + (1-p)*log(1-p)]
+            p = probs.clamp(eps, 1.0 - eps)
+            entropy = -(p * p.log() + (1.0 - p) * (1.0 - p).log())
+        else:
+            # Multi-class Entropy: H = -sum(p_i * log(p_i))
+            p = probs.clamp(eps, 1.0 - eps)
+            entropy = -(p * p.log()).sum(dim=-1, keepdim=True)
+        
+        # Normalize entropy to [0, 1] for downstream compatibility
+        # Max entropy: log(num_classes) for multi-class, log(2) for binary
+        max_entropy = float(torch.log(torch.tensor(max(self.num_classes, 2), dtype=torch.float32)))
+        uncertainty = (entropy / max_entropy).clamp(0.0, 1.0)
+        
+        # Ensure shape is [B, 1] for consistency with downstream code
+        if uncertainty.ndim == 1:
+            uncertainty = uncertainty.unsqueeze(-1)
+        if uncertainty.shape[-1] != 1:
+            uncertainty = uncertainty.mean(dim=-1, keepdim=True)
+        
+        # 7. Loss Calculation
         loss = None
         if targets is not None and not return_sequence:
             num_classes = logits.shape[-1]
             if num_classes > 1:
-                # [SOTA FIX] Multi-Class One-Hot Conversion
+                # Multi-Class: One-Hot Conversion
                 if targets.ndim == 1:
                     targets_oh = F.one_hot(targets.long(), num_classes=num_classes).float()
                 else:
                     targets_oh = targets.float()
             else:
+                # Binary: Ensure correct shape
                 targets_oh = targets.float().unsqueeze(-1) if targets.ndim == 1 else targets.float()
                     
-            # [v14.0 PATCH] Use Evidential Loss on alphas
-            # We pass 'alpha' (Dirichlet params) instead of 'logits'
-            # Note: The loss needs the current epoch for KL annealing. 
-            loss = self.criterion(alpha, targets_oh, epoch_num=epoch_num)
-            
+            # [v14.1 FORENSIC FIX] Asymmetric Loss on RAW LOGITS
+            # AsymmetricLoss expects logits, NOT probabilities
+            loss = self.criterion(logits, targets_oh)
+        
+        # Return dict with all keys for API compatibility
+        # alpha=None signals that Dirichlet parameters are not available with ASL
         return {
             "logits": logits,
-            "alpha": alpha,
-            "uncertainty": uncertainty,
+            "probs": probs,
+            "alpha": None,  # [v14.1] Dirichlet not available with ASL
+            "uncertainty": uncertainty,  # [v14.1] Predictive entropy as surrogate
             "loss": loss
         }
