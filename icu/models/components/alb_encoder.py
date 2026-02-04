@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, Any
+from omegaconf import DictConfig
 from icu.models.components.bypass_context import LateralBypass
 
 class GatedResidualNetwork(nn.Module):
@@ -113,7 +114,7 @@ class SinusoidalPositionalEncoding(nn.Module):
         return self.pe[:T, :].unsqueeze(0).to(dtype=x.dtype, device=x.device)
 
 class AsymmetricLatentBottleneck(nn.Module):
-    def __init__(self, encoder: nn.Module, cfg: Any):
+    def __init__(self, encoder: nn.Module, cfg: DictConfig):
         super().__init__()
         self.encoder = encoder
         self.bypass = LateralBypass(
@@ -127,7 +128,9 @@ class AsymmetricLatentBottleneck(nn.Module):
         self.pos_encoder = SinusoidalPositionalEncoding(cfg.d_model)
         
         # [v4.0 PERFECT] Manifold Synchronization with RoPE and GRN
-        self.sync = RoPEMultiheadAttention(cfg.d_model)
+        # [v168.0 SOTA FIX] Pass n_heads to ensure RoPE frequency alignment
+        # Default was 8, which caused a 1.5x clock skew against 12-head backbone.
+        self.sync = RoPEMultiheadAttention(cfg.d_model, n_heads=cfg.n_heads)
         self.expert_proj = nn.Sequential(
             GatedResidualNetwork(cfg.d_model),
             GatedResidualNetwork(cfg.d_model),

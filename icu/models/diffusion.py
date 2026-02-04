@@ -116,6 +116,11 @@ class ICUConfig:
     num_quantiles: int = 25     # [v4.1 SOTA] Distributional Critic resolution
     use_teacher: bool = False   # [SOTA] EMA Teacher-Student toggle
 
+    # [v168.0] Asymmetric Loss Tuning (Phase 10 Alignment)
+    asl_gamma_neg: float = 2.0
+    asl_gamma_pos: float = 1.0
+    asl_clip: float = 0.05
+
 
     # Stable Sampling [v18.0]
     use_dynamic_thresholding: bool = True
@@ -450,6 +455,12 @@ class EncoderBlock(nn.Module):
         # [v10.0] Stochastic Depth
         self.drop_path = DropPath(cfg.stochastic_depth_prob) if cfg.stochastic_depth_prob > 0 else nn.Identity()
         
+        # [v8.0 SOTA FIX] Projection Restoration (Head Binding Resolution)
+        # Rationale: Linear projections are REQUIRED to allow cross-head
+        # association. Without them, each head is bound to its input slice.
+        self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=True)
+        self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=True)
+        
         # FFN
         if cfg.use_swiglu:
             hidden_dim = int(cfg.d_model * cfg.ffn_dim_ratio * 2 / 3)
@@ -463,15 +474,18 @@ class EncoderBlock(nn.Module):
             )
             
     def forward(self, x, cos, sin, mask=None):
-        # Self-Attention with Pre-Norm (Q, K, V all from normalized input)
+        # Self-Attention with Pre-Norm
         h = self.norm1(x)
+        
+        # [v8.0 SOTA] Projected Attention (QKV)
+        qkv = self.qkv(h).chunk(3, dim=-1)
         attn = robust_flash_attention(
-            h, h, h,  # CRITICAL: All three use normalized input
+            qkv[0], qkv[1], qkv[2],
             self.cfg.n_heads, self.cfg.dropout, 
             cos_q=cos, sin_q=sin, cos_k=cos, sin_k=sin,
             key_padding_mask=mask
         )
-        x = x + self.drop_path(self.dropout(attn))
+        x = x + self.drop_path(self.dropout(self.proj(attn)))
         
         # FFN with Pre-Norm
         x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
@@ -681,14 +695,15 @@ class AdaLNZero(nn.Module):
     def __init__(self, d_model: int):
         super().__init__()
         self.silu = nn.SiLU()
-        self.linear = nn.Linear(d_model, 6 * d_model, bias=True)
+        # [v8.2 SOTA FIX] Extended AdaLN: Regress 9 parameters (MSA, Cross, MLP)
+        self.linear = nn.Linear(d_model, 9 * d_model, bias=True)
         # Initialize to zero so the block is an identity function at start of training
         nn.init.zeros_(self.linear.weight)
         nn.init.zeros_(self.linear.bias)
 
     def forward(self, condition: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         chunk = self.linear(self.silu(condition))
-        return chunk.chunk(6, dim=1)
+        return chunk.chunk(9, dim=1)
 
 
 class DiTBlock1D(nn.Module):
@@ -711,6 +726,14 @@ class DiTBlock1D(nn.Module):
         self.norm3 = RMSNorm(cfg.d_model)
         self.adaLN = AdaLNZero(cfg.d_model)
         self.dropout = nn.Dropout(cfg.dropout)
+        
+        # [v8.0 SOTA FIX] Projection Restoration (Head Binding Resolution)
+        self.qkv_self = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=True)
+        self.proj_self = nn.Linear(cfg.d_model, cfg.d_model, bias=True)
+        
+        self.q_cross = nn.Linear(cfg.d_model, cfg.d_model, bias=True)
+        self.kv_cross = nn.Linear(cfg.d_model, 2 * cfg.d_model, bias=True)
+        self.proj_cross = nn.Linear(cfg.d_model, cfg.d_model, bias=True)
         
         # [v10.0] Stochastic Depth
         self.drop_path = DropPath(cfg.stochastic_depth_prob) if cfg.stochastic_depth_prob > 0 else nn.Identity()
@@ -737,27 +760,34 @@ class DiTBlock1D(nn.Module):
             ctx_mask: Mask for History [B, T_hist] (True = Pad)
         """
         # Regress conditioning parameters from timestep
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN(t_cond)
+        (shift_msa, scale_msa, gate_msa, 
+         shift_cross, scale_cross, gate_cross,
+         shift_mlp, scale_mlp, gate_mlp) = self.adaLN(t_cond)
         
         # 1. Self-Attention (Future-Future, Time Mixing)
         h = self.norm1(x)
         h = h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+        
+        qkv = self.qkv_self(h).chunk(3, dim=-1)
         attn = robust_flash_attention(
-            h, h, h, self.cfg.n_heads, self.cfg.dropout,
+            qkv[0], qkv[1], qkv[2], self.cfg.n_heads, self.cfg.dropout,
             cos_q=cos_q, sin_q=sin_q, cos_k=cos_q, sin_k=sin_q
-            # No mask needed for future self-attention (no padding in future)
         )
-        x = x + self.drop_path(self.dropout(gate_msa.unsqueeze(1) * attn))
+        x = x + self.drop_path(self.dropout(gate_msa.unsqueeze(1) * self.proj_self(attn)))
         
         # 2. Cross-Attention (Future-History, Conditioning)
-        # CRITICAL: Pass ctx_mask to ignore padded history tokens
         h = self.norm2(x)
+        h = h * (1 + scale_cross.unsqueeze(1)) + shift_cross.unsqueeze(1)
+        
+        q = self.q_cross(h)
+        kv = self.kv_cross(context).chunk(2, dim=-1)
+        
         cross = robust_flash_attention(
-            h, context, context, self.cfg.n_heads, self.cfg.dropout,
+            q, kv[0], kv[1], self.cfg.n_heads, self.cfg.dropout,
             cos_q=cos_q, sin_q=sin_q, cos_k=cos_k, sin_k=sin_k,
             key_padding_mask=ctx_mask
         )
-        x = x + self.drop_path(self.dropout(cross))
+        x = x + self.drop_path(self.dropout(gate_cross.unsqueeze(1) * self.proj_cross(cross)))
         
         # 3. FFN
         h = self.norm3(x)
@@ -1071,8 +1101,11 @@ class ICUUnifiedPlanner(nn.Module):
                 # If num_phases=3 (Stable/Pre/Shock), it's multi-class.
                 # NTH SequenceAuxHead output shape is [B, num_classes].
                 num_layers=2,
-                n_heads=4,
-                drop_path_prob=cfg.stochastic_depth_prob
+                n_heads=cfg.n_heads,
+                drop_path_prob=cfg.stochastic_depth_prob,
+                gamma_neg=cfg.asl_gamma_neg,
+                gamma_pos=cfg.asl_gamma_pos,
+                clip=cfg.asl_clip
             )
             
             
@@ -1084,14 +1117,21 @@ class ICUUnifiedPlanner(nn.Module):
             num_quantiles=cfg.num_quantiles,
             dropout=0.1
         )
-        self.value_loss_fn = IQLQuantileLoss(tau=0.7, delta=1.0)
+        # [v168.0 SOTA FIX] Risk-Neutral Baseline (Smoking Gun #4)
+        # Seeking mean expectile (tau=0.5) is more stable for advantage centering
+        # than seeking the upper expectile (tau=0.7) during initial discovey.
+        self.value_loss_fn = IQLQuantileLoss(tau=0.5, delta=1.0)
         
         # [v10.0] Physics Loss for both training and PGS
         self.phys_loss = PhysiologicalConsistencyLoss()
         
         # [v13.0 SOTA FIX] Dynamic Manifold Governance
         # Replaces hard clamps with Google Imagen-style thresholding
-        self.governance = DynamicThresholding(percentile=0.995, threshold=3.0)
+        # [v168.0 SOTA FIX] Signal Liberation (Smoking Gun #67)
+        # Rationale: Clinical crises (Sepsis/Arrest) often reach 4-5 sigma.
+        # Thresholding at 3.0 clips the very signal we need for detection.
+        # Percentile 0.999 ensures we only squash extreme numerical ghosts.
+        self.governance = DynamicThresholding(percentile=0.999, threshold=5.0)
         
         # =====================================================================
         # [NEW] AGENTIC EVOLUTION CORE (Phases 4-5)

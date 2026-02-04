@@ -242,7 +242,8 @@ class ICUSpecialistWrapper(pl.LightningModule):
             lambda_gae=cfg.train.get("awr_lambda", 0.95),
             gamma=cfg.train.get("awr_gamma", 0.99),
             adaptive_beta=cfg.train.get("adaptive_beta", True), # [SOTA 2025] Enable by default
-            adaptive_clipping=cfg.train.get("adaptive_clipping", True)
+            adaptive_clipping=cfg.train.get("adaptive_clipping", True),
+            target_ess=cfg.train.get("target_ess", 20.0)        # [SOTA 2025] Adaptive Target ESS
         )
         logger.info(f"[AWR] Temperature (beta)={self.awr_calculator.beta}, Max Weight={self.awr_calculator.max_weight}")
         
@@ -472,8 +473,20 @@ class ICUSpecialistWrapper(pl.LightningModule):
             
             # [v15.4] Robusified: Calibration Mode Toggle
             sample_count = len(dataset)
-            mode = self.cfg.train.get("awr_calibration_mode", "full")
+            config_mode = self.cfg.train.get("awr_calibration_mode", "sample")
             max_samples = self.cfg.train.get("awr_max_samples", 5000)
+
+            # [SOTA FORENSIC FORCE] Override "full" if max_samples implies intention to sample
+            if max_samples < sample_count and max_samples > 0:
+                if config_mode != "sample":
+                    logger.warning(f"[AWR SYNC FORCE] Config says '{config_mode}' but max_samples={max_samples} << {sample_count}. FORCING 'sample' mode.")
+                    mode = "sample"
+                else:
+                    mode = "sample"
+            else:
+                mode = config_mode
+            
+            logger.info(f"[AWR SYNC Config] Mode='{mode}' (Orig='{config_mode}'), MaxSamples={max_samples}, Population={sample_count}")
 
             if mode == "sample":
                 if max_samples >= sample_count:

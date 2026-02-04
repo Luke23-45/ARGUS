@@ -523,13 +523,20 @@ class ClinicalNormalizer(nn.Module):
             x_norm = self._per_patient_normalize(x_processed)
         else:
             # Standard global quantile normalization
-            x_win = torch.clamp(x_processed, s_min, s_max)
-            x_norm = self._safe_normalize(x_win, s_min, s_max)
+            # [SOTA 2025: Leaky Clinical Clipping]
+            # Replace hard clamp with a 'Linear Extension' that preserves gradients.
+            # This is critical for crisis scenarios (HR > P99) which were previously blinded.
+            x_norm = self._safe_normalize(x_processed, s_min, s_max)
+            # Apply 0.1x slope for values beyond statistical bounds
+            x_norm = torch.where(x_norm > 1.0, 1.0 + (x_norm - 1.0) * 0.1, x_norm)
+            x_norm = torch.where(x_norm < -1.0, -1.0 + (x_norm + 1.0) * 0.1, x_norm)
 
         # =====================================================================
         # 5. LATENT SPACE CLAMP (Neural Stability)
         # =====================================================================
-        x_ts_norm = torch.clamp(x_norm, -1.0, 1.0)
+        # [SOTA 2025] Physiological Headroom: Expand Latent Range to [-2.0, 2.0]
+        # This prevents saturation in the downstream Transformer while keeping values manageable.
+        x_ts_norm = torch.clamp(x_norm, -2.0, 2.0)
 
         # =====================================================================
         # 6. STATIC CONTEXT HANDLING

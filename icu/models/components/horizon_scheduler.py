@@ -1,6 +1,9 @@
 import math
 import torch
 import torch.nn as nn
+import logging
+
+logger = logging.getLogger("ClinicalHorizonScheduler")
 
 class ClinicalHorizonScheduler(nn.Module):
     """
@@ -24,6 +27,8 @@ class ClinicalHorizonScheduler(nn.Module):
         self.end_gamma = end_gamma
         self.warmup_epochs = warmup_epochs
         self.ramp_epochs = ramp_epochs
+        
+        logger.info(f"Initialized v30.0 SOTA HorizonScheduler: Gamma={start_gamma}->{end_gamma}")
         
     def get_gamma(self, current_epoch: int) -> float:
         """Calculates gamma based on epoch (Legacy)."""

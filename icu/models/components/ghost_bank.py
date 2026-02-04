@@ -72,7 +72,7 @@ class SepsisGhostBank(nn.Module):
         self.register_buffer("is_full", torch.tensor(False, dtype=torch.bool))
 
     @torch.no_grad()
-    def _update_prototype(self, new_latents: torch.Tensor):
+    def _update_prototype(self, new_latents: torch.Tensor, decay_override: Optional[float] = None):
         """
         [v161.0 SOTA FIX] Global Prototype Parity (Smoking Gun #161)
         Rationale: Updates must occur identically on all ranks. If only one rank
@@ -106,7 +106,9 @@ class SepsisGhostBank(nn.Module):
         if self.prototype_ema.abs().sum() == 0:
             self.prototype_ema.copy_(batch_avg)
         else:
-            self.prototype_ema.mul_(self.prototype_ema_decay).add_(batch_avg, alpha=1 - self.prototype_ema_decay)
+            # [v2026 Phase 12 FIX] Momentum Burst (Smoking Gun #Phase12)
+            eff_decay = decay_override if decay_override is not None else self.prototype_ema_decay
+            self.prototype_ema.mul_(eff_decay).add_(batch_avg, alpha=1 - eff_decay)
         
         # Rescale to unit hypersphere for stable similarity mapping
         self.prototype_ema.copy_(F.normalize(self.prototype_ema, dim=1))
@@ -210,7 +212,8 @@ class SepsisGhostBank(nn.Module):
         labels: torch.Tensor,
         latents: torch.Tensor,
         uncertainties: Optional[torch.Tensor] = None,
-        active_mask: Optional[torch.Tensor] = None
+        active_mask: Optional[torch.Tensor] = None,
+        prototype_burst: bool = False
     ):
         """
         [v25.5 SOTA] Vectorized Diversity-Aware Update.
@@ -255,7 +258,9 @@ class SepsisGhostBank(nn.Module):
             uncertainties = torch.zeros(B, 1, device=vitals.device)
 
         # 1. Update global prototype with new incoming signal
-        self._update_prototype(latents)
+        # [v2026 Phase 12] Apply aggressive burst if requested (decay=0.1)
+        eff_decay = 0.1 if prototype_burst else None
+        self._update_prototype(latents, decay_override=eff_decay)
 
         # 2. Sequential Bootstrap for Empty Bank
         if self.size == 0:

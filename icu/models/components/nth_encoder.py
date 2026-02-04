@@ -221,7 +221,8 @@ class NTHEncoderBlock(nn.Module):
         self.grn = GatedResidualNetwork(d_model, hidden_dim)
         self.attn = NTHAttention(d_model, n_heads)
         self.drop_path = DropPath(drop_path_prob) if drop_path_prob > 0 else nn.Identity()
-        self.norm = nn.LayerNorm(d_model)
+        # [v166.0 SOTA FIX] Removed unused norm. Sub-blocks have internal norms.
+        # self.norm = nn.LayerNorm(d_model) <-- DEAD PARAM REMOVED
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # 1. Feature Processing (Residual handled inside GRN, but we add DropPath for layer-level)

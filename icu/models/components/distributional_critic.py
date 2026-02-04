@@ -63,7 +63,9 @@ class DistributionalValueHead(nn.Module):
         self.head = nn.Linear(d_model, pred_len * num_quantiles)
         
         # Expert Initialization (Orthogonal with clinical-safe gain)
-        nn.init.orthogonal_(self.head.weight, gain=0.01)
+        # [v7.1 SOTA FIX] Unlocked Head: Increased gain from 0.01 to 1.0 to resolve
+        # 'Dead Man' initialization pattern and restore Advantage range.
+        nn.init.orthogonal_(self.head.weight, gain=1.0)
         nn.init.zeros_(self.head.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -103,15 +105,17 @@ class DistributionalValueHead(nn.Module):
         if tau == 0.5:
             return quantiles.mean(dim=-1)
             
-        # [v4.2 SOTA] Quantile-to-Expectile weighted mapping
-        # For pessimistic RL (tau > 0.5), we weight LOWER quantiles more heavily.
+        # [v2026 Phase 12 FIX] Medical Consensus (Expectile Parity).
+        # Rationale: Standard tau=0.7 summary creates a 'Phantom Advantage' scissor 
+        # when trained with IQL 0.7-loss. We average the tau-weights and uniform 
+        # weights for a robust, consensus-driven medical estimate.
         N = self.num_quantiles
-        # Midpoint quantiles [0.02, 0.06... 0.98]
         taus_q = torch.linspace(1/(2*N), 1 - 1/(2*N), N, device=quantiles.device)
         
-        # Pessimistic Weights: Higher weight on LOWER quantiles when tau > 0.5
-        # This is the key insight: taus_q < 0.5 are the "danger zone" (lower outcomes)
-        weights = torch.where(taus_q < 0.5, tau, 1 - tau)  # Flipped from before
+        tau_w = torch.where(taus_q < 0.5, tau, 1 - tau)
+        uni_w = torch.ones_like(taus_q)
+        # 50/50 Consensus (Pessimistic + Neutral)
+        weights = 0.5 * (tau_w / tau_w.sum()) + 0.5 * (uni_w / uni_w.sum())
         weights = weights / weights.sum()
         
         return (quantiles * weights.view(1, 1, -1)).sum(dim=-1)

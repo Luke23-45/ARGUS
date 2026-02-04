@@ -26,34 +26,35 @@ class DynamicThresholding(nn.Module):
         abs_x = torch.abs(x)
         flat_abs = abs_x.view(B, -1)
         
-        # [FIX] torch.quantile requires float32 or float64.
-        # Calculate s-th percentile. Detach to avoid graph retention.
-        batch_s = torch.quantile(flat_abs.detach().float(), self.percentile, dim=1).mean()
+        # [v168.0 SOTA FIX] Per-Sample Manifold Preservation (Smoking Gun #67)
+        # Rationale: Using batch-average squashing causes 'Gradient Bullying'.
+        # One bad sample rescales the whole batch.
+        # Fix: Calculate quantile PER SAMPLE.
+        sample_s = torch.quantile(flat_abs.detach().float(), self.percentile, dim=1) # [B]
         
-        # [v67.0 SOTA FIX] DDP Governance Consensus (Smoking Gun #67)
-        # Rationale: EMA buffers MUST be identical across ranks to ensure 
-        # consistent manifold scaling, otherwise gradients will 'fight' after AllReduce.
+        # [v67.0 SOTA FIX] DDP Governance Consensus
         if torch.distributed.is_initialized():
-            torch.distributed.all_reduce(batch_s, op=torch.distributed.ReduceOp.SUM)
-            batch_s /= torch.distributed.get_world_size()
+            # Sync the batch-wide mean for EMA stability, but keep local s for scaling
+            batch_avg_s = sample_s.mean()
+            torch.distributed.all_reduce(batch_avg_s, op=torch.distributed.ReduceOp.SUM)
+            batch_avg_s /= torch.distributed.get_world_size()
+        else:
+            batch_avg_s = sample_s.mean()
 
-        # [v27.0 FIX] EMA smoothing for gradient stability
-        # [v2026 SOTA] Accumulation Guard: Only update on stepping batches during training.
+        # Update EMA for trend monitoring (Scalar)
         if update_ema and self.training:
             with torch.no_grad():
-                self.ema_s.mul_(self.ema_decay).add_(batch_s * (1 - self.ema_decay))
+                self.ema_s.mul_(self.ema_decay).add_(batch_avg_s * (1 - self.ema_decay))
         
-        # Scale factor using smoothed percentile
-        s = torch.clamp(self.ema_s, min=self.threshold)
-        scale = self.threshold / s
+        # Scaling logic: x_scaled = x * (threshold / max(threshold, s_sample))
+        # This protects against outliers without squashing valid high-magnitude signals.
+        s_eff = torch.clamp(sample_s, min=self.threshold)
+        scale = self.threshold / s_eff # [B]
         
-        # Handle different tensor dimensions
-        if x.dim() == 3:
-            return x * scale.view(1, 1, 1)
-        elif x.dim() == 2:
-            return x * scale.view(1, 1)
-        else:
-            return x * scale
+        # Handle different tensor dimensions via broadcasting
+        # [B] -> [B, 1] or [B, 1, 1]
+        scale_view = scale.view(B, *([1] * (x.dim() - 1)))
+        return x * scale_view
 
 class ForensicStabilityAuditor(nn.Module):
     """

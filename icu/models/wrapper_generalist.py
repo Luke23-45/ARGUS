@@ -279,7 +279,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
             gamma=cfg.train.get("awr_gamma", 0.99),
             adaptive_beta=cfg.train.get("adaptive_beta", True),
             adaptive_clipping=cfg.train.get("adaptive_clipping", True),
-            beta_momentum=cfg.train.get("awr_momentum", 0.999) # [SOTA] Stabilize AWR for long epochs
+            beta_momentum=cfg.train.get("awr_momentum", 0.999), # [SOTA] Stabilize AWR for long epochs
+            target_ess=cfg.train.get("target_ess", 20.0)        # [SOTA 2025] Adaptive Target ESS
         )
         
         # =====================================================================
@@ -395,6 +396,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
             similarity_threshold=cfg.train.get("ghost_sim_threshold", 0.98)
         )
         
+        
+        # [v177.3 SOTA] Multi-Task Gradient Pressure EMAs
+        # Rationale: Track gradient magnitudes for Physics vs Diffusion to ensure 1:1 balance.
+        # Registered as buffers to ensure persistence across resumption.
+        self.register_buffer("phys_grad_ema", torch.tensor(1.0))
+        self.register_buffer("diff_grad_ema", torch.tensor(1.0))
         
         # [v4.0 PERFECT] Manifold Projections
         # [REMOVED] self.expert_state_head = nn.Linear(cfg.model.d_model, 1)
@@ -974,13 +981,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
             # Correct Implementation: Multi-Branch Projection
             # We must identify which branch is which.
-            def project_aux_against_fnd_ema(grad_aux):
-                # grad_aux: [B, T, D] or [B, D]
-                if self._fnd_grad_ema is not None:
-                    # [PMS] Shape-Invariant Projection
-                    # We project the aux gradient against the stable foundation direction
-                    return LinearManifoldSentinel.project(grad_aux, self._fnd_grad_ema)
-                return grad_aux
+            def throttle_aux_gradient(grad_aux):
+                # [SOTA FIX] Decoupled Signal (Smoking Gun #Phase9)
+                # Rationale: MGP Projection (PCGrad-style) suppresses ~80% of the Sepsis 
+                # signal if it conflicts with the foundation trend. 
+                # For sparse Aux tasks, we use simple throttling (0.2x) to protect 
+                # the backbone while allowing the task to learn independently.
+                return grad_aux * 0.2
 
             def update_fnd_ema(grad_fnd):
                 # grad_fnd: [B, T, D]
@@ -1015,7 +1022,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 ctx_seq.register_hook(update_fnd_ema)
             
             if ctx_aux.requires_grad:
-                ctx_aux.register_hook(project_aux_against_fnd_ema)
+                ctx_aux.register_hook(throttle_aux_gradient)
             
             # [v17.3] Omega Summoning: Constant Clinical Pressure
             # Every batch now has sepsis signal via the Summoned Ghosts.
@@ -1195,6 +1202,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
             weights_awr, diag = self.awr_calculator.calculate_weights(
                 advantages, values=target_values, rewards=returns, mask=f_mask
             )
+            
+            # [v7.3 SOTA FIX] AWR Warmup (The "Cognitive Settle")
+            # Rationale: Advantage weighting on a random Value Head causes 'Selection Panic'.
+            # We enforce uniform weights (1.0) for the first 1000 steps to let V(s) settle.
+            # Scaling ensures consistency across different batch sizes/devices.
+            n_batches = self.trainer.num_training_batches
+            awr_warmup = ScalingSteward.get_steps(1000, n_batches)
+            if self.global_step < awr_warmup:
+                weights_awr = torch.ones_like(weights_awr)
             
             # [v21.2 SOTA FIX] Global AWR Normalization (Smoking Gun #185)
             # Rationale: Normalizing weights locally causes magnitude divergence 
@@ -1419,13 +1435,36 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 self.log("gov/stability_factor", stability_factor, on_step=True)
                 self.log("gov/gamma_effective", 1.0 + (self.risk_aware_loss.gamma_neg - 1.0) * stability_factor, on_step=True)
 
-            # [Point 2] Adaptive Graduate Dynamics
+            # [SOTA RECOVERY v3.2] Configurable Generative Ramping
+            # Rationale: Enables 100x gradient recovery (1e-4 -> 1e-2) without initial shock.
+            # 1. Access stabilized loss scales
             with torch.no_grad():
                 d_ema = self.loss_scaler.loss_emas[0]
                 a_ema = self.loss_scaler.loss_emas[2]
-                alpha = (a_ema / (d_ema + 1e-8)).clamp(min=1e-4, max=1.0)
             
-            loss_dict['diffusion'] = diff_loss * alpha
+            # [SOTA v4.0] Raised Alpha Floor (Gradient Starvation Prevention)
+            # Rationale: alpha_min=0.01 allows 100x gradient suppression.
+            # Raising to 0.1 limits suppression to 10x, preserving diffusion signal.
+            # [SOTA v4.1] Raised Alpha Floor (Phase 9 Recovery)
+            # Rationale: alpha_min=0.1 allowed 10x suppression which caused
+            # stagnation after architectural shifts. 0.5 ensures backbone priority.
+            alpha_min = getattr(self.cfg, "alpha_min", 0.5)
+            raw_alpha = (a_ema / (d_ema + 1e-8))
+            # [SOTA v4.0] Upper bound at 1.5 to allow boosting when diffusion is underweighted
+            stabilized_alpha = torch.clamp(raw_alpha, min=alpha_min, max=1.5)
+            
+            # 2. Apply Warmup Ramp
+            warmup_epochs = max(1, getattr(self.cfg, "alpha_warmup_epochs", 5))
+            curr_epoch = float(getattr(self, "current_epoch", 0))
+            ramp = min(1.0, curr_epoch / float(warmup_epochs))
+            alpha_sota = alpha_min * (1.0 - ramp) + stabilized_alpha * ramp
+            
+            # [SOTA v4.0] Critical Telemetry: Alpha Visibility
+            self.log("train/alpha_sota", alpha_sota.item() if isinstance(alpha_sota, torch.Tensor) else alpha_sota, on_step=True, prog_bar=True)
+            self.log("train/d_ema", d_ema.item() if isinstance(d_ema, torch.Tensor) else d_ema, on_step=True)
+            self.log("train/a_ema", a_ema.item() if isinstance(a_ema, torch.Tensor) else a_ema, on_step=True)
+            
+            loss_dict['diffusion'] = diff_loss * alpha_sota
             loss_dict['bgsl'] = l_bgsl
             loss_dict['tcb'] = l_tcb
             
@@ -1434,10 +1473,33 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Note: We use curr_sigma_scale curriculum here.
             phys_loss = self.model.phys_loss(x0_approx) + self.safety_envelope(x0_clinical, risk_coef, sigma_scale=self.curr_sigma_scale)
             
-            # [v27.1 FIX] Gradual Physics Clamp Relaxation (Step-Invariant Abyssal #310)
-            phys_loss = torch.clamp(phys_loss, max=float(self.curr_phys_clamp))
+            # [SOTA RECOVERY v3.2] Physics Gradient Normalization (DDP-Safe)
+            # Rationale: Normalize physics loss by global running gradient magnitude to match Diffusion.
+            # Prevents "Bullying" (52:1 ratio) and enforces 1:1 pressure across the entire cluster.
+            phys_loss_raw = torch.clamp(phys_loss, max=float(self.curr_phys_clamp))
+            
+            # Access DDP-Synchronized EMAs from the scaler
+            with torch.no_grad():
+                d_ema_sync = self.loss_scaler.loss_emas[0]
+                p_ema_sync = self.loss_scaler.loss_emas[6]
                 
-            loss_dict['phys'] = phys_loss
+            # [SOTA v4.0] Adaptive Physics Scaling with Dynamic Range
+            # Rationale: Fixed [0.1, 10] clamp can permanently mute physics if early spikes
+            # poison the EMA ratio. We use step-based clamp relaxation.
+            phys_scale_raw = (d_ema_sync + 1e-8) / (p_ema_sync + 1e-8)
+            
+            # Dynamic Clamp: Starts tight [0.2, 5.0], relaxes to [0.1, 10.0] after 1000 steps
+            warmup_steps = 1000
+            warmup_progress = min(1.0, self.global_step / warmup_steps)
+            clamp_min = 0.2 - (0.1 * warmup_progress)  # 0.2 -> 0.1
+            clamp_max = 5.0 + (5.0 * warmup_progress)  # 5.0 -> 10.0
+            
+            phys_scale = torch.clamp(phys_scale_raw, min=clamp_min, max=clamp_max)
+            # [SOTA v4.0] Critical Telemetry: Physics Visibility
+            self.log("train/phys_scale", phys_scale.item() if isinstance(phys_scale, torch.Tensor) else phys_scale, on_step=True, prog_bar=True)
+            self.log("train/p_ema", p_ema_sync.item() if isinstance(p_ema_sync, torch.Tensor) else p_ema_sync, on_step=True)
+            
+            loss_dict['phys'] = phys_loss_raw * phys_scale
 
             # [v177.0 SOTA FIX] Accumulation-Aware Scaling (Smoking Gun #177)
             # Rationale: EMA updates must only occur on the stepping batch.
@@ -1645,6 +1707,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
                     # 6. Cycle Reset
                     self.grad_ref_buffer.zero_()
             else:
+                # [SOTA RECOVERY v3.2] Runtime Gradient Fix
+                # Rationale: Restoring total_loss_bwd to ensure correct gradient scaling 
+                # (1/acc_batches) when AGEM is bypassed.
                 self.manual_backward(total_loss_bwd)
 
 
@@ -2056,12 +2121,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
                      dim=1
                  )
                  
+                 # [v2026 Phase 12] Metabolic Momentum Burst (Warmup: 1000 steps)
+                 # Rapidly ingests new 'Leaky' representation space after metamorphosis.
                  self.ghost_bank.update(
                     vitals=g_v.reshape(-1, T, F_feat),
                     masks=g_m.reshape(-1, T, F_feat),
-                    labels=g_lbl.squeeze(1).long(), # Cast back to 1D long
+                    labels=g_lbl.squeeze(1).long(),
                     latents=g_lat,
-                    uncertainties=g_unc # Keep as [N, 1]
+                    uncertainties=g_unc,
+                    prototype_burst=(self.global_step < 1000)
                  )
             
             # Global Rank 0 Logging (SOTA: Pass objects, not .compute(), to avoid sync bottleneck)
@@ -2151,6 +2219,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
             value_preds = out.get("pred_value", None)
             
             if logits is not None:
+
+                
                 # [v14.2 SOTA FIX] Direct Probability Extraction
                 # Rationale: Using probabilities computed by the head ensures 
                 # correct activation (Sigmoid vs Softmax) is used.
@@ -2349,6 +2419,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 weights = torch.tensor([0.25, 0.5, 0.25], device=pred_safe.device).view(1, 1, 3)
                 
                 # Iterate 3 times for aggressive high-freq rejection
+                # [SOTA RECOVERY v3.2] Dual-Stream Telemetry
+                # Rationale: Log raw logs for OOD detection, but use smoothed for metrics.
+                raw_pred = pred_safe.clone().detach()
+                
+                # Apply Smoothing for Metric Stability
                 for _ in range(3):
                     p_pad = F.pad(pred_safe.permute(0, 2, 1), (1, 1), mode='replicate')
                     B, C, T = p_pad.shape
@@ -2692,7 +2767,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
         
         # Ensure AWR Stats are synced (if resumed, they are already in the buffer)
         if self.awr_calculator.stats_initialized:
-             logger.info(f"✅ [RESUME] AWR Engine Online: mu={self.awr_calculator.adv_mean:.4f}, sigma={self.awr_calculator.adv_std:.4f}")
+            if hasattr(self.awr_calculator, 'adv_mean'):
+                logger.info(f"✅ [RESUME] AWR Engine Online: mu={self.awr_calculator.adv_mean.item():.4f}, sigma={self.awr_calculator.adv_std.item():.4f}")
 
         # =====================================================================
         # 1.1 MANUAL OPTIMIZER RESTORATION (The Anti-Trauma Fix)
@@ -2846,9 +2922,22 @@ class ICUGeneralistWrapper(pl.LightningModule):
             
             # [v15.4] Robusified: Calibration Mode Toggle
             num_samples = len(dataset)
-            mode = self.cfg.train.get("awr_calibration_mode", "full")
+            # [SOTA FIX] Default to "sample" to prevent 15-minute stalls on missing keys
+            config_mode = self.cfg.train.get("awr_calibration_mode", "sample")
             # [SOTA FIX] Population Coverage Boost (10k -> 60k)
             max_samples = self.cfg.train.get("awr_max_samples", 60000)
+            
+            # [SOTA FORENSIC FORCE] Override "full" if max_samples implies intention to sample
+            if max_samples < num_samples and max_samples > 0:
+                if config_mode != "sample":
+                    logger.warning(f"[AWR FORCE] Config says '{config_mode}' but max_samples={max_samples} << {num_samples}. FORCING 'sample' mode.")
+                    mode = "sample"
+                else:
+                    mode = "sample"
+            else:
+                mode = config_mode
+            
+            logger.info(f"[AWR Config] Mode='{mode}' (Orig='{config_mode}'), MaxSamples={max_samples}, Population={num_samples}")
 
             if mode == "sample":
                 if max_samples >= num_samples:

@@ -154,17 +154,18 @@ class ICUAdvantageCalculator(nn.Module):
         self, 
         beta: float = 0.5,              # AWR Temperature (0.3-1.0 for clinical)
         gamma: float = 0.99,            # Discount Factor (~48h horizon)
-            lambda_gae: float = 0.95,       # GAE Variance-Bias trade-off
-            max_weight: float = 20.0,       # Hard clip for AWR weights
-            sparse_reward_scale: float = 2.0,   # [v40.0 SOTA] Reduced to prevent drowning
-            reward_shaping_coef: float = 0.5,   # [v40.0 SOTA] Increased for better guidance
-            focal_alpha: float = 1.0,      # [v41.0 SOTA] 2x Death weight (Clinical Reality)
-            qsofa_thresholds: Optional[Dict[str, float]] = None,  # Override defaults
-            adaptive_beta: bool = True,     # [SOTA 2025] Enabled by default for fresh start
-            adaptive_clipping: bool = True, # [SOTA 2025] Enabled by default for fresh start
-            beta_momentum: float = 0.90,    # [SOTA] Default momentum (exposed for tuning)
-            beta_gain: float = 2.0          # [v116.0 SOTA FIX] PI-style gain for faster adaptation
-        ):
+    lambda_gae: float = 0.95,       # GAE Variance-Bias trade-off
+    max_weight: float = 20.0,       # Hard clip for AWR weights
+    sparse_reward_scale: float = 2.0,   # [v40.0 SOTA] Reduced to prevent drowning
+    reward_shaping_coef: float = 0.5,   # [v40.0 SOTA] Increased for better guidance
+    focal_alpha: float = 1.0,      # [v41.0 SOTA] 2x Death weight (Clinical Reality)
+    qsofa_thresholds: Optional[Dict[str, float]] = None,  # Override defaults
+    adaptive_beta: bool = True,     # [SOTA 2025] Enabled by default for fresh start
+    adaptive_clipping: bool = True, # [SOTA 2025] Enabled by default for fresh start
+    beta_momentum: float = 0.90,    # [SOTA] Default momentum (exposed for tuning)
+    beta_gain: float = 2.0,         # [v116.0 SOTA FIX] PI-style gain for faster adaptation
+    target_ess: float = 30.0        # [v117.0 SOTA FIX] Raised target for better diversity
+):
         """
         Initialize the Advantage Calculator.
         
@@ -180,6 +181,7 @@ class ICUAdvantageCalculator(nn.Module):
             adaptive_beta: Enable dynamic beta scaling (std-based)
             adaptive_clipping: Enable dynamic weight clipping (quantile-based)
             beta_momentum: Momentum for adaptive beta updates (0.90-0.999)
+            target_ess: Target Effective Sample Size (default 20.0)
         """
         super().__init__()
         self.register_buffer("beta", torch.tensor(1.0).float()) # Fresh Start: Default to 1.0
@@ -189,6 +191,7 @@ class ICUAdvantageCalculator(nn.Module):
         self.sparse_scale = sparse_reward_scale
         self.shaping_coef = reward_shaping_coef
         self.focal_alpha = focal_alpha
+        self.target_ess = target_ess
         
         # [v2025 SOTA] State Buffers for DDP Synchronization
         self.register_buffer("ess_buffer", torch.zeros(1))
@@ -205,11 +208,14 @@ class ICUAdvantageCalculator(nn.Module):
         # [SOTA v2026] Internal Scaled Constants (Initialized with Defaults for 200 steps)
         self.base_beta_momentum = float(beta_momentum) # [v26.1 FIX] Store Base for Idempotency
         self.ess_ema_decay = 0.95
-        self.beta_growth_factor = 1.5
+        self.beta_growth_factor = 2.0  # [Phase 9] Faster recovery
         self.beta_growth_cooldown = 0  # [v27.1] Cooldown to prevent runaway growth
         
-        self.min_beta = 0.1            # [v35.0 SOTA FIX] Raised floor from 0.01 to prevent selection explosion
-        self.max_beta = 10.0
+        # [v5.1 SURGICAL PATCH] Selection Recovery Floor (Phase 9)
+        # Rationale: min_beta=1.0 still allows extreme peakedness (~0.5% ESS).
+        # Lifting to 2.0 ensures at least ~5% diversity in typical batches.
+        self.min_beta = 2.0            
+        self.max_beta = 20.0
         
         # [v29.1 SOTA FIX] Whitening Momentum Stability (Abyssal #1)
         # [v35.0 SOTA FIX] Faster Adaptation: 0.999 -> 0.99 (Smoking Gun #35)
@@ -560,7 +566,7 @@ class ICUAdvantageCalculator(nn.Module):
                  rewards = rewards * src_mask.any(dim=-1).float()
 
         return rewards * 10.0
-
+        
 
     # =========================================================================
     # GENERALIZED ADVANTAGE ESTIMATION (GAE)
@@ -866,15 +872,110 @@ class ICUAdvantageCalculator(nn.Module):
             advantages = torch.clamp(advantages, max=p99)
         
         # Z-Score normalization: A ~ N(0, 1)
-        # Applied to all elements (the mask will zero out padding later if needed)
-        norm_adv = (advantages - mu) / sigma
+        # [v167.0 SOTA FIX] Synergistic Batch-Local Normalization (BLN)
+        # Rationale: Mix Global Z-Score with Batch Z-Score to prevent collapse (ESS < 2.0).
+        # Fixes "Single Sample Dominance" in high-variance batches.
+        
+        # 1. Global Z-Score (Stability)
+        z_global = (advantages - mu) / (sigma + 1e-5)
+        
+        # 2. Batch-Local Z-Score (Reactivity)
+        if adv_flat.numel() > 1:
+            b_mean = adv_flat.mean()
+            b_std = adv_flat.std().clamp(min=1e-5)
+            z_batch = (advantages - b_mean) / b_std
+        else:
+            z_batch = z_global
+            
+        # 3. Hybrid Mixing (80% Global / 20% Batch)
+        # Keeps alignment with global value scale while ensuring >0 gradients for best local samples.
+        alpha_bln = 0.8
+        norm_adv = (alpha_bln * z_global) + ((1 - alpha_bln) * z_batch)
+        
+        # 4. FP16 Safety Clamp (prevent exp explosion)
+        norm_adv = norm_adv.clamp(min=-5.0, max=5.0)
         
         # [SOTA 2025] Z-Score Normalization (Unclipped)
         # We no longer hard-clamp at ±2.0 to preserve heavy-tailed 'clinical crash' signals.
         # Stability is instead managed via Exponential Tempering and Hard-Weight Clipping.
         
         
-        # --- 2. Scaled Advantage ---
+        # --- 2. Scaled Advantage (Adaptive ESS) ---
+        # [SOTA RECOVERY v3.2] Adaptive Beta Search
+        # Rationale: Dynamically anneal temperature to guarantee broad sampling (ESS >= 20.0).
+        # [v4.0] Reduced Target ESS (Selection Pressure Recovery)
+        # Rationale: target_ess=20 forces beta too high (3.0-4.2), eliminating advantage signal.
+        # [v5.0 SURGICAL PATCH] Target 10% of batch size (min 5.0 count)
+        target_ess = max(5.0, self.target_ess * 0.1)
+        
+        # [SOTA Phase 10 FIX] Consensus-AWR (Smoking Gun #3)
+        # Rationale: DDP ranks must apply identical selection pressure (Beta) to 
+        # prevent 'Noisy Rank Dominance'.
+        
+        # 1. Prepare data for search (Mask-aware)
+        if mask is not None:
+             # advantages is [B, T], mu/sigma are scalars
+             norm_flat = (advantages - mu) / sigma
+             # Mask out invalid steps for count/sums
+             norm_flat = norm_flat.view(-1)[mask.view(-1) == 0]
+        else:
+             norm_flat = norm_adv.view(-1)
+             
+        # Definition: Global ESS = (sum(w))^2 / sum(w^2) across all ranks
+        def get_consensus_ess(temperature):
+             t = max(temperature, 1e-3)
+             # Local weights (not sum-to-1)
+             w_local = torch.exp(norm_flat / t)
+             
+             l_sum = w_local.sum()
+             l_sq_sum = w_local.pow(2).sum()
+             l_count = torch.tensor(norm_flat.numel(), device=w_local.device, dtype=w_local.dtype)
+             
+             if dist.is_initialized():
+                  stats = torch.stack([l_sum, l_sq_sum, l_count])
+                  dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                  g_sum, g_sq_sum, g_count = stats[0], stats[1], stats[2]
+             else:
+                  g_sum, g_sq_sum, g_count = l_sum, l_sq_sum, l_count
+                  
+             if g_count < 1: return 1.0
+             # ESS formula: (SumW)^2 / Sum(W^2)
+             return (g_sum.pow(2) / (g_sq_sum + 1e-12)).item()
+
+        # Update target_ess to count-safe value
+        target_ess_val = max(5.0, self.target_ess)
+
+        # Check current ESS
+        current_temp = self.beta.item()
+        
+        # [SOTA v4.1] Bidirectional Beta Adaptation
+        # Rationale: Previous logic only increased beta (heating) but never decreased it (cooling).
+        # This caused beta to get stuck at high values (~4.0) yielding uniform weights (wa_mean=1.0).
+        if True: # Ensure we always check consensus if updated
+            current_ess = get_consensus_ess(current_temp)
+            
+            if current_ess < target_ess_val:
+                 # Case 1: Too Peaky (ESS too low) -> Search UP (Flatten/Heat)
+                 lo, hi = current_temp, 20.0 # Cap max temp at 20.0
+                 for _ in range(10):
+                      mid = (lo + hi) / 2
+                      if get_consensus_ess(mid) >= target_ess_val: # Satisfied, try to be greedier (lower temp)
+                           hi = mid 
+                      else: # Still too peaky, need higher temp
+                           lo = mid
+                 current_temp = hi
+            elif current_ess > target_ess_val * 1.5:
+                 # Case 2: Too Flat (ESS too high) -> Decay DOWN (Sharpen/Cool)
+                 # Slowly restore selection pressure if we have excess sample diversity
+                 current_temp = max(0.5, current_temp * 0.98)
+
+            # [SOTA v4.0] Beta Floor: Prevent Runaway Flattening
+            # [v5.0 SURGICAL PATCH] Lifted floor to 1.0 for sample diversity
+            current_temp = max(self.min_beta, min(current_temp, self.max_beta))
+            
+            # Amortized Update: Persist the adaptation
+            self.beta.fill_(current_temp)
+             
         scaled_adv = norm_adv / self.beta
         
         # --- 3. SOTA Numerical Stability: Local-Global Robust AWR ---
@@ -945,9 +1046,9 @@ class ICUAdvantageCalculator(nn.Module):
                 g_sum_w, g_sum_w_sq, g_clip_count, g_numel = sum_w, sum_w_sq, clipping_count, float(numel_local)
 
             # Global Effective Sample Size (ESS)
-            # [SOTA BUG FIX] 'ess' is already normalized to [0, 1] by 'g_numel' in denominator.
-            # Do NOT divide by g_numel again.
-            ess = (g_sum_w ** 2) / (g_sum_w_sq * g_numel + 1e-8)
+            # [SOTA BUG FIX] Return ESS as Count (1..N), not Ratio (1/N..1).
+            # Consumers (Probes/Logs) expect Count.
+            ess = (g_sum_w ** 2) / (g_sum_w_sq + 1e-8)
             self.ess_buffer.fill_(ess) 
             
             # Global Clipping Rate
@@ -1039,10 +1140,12 @@ class ICUAdvantageCalculator(nn.Module):
                     new_beta = self.beta * correction
                     beta_raw = new_beta.item()
                     
-                    # [v116.0 SOTA FIX]: Remove the 0.99 floor. 
-                    # Use the momentum specified in config (default 0.90) for faster adaptation.
-                    mom = self.beta_momentum
-                    self.beta.copy_((mom * self.beta) + ((1.0 - mom) * new_beta))
+                    # [SOTA 2025: Phase 11 Metamorphosis]
+                    # Lift the beta floor to 1.5 to prevent noisy selection peakiness.
+                    # Increased momentum to 0.999 to stabilize pressure transitions.
+                    mom = 0.999 
+                    updated_beta = (mom * self.beta) + ((1.0 - mom) * new_beta)
+                    self.beta.copy_(torch.clamp(updated_beta, min=1.5))
                     
                     # [PHASE 47] Unfreezing Telemetry
                     # print(f"[AWR DEBUG] ESS={current_ess:.4f} | Target={target_ess} | Err={error_ess:.4f} | Corr={correction:.4f} | Beta: {self.beta.item():.4f}")
@@ -1053,7 +1156,8 @@ class ICUAdvantageCalculator(nn.Module):
                 # [v27.1 FIX] ESS Safety Floor with Cooldown
                 # Prevents runaway multiplicative growth (166 clamps/200 steps → ~20)
                 if current_ess < 0.05 and self.beta_growth_cooldown == 0:
-                    self.beta.copy_(self.beta * self.beta_growth_factor)
+                    # [SOTA] Emergency growth still allowed but anchored by floor
+                    self.beta.copy_(torch.clamp(self.beta * self.beta_growth_factor, min=1.5))
                     self.beta_growth_cooldown = 10  # Cooldown: 10 steps between emergency growths
                 else:
                     self.beta_growth_cooldown = max(0, self.beta_growth_cooldown - 1)
@@ -1064,7 +1168,10 @@ class ICUAdvantageCalculator(nn.Module):
                 ema_d = self.ess_ema_decay
                 self.ess_momentum_buffer.copy_(ema_d * self.ess_momentum_buffer + (1.0 - ema_d) * current_ess)
                 
-                self.beta.copy_(self.beta.clamp(min=self.min_beta, max=self.max_beta))
+                # [v7.2 SOTA FIX] IronFloor: Strict runtime clamp
+                # Rationale: Persistence and config overrides were bypassing the Phase 6
+                # min_beta=1.0 floor, causing ESS collapse in DDP environments.
+                self.beta.clamp_(min=self.min_beta, max=self.max_beta)
 
                 
             # B. Adaptive Clipping (Target = 95th Percentile)
