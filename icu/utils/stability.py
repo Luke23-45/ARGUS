@@ -89,7 +89,7 @@ class ForensicStabilityAuditor(nn.Module):
             true_sigma = 2.0 * (p_processed - s_min) / denom - 1.0
             
             phys_violations = (torch.abs(true_sigma) > 2.5).float().mean()
-            max_sigma = torch.abs(true_sigma).max().item()
+            max_sigma = torch.abs(true_sigma).max()
 
         # 2. Honest OOD Check
         ood_results = {}
@@ -102,8 +102,8 @@ class ForensicStabilityAuditor(nn.Module):
             
         return {
             "forensic/max_sigma": max_sigma,
-            "forensic/phys_violation_rate": phys_violations.item(),
-            "forensic/ood_rate": ood_results.get("ood_rate", 0.0),
-            "forensic/safe_trajectories_avg": ood_results.get("safe_count", 0.0),
-            "forensic/is_stable": float(max_sigma < 5.0)
+            "forensic/phys_violation_rate": phys_violations,
+            "forensic/ood_rate": ood_results.get("ood_rate", torch.tensor(0.0, device=device)),
+            "forensic/safe_trajectories_avg": ood_results.get("safe_count", torch.tensor(0.0, device=device)),
+            "forensic/is_stable": (max_sigma < 5.0).float()
         }

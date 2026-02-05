@@ -58,7 +58,7 @@ class CAGrad(torch.optim.Optimizer):
         # 1. Save current accumulated gradients if we are in an accumulation window
         current_grads = None
         if accumulate:
-            current_grads = self._get_flat_grad().clone()
+            current_grads = self._get_flat_grad() # [FIX] cat() already clones
 
         # 2. Capture Task Gradients
         task_grads = []
@@ -68,7 +68,7 @@ class CAGrad(torch.optim.Optimizer):
                 backward_fn(loss, retain_graph=True)
             else:
                 loss.backward(retain_graph=True)
-            task_grads.append(self._get_flat_grad().clone())
+            task_grads.append(self._get_flat_grad()) # [FIX] cat() already clones
 
         # 3. Perform Surgery (Math remains same)
         g = torch.stack(task_grads)

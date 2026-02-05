@@ -83,7 +83,7 @@ sys.path.append(str(ROOT_DIR))
 
 # --- Project Imports ---
 from icu.models.wrapper_apex import ICUSpecialistWrapper
-from icu.datasets.dataset import ICUSotaDataset, robust_collate_fn, ensure_data_ready
+from icu.datasets.dataset import ICUSotaDataset, robust_collate_fn, ensure_data_ready, create_sepsis_aware_sampler
 from icu.utils.callbacks import get_sota_callbacks, EMACallback
 from icu.utils.train_utils import (
     set_seed, 
@@ -138,6 +138,10 @@ def load_checkpoint_robust(
                     ema_cb = cb
                     break
             
+            if ema_cb:
+                # Guarantee EMACallback is initialized for system
+                ema_cb._init_ema(system)
+
             if ema_cb and "ema_state_dict" in checkpoint:
                 # Force-load EMA state dict
                 ema_cb.on_load_checkpoint(trainer, system, checkpoint)
@@ -247,10 +251,19 @@ class ICUSpecialistDataModule(pl.LightningDataModule):
     def train_dataloader(self) -> DataLoader:
         """Returns the training DataLoader."""
         num_workers = self.cfg.train.num_workers
+        
+        # [v2.0 SOTA FIX] Plug in the Sepsis-Aware Stateful Sampler
+        # Rationale: Direct shuffling (random) often misses sparse clinical events.
+        sampler = create_sepsis_aware_sampler(
+            self.train_ds, 
+            sepsis_boost_factor=self.cfg.train.get("sepsis_boost_factor", 10.0),
+            seed=self.cfg.get("seed", 42)
+        )
+        
         return DataLoader(
             self.train_ds,
             batch_size=self.cfg.train.batch_size,
-            shuffle=True,
+            sampler=sampler,
             num_workers=num_workers,
             collate_fn=robust_collate_fn,
             pin_memory=self.pin_memory,

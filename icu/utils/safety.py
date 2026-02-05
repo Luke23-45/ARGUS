@@ -86,9 +86,9 @@ class OODGuardian:
 
         # 2. SBP Heuristic (requires IDX_SBP to exist)
         if tensor.shape[-1] > IDX_SBP:
-            sbp_max = tensor[..., IDX_SBP].max().item()
-            if sbp_max < 30.0: 
-                return True
+            # [v14.1 PERFORMANCE FIX] Avoid .item() in hot path
+            # If ANY value is > 30, it's likely clinical.
+            return (tensor[..., IDX_SBP] < 30.0).all()
         
         return False   
 

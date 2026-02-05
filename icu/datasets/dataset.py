@@ -36,6 +36,7 @@ from typing import Dict, List, Optional, Any, Tuple, Union
 from torch.utils.data import Dataset, default_collate, Sampler, WeightedRandomSampler
 from huggingface_hub import snapshot_download
 from tqdm import tqdm
+from icu.utils.train_utils import get_rank
 
 # --- Configuration & Constants ---
 logger = logging.getLogger("APEX_Data_Frontier")
@@ -529,11 +530,82 @@ def robust_collate_fn(batch: List[Optional[Dict]]) -> Dict[str, torch.Tensor]:
 # 4. STRATIFIED SAMPLER (Gap 5 Fix)
 # ==============================================================================
 
+# ==============================================================================
+# 5. SAMPLERS (State-Persistent)
+# ==============================================================================
+
+class StatefulWeightedSampler(Sampler):
+    """
+    SOTA State-Persistent Weighted Sampler (v2.1 - DDP Hermetic).
+    Rationale: Standard WeightedRandomSampler resets on resumption.
+    This version uses a rank-aware deterministic generator and persistent 
+    epoch/consumed counters for exact DDP-safe resumption.
+    """
+    def __init__(self, weights, num_samples, replacement=True, seed=42):
+        super().__init__(None)
+        self.weights = torch.as_tensor(weights, dtype=torch.double)
+        self.num_samples = num_samples
+        self.replacement = replacement
+        self.seed = seed
+        self.epoch = 0
+        self.consumed = 0
+        self.rank = get_rank() # safe utility import assumed
+        self.indices = None
+
+    def set_epoch(self, epoch: int):
+        """Called by Trainer at start of epoch."""
+        self.epoch = epoch
+        self.indices = None
+        self.consumed = 0
+
+    def __iter__(self):
+        if self.indices is None:
+            # [SOTA 2025] Deterministic multi-gpu branching
+            # We seed with (seed + epoch + rank) to ensure 
+            # 1. Deterministic reconstruction after crash
+            # 2. Unique data stream per GPU rank
+            g = torch.Generator()
+            # Large multiplier for rank to prevent seed overlap between epochs
+            g.manual_seed(self.seed + self.epoch + self.rank * 10000)
+            
+            # Reconstruction is fast (vectorized on CPU)
+            self.indices = torch.multinomial(
+                self.weights, 
+                self.num_samples, 
+                self.replacement, 
+                generator=g
+            )
+        
+        # Resume from precise offset
+        for i in range(self.consumed, self.num_samples):
+            self.consumed += 1
+            yield int(self.indices[i])
+            
+        # End of stream hygiene
+        self.indices = None
+        self.consumed = 0
+
+    def state_dict(self):
+        """Memory-efficient state (No large tensors)."""
+        return {
+            "consumed": self.consumed, 
+            "epoch": self.epoch,
+            "seed": self.seed
+        }
+
+    def load_state_dict(self, state_dict):
+        self.consumed = state_dict.get("consumed", 0)
+        self.epoch = state_dict.get("epoch", 0)
+        self.seed = state_dict.get("seed", self.seed)
+        self.indices = None # Force reconstruction with new state
+        logger.info(f"[Sampler] DDP-Link Restored: Epoch {self.epoch}, Consumed {self.consumed}")
+
 def create_sepsis_aware_sampler(
     dataset: ICUTrajectoryDataset,
     sepsis_boost_factor: float = 10.0,
-    max_samples: int = 100000
-) -> WeightedRandomSampler:
+    max_samples: int = 100000,
+    seed: int = 42
+) -> StatefulWeightedSampler:
     """
     [v13.0 PATCH] Create a WeightedRandomSampler that oversamples sepsis-positive windows.
     
@@ -627,11 +699,12 @@ def create_sepsis_aware_sampler(
     logger.info(f"[Sampler] Coverage: 100% | Sepsis Detected: {sepsis_count:,} | Rate: {rate*100:.2f}% | Boost factor: {sepsis_boost_factor}x")
     
     # Create the weighted sampler
-    # replacement=True allows oversampling of rare sepsis windows
-    sampler = WeightedRandomSampler(
+    # [v2.0 SOTA FIX]: Use StatefulWeightedSampler for gapless resumption
+    sampler = StatefulWeightedSampler(
         weights=weights,
         num_samples=n_samples,
-        replacement=True
+        replacement=True,
+        seed=seed
     )
     
     return sampler

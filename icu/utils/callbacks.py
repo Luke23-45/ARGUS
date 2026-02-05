@@ -828,9 +828,8 @@ def get_sota_callbacks(cfg: DictConfig) -> List[Callback]:
     callbacks.append(ClinicalMetricCallback(inputs_are_logits=True))
     callbacks.append(GradientHealthMonitor(log_every_n_steps=100))
     
-    # [v4.2.1 SOTA CLEANUP] Sampler Stewardship unified into DataModule Bridge.
-    # Disabling the generic callback to prevent "Double-Restoration" conflicts.
-    # callbacks.append(SamplerSteward())
+    # [v4.2.1 SOTA] Sampler Stewardship enabled for StatefulWeightedSampler support.
+    callbacks.append(SamplerSteward())
 
     # 3. Standard SOTA Monitoring (TQDM Standardized)
     # [FIX] Primacy given to TQDM for terminal stability. 

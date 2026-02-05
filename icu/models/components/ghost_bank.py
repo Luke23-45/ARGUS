@@ -339,14 +339,15 @@ class SepsisGhostBank(nn.Module):
                 self.uncertainties[lvp_indices] = dunc[num_fill:num_fill+num_to_replace]
 
     @torch.no_grad()
-    def refresh_anchors(self, encoder: nn.Module):
+    def refresh_anchors(self, encoder: nn.Module, decay: float = 0.0):
         """
         [v33.1 SOTA FIX] Anchor Refresh mechanism (Fix #356).
         Re-encodes all stored trajectories to prevent latent representation drift.
         
-        Rationale: As the encoder weights change, stored 'latent_anchors' become 
-        misaligned with the current manifold. Periodic refresh ensures 
-        diversity-based rejection remains accurate.
+        Args:
+            encoder: The encoder module (or callable) to use.
+            decay: Momentum decay rate (0.0 = Hard Refresh, 0.9 = Soft Update).
+                   Higher values (e.g. 0.9) retain more history, reducing gradient shock.
         """
         if self.size == 0:
             return
@@ -371,14 +372,18 @@ class SepsisGhostBank(nn.Module):
                 m_batch = self.raw_masks[start:end]
                 
                 # Re-encode using CURRENT encoder weights
-                # [v33.1 Hardened] We assume encoder is a callable that projects to latent space.
-                # If it's the APEX Planner, we might need to pass static data too.
-                # However, for the ghost bank, vitals/masks usually suffice for the base representation.
-                # In wrapper_generalist, we'll pass a lambda that handles the details.
                 new_anchors = encoder(v_batch, m_batch)
+                new_norm = F.normalize(new_anchors, dim=1)
                 
-                # Standardize on unit hypersphere
-                self.latent_anchors[start:end].copy_(F.normalize(new_anchors, dim=1))
+                # [SOTA FIX v33.2] Momentum Stabilization (Ghost Drift Patch)
+                if decay > 0:
+                    # Soft Update: old = decay * old + (1-decay) * new
+                    self.latent_anchors[start:end].mul_(decay).add_(new_norm, alpha=1.0 - decay)
+                    # Re-normalize to ensure we stay on the hypersphere
+                    self.latent_anchors[start:end].copy_(F.normalize(self.latent_anchors[start:end], dim=1))
+                else:
+                    # Hard Refresh (Legacy Behavior)
+                    self.latent_anchors[start:end].copy_(new_norm)
         finally:
             # Restore training state
             if was_training is not None:

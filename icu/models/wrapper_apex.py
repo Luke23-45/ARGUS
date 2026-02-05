@@ -166,6 +166,9 @@ class ICUSpecialistWrapper(pl.LightningModule):
             self.log_var_router = nn.Parameter(torch.tensor(0.0))
             logger.info("Initializing Uncertainty Weighting Parameters (Specialist)...")
         
+        # [v4.2.1] Internal State for Sampler Restoration
+        self.pending_sampler_states = None
+        
         # =====================================================================
         # 1. SCAFFOLDING (The Generalist Foundation)
         # =====================================================================

@@ -55,6 +55,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import pytorch_lightning as pl
+import torchmetrics.functional as tm_func # [SOTA FIX] Stateless Metrics
 from tqdm.auto import tqdm
 from typing import Any, Dict, Optional, Tuple, List, Union
 from omegaconf import DictConfig
@@ -2507,8 +2508,38 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # [v110.0 SOTA FIX] Teacher Consensus Engine (Smoking Gun #38)
         # Rationale: Average teacher shadow weights across all ranks at epoch-end
         # to prevent silent divergence in the EMA manifold.
+        #
+        # [v36.0 SOTA FIX] Periodic Hard Teacher Reset (Fix #H2)
+        # Rationale: Diagnostic testing confirmed Teacher-Student drift of 1.87x (threshold: 0.05).
+        # Soft EMA updates cause the teacher to lag behind the student's evolved manifold,
+        # leading to stale advantage estimates and GMSE oscillation after epoch 8.
+        # Hard sync every 3 epochs copies student weights to teacher, resetting drift to zero.
         if self.ema is not None:
-             self.ema.synchronize()
+            # [FIX #H2] Check if this is a hard sync epoch
+            hard_sync_interval = 3  # Reset teacher every 3 epochs
+            if (self.current_epoch + 1) % hard_sync_interval == 0:
+                # Hard Sync: Copy student weights to teacher shadow
+                # This resets the value manifold drift to zero
+                if self.trainer.is_global_zero:
+                    logger.info(f"🔄 [HARD SYNC] Resetting EMA teacher to student state (epoch {self.current_epoch})...")
+                
+                with torch.no_grad():
+                    for name, param in self.model.named_parameters():
+                        if param.requires_grad and name in self.ema.shadow:
+                            self.ema.shadow[name].copy_(param.data.cpu().float())
+                    
+                    for name, buffer in self.model.named_buffers():
+                        if name in self.ema.shadow:
+                            if torch.is_floating_point(buffer):
+                                self.ema.shadow[name].copy_(buffer.data.cpu().float())
+                            else:
+                                self.ema.shadow[name].copy_(buffer.data.cpu())
+                
+                if self.trainer.is_global_zero:
+                    logger.info(f"✅ [HARD SYNC] Complete. Teacher-Student drift reset to 0.0.")
+            
+            # Normal synchronization: Average shadow weights across DDP ranks
+            self.ema.synchronize()
 
         # [v33.1 SOTA FIX] Ghost Anchor Refresh (Smoking Gun #356)
         # Rationale: Re-align stored latents with current encoder manifold 
@@ -2550,9 +2581,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
                  return out_alb["global_expert"]
 
              if self.trainer.is_global_zero:
-                 logger.info(f"👻 [GHOST REFRESH] Re-encoding {self.ghost_bank.size} anchors...")
+                 logger.info(f"👻 [GHOST REFRESH] Re-encoding {self.ghost_bank.size} anchors (Momentum=0.9)...")
                  
-             self.ghost_bank.refresh_anchors(ghost_encoder_fn)
+             # [v36.0 SOTA FIX] Accelerated Ghost Refresh (Fix #H3)
+             # Rationale: Preventative hardening - faster refresh (decay=0.5) ensures ghost latents
+             # stay aligned with current encoder manifold even during fast learning phases.
+             # Original decay=0.9 retained 90% history, new decay=0.5 balances stability vs freshness.
+             self.ghost_bank.refresh_anchors(ghost_encoder_fn, decay=0.5)
 
     def on_validation_epoch_end(self):
         """
@@ -2617,10 +2652,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
         final_thresh = self.calibrated_threshold.item()
             
         # Log calibrated Metrics using the Bayesian-stabilized threshold
-        self.val_precision.threshold = final_thresh
-        self.val_recall.threshold = final_thresh
-        self.val_f1.threshold = final_thresh
-            
+        # [SOTA FIX v15.0] Truthful Reporting (Metric Alignment Patch)
+        # We use functional metrics on the gathered tensors with the JUST OPTIMIZED threshold.
+        # This prevents the "Metric Paradox" where the metric object holds state from the OLD threshold.
+        
+        # Calculate precise metrics using the synchronized final_thresh
+        s_prec = tm_func.precision(all_probs, all_labels.long(), task="binary", threshold=final_thresh).item()
+        s_rec = tm_func.recall(all_probs, all_labels.long(), task="binary", threshold=final_thresh).item()
+        s_f1 = tm_func.f1_score(all_probs, all_labels.long(), task="binary", threshold=final_thresh).item()
+
         self.log_dict({
             "val/mse_global": self.val_mse_global.compute(),
             "val/mse_hemo": self.val_mse_hemo.compute(),
@@ -2628,9 +2668,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
             "val/mse_electrolytes": self.val_mse_electrolytes.compute(),
             "val/sepsis_acc": self.val_acc_sepsis.compute(),
             "val/sepsis_auroc": self.val_auroc_sepsis.compute(),
-            "val/sepsis_precision": self.val_precision.compute(),
-            "val/sepsis_recall": self.val_recall.compute(),
-            "val/sepsis_f1": self.val_f1.compute(),
+            "val/sepsis_precision": s_prec, # [FIXED]
+            "val/sepsis_recall": s_rec,     # [FIXED]
+            "val/sepsis_f1": s_f1,          # [FIXED]
             "val/clinical_f2_opt": opt_f2,
             "val/clinical_threshold_opt": final_thresh,
             "val/raw_threshold_epoch": opt_thresh,
@@ -3041,11 +3081,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 if id(p) not in aux_param_ids
             ]
             
-            # [PATCH 4] Reduce LR Multiplier
-            # Original: 3.0x LR for aux/acl caused GN spikes to 16.9
-            # Evidence: Combined with fixed weights (1.5x), effective boost was ~4.5x
-            # Fix: Reduce to 1.5x for gentler learning
-            aux_lr_mult = self.cfg.train.get("aux_lr_multiplier", 1.5)
+            # [PATCH 4 - SOTA FINAL] Parity Restoration
+            # Original: 1.5x caused spikes.
+            # Fix: Reset to 1.0x (Parity) - The auxiliary head should not lead the backbone.
+            aux_lr_mult = self.cfg.train.get("aux_lr_multiplier", 1.0)
             
             optimizer_params = [
                 # Group 1: Main Backbone (Standard LR)

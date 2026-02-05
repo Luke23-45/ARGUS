@@ -209,7 +209,7 @@ class ICUAdvantageCalculator(nn.Module):
         self.base_beta_momentum = float(beta_momentum) # [v26.1 FIX] Store Base for Idempotency
         self.ess_ema_decay = 0.95
         self.beta_growth_factor = 2.0  # [Phase 9] Faster recovery
-        self.beta_growth_cooldown = 0  # [v27.1] Cooldown to prevent runaway growth
+        self.register_buffer("beta_growth_cooldown", torch.tensor(0, dtype=torch.long))  # [v27.1] Cooldown persistent
         
         # [v5.1 SURGICAL PATCH] Selection Recovery Floor (Phase 9)
         # Rationale: min_beta=1.0 still allows extreme peakedness (~0.5% ESS).
@@ -746,12 +746,18 @@ class ICUAdvantageCalculator(nn.Module):
                     advantages.clamp(min=-10000.0, max=10000.0), 
                     torch.zeros_like(advantages)
                 )
-
-            # [SOTA v3.1] Mask-Aware Statistics
             if mask is not None:
-                adv_flat = advantages[mask.bool()]
-            else:
-                adv_flat = advantages.reshape(-1)
+                if mask.dim() == 1 and mask.shape[0] == advantages.shape[0]:
+                    mask = mask.bool()
+                    advantages = advantages[mask]
+                    # if values is not None: values = values[mask] # values not passed to this function
+                    # if rewards is not None: rewards = rewards[mask] # rewards not passed to this function
+        
+        # [SOTA v3.1] Mask-Aware Statistics
+        if mask is not None:
+            adv_flat = advantages[mask.bool()]
+        else:
+            adv_flat = advantages.reshape(-1)
 
         # --- 1. Global Whitening & Winsorization ---
         # [v39.0 SOTA FIX] Adaptive Advantage Whitening (Smoking Gun #39)
@@ -948,33 +954,9 @@ class ICUAdvantageCalculator(nn.Module):
         # Check current ESS
         current_temp = self.beta.item()
         
-        # [SOTA v4.1] Bidirectional Beta Adaptation
-        # Rationale: Previous logic only increased beta (heating) but never decreased it (cooling).
-        # This caused beta to get stuck at high values (~4.0) yielding uniform weights (wa_mean=1.0).
-        if True: # Ensure we always check consensus if updated
-            current_ess = get_consensus_ess(current_temp)
-            
-            if current_ess < target_ess_val:
-                 # Case 1: Too Peaky (ESS too low) -> Search UP (Flatten/Heat)
-                 lo, hi = current_temp, 20.0 # Cap max temp at 20.0
-                 for _ in range(10):
-                      mid = (lo + hi) / 2
-                      if get_consensus_ess(mid) >= target_ess_val: # Satisfied, try to be greedier (lower temp)
-                           hi = mid 
-                      else: # Still too peaky, need higher temp
-                           lo = mid
-                 current_temp = hi
-            elif current_ess > target_ess_val * 1.5:
-                 # Case 2: Too Flat (ESS too high) -> Decay DOWN (Sharpen/Cool)
-                 # Slowly restore selection pressure if we have excess sample diversity
-                 current_temp = max(0.5, current_temp * 0.98)
-
-            # [SOTA v4.0] Beta Floor: Prevent Runaway Flattening
-            # [v5.0 SURGICAL PATCH] Lifted floor to 1.0 for sample diversity
-            current_temp = max(self.min_beta, min(current_temp, self.max_beta))
-            
-            # Amortized Update: Persist the adaptation
-            self.beta.fill_(current_temp)
+        # [SOTA v4.1 LEGACY REMOVED] Bidirectional Beta Adaptation
+        # Redundant block removed. Logic centralized in _update_adaptive_stats.
+        # This block caused "Batch Size Paradox" by forcing Beta=20.0 before Safety Valve could act.
              
         scaled_adv = norm_adv / self.beta
         
@@ -1058,7 +1040,10 @@ class ICUAdvantageCalculator(nn.Module):
             # [SOTA 2025] Adaptive Dynamics Update (Uses Global Statistics)
             beta_raw = self.beta.item()
             if self.adaptive_beta or self.adaptive_clipping:
-                beta_raw = self._update_adaptive_stats(advantages, weights, ess, clipped_rate.item())
+                beta_raw = self._update_adaptive_stats(
+                    advantages, weights, ess, clipped_rate.item(), 
+                    total_batch_size=float(g_numel)
+                )
             
             # Weight Entropy (Information Theoretic)
             probs = weights_clipped / (sum_w + 1e-8)
@@ -1099,7 +1084,10 @@ class ICUAdvantageCalculator(nn.Module):
         
         return weights_clipped, diagnostics
 
-    def _update_adaptive_stats(self, advantages: torch.Tensor, weights: torch.Tensor, ess: torch.Tensor, clipped_rate: float) -> float:
+    def _update_adaptive_stats(
+        self, advantages: torch.Tensor, weights: torch.Tensor, ess: torch.Tensor, clipped_rate: float,
+        total_batch_size: float = None
+    ) -> float:
         """
         [SOTA 2025] Dynamically adapts hyperparameters to squeeze performance.
         Returns the raw (un-momentum-ed) beta target for forensics.
@@ -1116,7 +1104,7 @@ class ICUAdvantageCalculator(nn.Module):
                 if clipped_rate > 0.05:
                     # Saturation Recovery Mode (Turbo-Charged)
                     # [SOTA FIX]: Boost beta proportional to clipping severity.
-                    # If 100% clipped, beta doubles instantly. 
+                    # If 100% clipped, beta doubles instantly.
                     # If 10% clipped, beta * 1.1.
                     # This fixes the "lazy adaptation" (33 steps -> 3 steps).
                     boost_factor = 1.0 + clipped_rate
@@ -1127,15 +1115,32 @@ class ICUAdvantageCalculator(nn.Module):
                 
                 if clipped_rate <= 0.05:
                     # Standard ESS Control Mode
-                    # Target 20% ESS (Robust balance between selection and diversity)
-                    target_ess = 0.20
-                    # P-Controller with Anti-Windup
-                    error_ess = (target_ess - current_ess)
+                    # [SOTA FIX v2.0] Adaptive Target Scaling (The "Batch Size Paradox" Fix)
+                    # Rationale: If target_ess (30) > batch_size (16), controller panics -> Beta=20.
+                    # Fix: Dynamically clamp target to 50% of available batch size.
                     
-                    # Correction factor capped to [0.5, 2.0] range to prevent runaway
-                    # [v116.0 SOTA FIX] PI-style gain (Proportional + implicit Integral via momentum)
-                    # Adds 'beta_gain' multiplier to accelerate response to ESS drops.
+                    if total_batch_size is not None:
+                        batch_size = total_batch_size
+                    else:
+                        batch_size = float(weights.numel())
+                    
+                    current_raw_ess = ess.item()
+                    
+                    # Resolve Target
+                    if self.target_ess > 1.0:
+                        # Interpreted as Raw Count (e.g., 30.0)
+                        safe_cap = batch_size * 0.5 # Nyquist-style safety limit
+                        target_val = min(self.target_ess, safe_cap)
+                        current_val = current_raw_ess
+                    else:
+                        # Interpreted as Ratio (e.g., 0.20)
+                        target_val = self.target_ess
+                        current_val = current_raw_ess / (batch_size + 1e-6)
+
+                    # P-Controller with Anti-Windup
+                    error_ess = (target_val - current_val)
                     correction = math.exp(10.0 * error_ess * self.beta_gain)
+                    
                     correction = max(0.5, min(2.0, correction))
                     new_beta = self.beta * correction
                     beta_raw = new_beta.item()
@@ -1156,11 +1161,15 @@ class ICUAdvantageCalculator(nn.Module):
                 # [v27.1 FIX] ESS Safety Floor with Cooldown
                 # Prevents runaway multiplicative growth (166 clamps/200 steps → ~20)
                 if current_ess < 0.05 and self.beta_growth_cooldown == 0:
-                    # [SOTA] Emergency growth still allowed but anchored by floor
+                    # [v36.0 SOTA FIX] Extended Emergency Cooldown (Fix #H4)
+                    # Rationale: Preventative hardening - 10-step cooldown allowed up to 20
+                    # emergency growths per epoch, causing potential beta ratcheting.
+                    # New 50-step cooldown limits to ~4 per epoch for stable selection pressure.
                     self.beta.copy_(torch.clamp(self.beta * self.beta_growth_factor, min=1.5))
-                    self.beta_growth_cooldown = 10  # Cooldown: 10 steps between emergency growths
-                else:
-                    self.beta_growth_cooldown = max(0, self.beta_growth_cooldown - 1)
+                    self.beta_growth_cooldown = 50  # Extended cooldown: 50 steps between emergency growths
+                 # [v27.1 FIX] Tensor-Safe Cooldown Update
+            if self.beta_growth_cooldown.item() > 0:
+                self.beta_growth_cooldown.sub_(1)
 
                 # [v25.6 SOTA] ESS Momentum Buffer
                 # Stabilizes telemetry across jittery batches.
