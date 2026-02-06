@@ -412,9 +412,12 @@ class TrendSentinel:
     def get_stats(ema: torch.Tensor, std: torch.Tensor, decay: float, step_tensor: torch.Tensor) -> Tuple[float, float]:
         """[SOTA v2026] Returns bias-corrected statistics without updating."""
         t = step_tensor.item()
-        bias_correction = 1.0 - (decay ** t) if t > 0 else 1.0
-        corrected_ema = ema.item() / max(bias_correction, 1e-8)
-        corrected_std = std.item() / math.sqrt(max(bias_correction, 1e-8))
+        # [v47.0 SOTA FIX] Bias Floor Stabilization (Smoking Gun #47)
+        # Rationale: Using 1e-8 allows for 100,000,000x amplification. 
+        # Using 0.01 limits amplification to 100x, protecting manifold grounding.
+        bias_correction = max(1.0 - (decay ** t), 0.01) if t > 0 else 1.0
+        corrected_ema = ema.item() / bias_correction
+        corrected_std = std.item() / math.sqrt(bias_correction)
         return corrected_ema, corrected_std
 
     @staticmethod

@@ -499,7 +499,14 @@ class ICUSotaDataset(ICUTrajectoryDataset):
                     # Create channel mask [C]
                     mask = torch.rand(sample["observed_data"].shape[1]) > self.augment_mask_prob
                     # Broadcast mask [C] -> [T, C]
-                    sample["observed_data"] *= mask.float()
+                    mask_broadcast = mask.float()
+                    sample["observed_data"] *= mask_broadcast
+                    
+                    # [Patch 62] Synchronize Imputation Mask
+                    # Rationale: If we drop a sensor, we must tell the model it's MISSING (0), 
+                    # not VALID ZERO (1). Otherwise, it learns falsely that 0.0 is a valid readout.
+                    if "src_mask" in sample:
+                         sample["src_mask"] *= mask_broadcast
 
             return sample
 
@@ -554,9 +561,21 @@ class StatefulWeightedSampler(Sampler):
 
     def set_epoch(self, epoch: int):
         """Called by Trainer at start of epoch."""
-        self.epoch = epoch
-        self.indices = None
-        self.consumed = 0
+        # [v2.2 SOTA FIX] Resumption Safety
+        # Only reset state if we are truly starting a DIFFERENT epoch.
+        # If resuming (load_state_dict -> set_epoch(same_epoch)), we MUST preserve 'consumed'.
+        if epoch != self.epoch:
+            self.consumed = 0
+            self.epoch = epoch
+            self.indices = None
+        else:
+            # Same epoch (Resumption case) - keep 'consumed', but ensure indices are rebuilt
+            # if they haven't been already (e.g. fresh init with load_state_dict)
+            self.epoch = epoch
+            # Do NOT reset indices to None if they are already valid? 
+            # Actually indices are not saved, so they are always None on resume.
+            # But set_epoch is called after load_state_dict.
+            pass
 
     def __iter__(self):
         if self.indices is None:

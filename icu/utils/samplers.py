@@ -48,6 +48,7 @@ class EpisodeAwareSampler(Sampler[int]):
         self.seed = seed
         self.drop_last = drop_last
         self.epoch = 0
+        self.consumed = 0
         
         # --- 1. DDP Setup ---
         if dist.is_available() and dist.is_initialized():
@@ -126,26 +127,39 @@ class EpisodeAwareSampler(Sampler[int]):
         else:
             local_stream = local_stream[:self.num_samples]
             
-        return iter(local_stream)
+        # [v4.2 SOTA FIX] Intra-Epoch Resumption
+        # Resume from the exact 'consumed' offset to prevent duplicate batches.
+        for i in range(self.consumed, len(local_stream)):
+            self.consumed += 1
+            yield int(local_stream[i])
+            
+        # Reset at end of full iteration
+        self.consumed = 0
     
     def __len__(self) -> int:
         return self.num_samples
 
     def set_epoch(self, epoch: int):
+        # [SOTA FIX] Only reset consumed if we are truly moving to a NEW epoch.
+        # This allows re-runs of 'set_epoch' (e.g. in validation/sanity) without wiping the training offset.
+        if epoch != self.epoch:
+            self.consumed = 0
         self.epoch = epoch
 
     def state_dict(self) -> Dict[str, int]:
         """v4.2: Persist state for exact resumption."""
         return {
             "epoch": self.epoch,
-            "seed": self.seed
+            "seed": self.seed,
+            "consumed": self.consumed
         }
 
     def load_state_dict(self, state_dict: Dict[str, int]):
         """v4.2: Restore state."""
         self.epoch = state_dict.get("epoch", 0)
         self.seed = state_dict.get("seed", self.seed)
-        logger.info(f"[Sampler] State Restored: Epoch={self.epoch}")
+        self.consumed = state_dict.get("consumed", 0)
+        logger.info(f"[Sampler] State Restored: Epoch={self.epoch}, Consumed={self.consumed}")
 
 
 class WeightedEpisodeSampler(EpisodeAwareSampler):
@@ -230,4 +244,9 @@ class WeightedEpisodeSampler(EpisodeAwareSampler):
         else:
             local_stream = local_stream[:self.num_samples]
             
-        return iter(local_stream)
+        # [v4.2 SOTA FIX] Intra-Epoch Resumption
+        for i in range(self.consumed, len(local_stream)):
+            self.consumed += 1
+            yield int(local_stream[i])
+            
+        self.consumed = 0

@@ -37,7 +37,7 @@ class BayesianProjectedScaler(nn.Module):
         
         # EMA tracking for UW-SO stability
         self.register_buffer("loss_emas", torch.ones(num_tasks))
-        self.decay = decay
+        self.register_buffer("decay", torch.tensor(decay))
         
         # [v177.1 SOTA] Accumulation Buffers
         # Rationale: Accumulate raw losses across sub-batches to provide 
@@ -50,7 +50,7 @@ class BayesianProjectedScaler(nn.Module):
     def scale_dynamics(self, n_curr: int):
         """[SOTA v2026] Unifies uncertainty decay across step densities."""
         if n_curr <= 0: return
-        self.decay = ScalingSteward.get_decay(0.99, n_curr)
+        self.decay.fill_(ScalingSteward.get_decay(0.99, n_curr))
         
     def forward(self, loss_dict: Dict[str, torch.Tensor], stability_factor: float = 1.0, phys_multiplier: float = 1.0, batch_size: int = 1, is_accumulating: bool = False) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
@@ -110,8 +110,8 @@ class BayesianProjectedScaler(nn.Module):
             # [SOTA v4.0] Conservative Warmup (EMA Poisoning Prevention)
             # Rationale: 0.90 decay allows 10x adaptation per step, causing EMA poisoning.
             # 0.95 decay limits to 5x adaptation, providing smoother convergence.
-            self.step_count += 1
-            curr_decay = 0.95 if self.step_count < 200 else self.decay
+            self.step_count.add_(1)
+            curr_decay = 0.95 if self.step_count.item() < 200 else self.decay.item()
             self.loss_emas.mul_(curr_decay).add_(avg_losses_all, alpha=1 - curr_decay)
             
             # 5. Cycle Reset
@@ -125,9 +125,9 @@ class BayesianProjectedScaler(nn.Module):
                 # [Non-DDP Case] Handle the non-DDP stepping-batch logic
                 avg_losses_all = self.loss_accumulator / (self.task_counters + 1e-8)
                 avg_losses = avg_losses_all[indices] if has_losses else torch.tensor([], device=device)
-                self.step_count += 1
+                self.step_count.add_(1)
                 # [SOTA v4.0] Conservative Warmup (matches DDP case)
-                curr_decay = 0.95 if self.step_count < 200 else self.decay
+                curr_decay = 0.95 if self.step_count.item() < 200 else self.decay.item()
                 self.loss_emas.mul_(curr_decay).add_(avg_losses_all, alpha=1 - curr_decay)
                 self.loss_accumulator.zero_()
                 self.task_counters.zero_()
@@ -242,3 +242,21 @@ class BayesianProjectedScaler(nn.Module):
         
         # Physics task (6) should also be constrained to prevent explosion
         self.log_vars[6].clamp_(max=3.0) 
+
+    def assert_clean(self):
+        """
+        [SOTA SAFETY] Epoch Boundary Guard.
+        Ensures that no loss accumulation bleeds into the next epoch.
+        Must be called at on_train_epoch_end.
+        """
+        if self.loss_accumulator.abs().sum() > 0:
+            raise RuntimeError(
+                "[CRITICAL] Loss Scaler Epoch Bleed Detected! "
+                "Accumulator was not cleared at the end of the epoch. "
+                "Check 'is_accumulating' logic in wrapper_generalist.py."
+            )
+        if self.batch_counter.item() > 0:
+            raise RuntimeError(
+                "[CRITICAL] Batch Counter Bleed Detected! "
+                "Scaler thinks it is still accumulating. "
+            )

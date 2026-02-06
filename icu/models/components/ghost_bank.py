@@ -236,7 +236,8 @@ class SepsisGhostBank(nn.Module):
         # Prevents filling the bank with identical samples from the same batch
         with torch.no_grad():
             # [v25.7] Mixed Precision Similarity (VRAM Optimization)
-            with torch.cuda.amp.autocast(enabled=False):
+            # [SOTA FIX] Use torch.amp.autocast for future compatibility
+            with torch.amp.autocast('cuda', enabled=False):
                 norm_b = F.normalize(latents, dim=1).half()
                 b_self_sim = torch.matmul(norm_b, norm_b.T)
                 b_self_sim.fill_diagonal_(0)
@@ -276,7 +277,7 @@ class SepsisGhostBank(nn.Module):
             return
 
         # 3. Vectorized Similarity Check (v25.7 Precision Guard)
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             norm_new = F.normalize(latents, dim=1).half()
             norm_old = F.normalize(self.latent_anchors[:self.size], dim=1).half()
             sim_matrix = torch.matmul(norm_new, norm_old.T)
@@ -323,7 +324,7 @@ class SepsisGhostBank(nn.Module):
             # Replace LVPs if bank is full
             num_lvp = num_div - num_fill
             if num_lvp > 0 and self.is_full:
-                with torch.cuda.amp.autocast(enabled=False):
+                with torch.amp.autocast('cuda', enabled=False):
                     lat_all = F.normalize(self.latent_anchors[:self.size], dim=1).half()
                     K = torch.matmul(lat_all, lat_all.T)
                     redundancy = (K.float() ** 2).sum(dim=1) - 1.0
@@ -363,36 +364,69 @@ class SepsisGhostBank(nn.Module):
              was_training = encoder.training
              encoder.eval()
         
-        try:
-            for i in range(num_iters):
-                start = i * batch_size
-                end = min(start + batch_size, int(self.size))
-                
-                v_batch = self.raw_vitals[start:end]
-                m_batch = self.raw_masks[start:end]
-                
-                # Re-encode using CURRENT encoder weights
-                new_anchors = encoder(v_batch, m_batch)
-                new_norm = F.normalize(new_anchors, dim=1)
-                
-                # [SOTA FIX v33.2] Momentum Stabilization (Ghost Drift Patch)
-                if decay > 0:
-                    # Soft Update: old = decay * old + (1-decay) * new
-                    self.latent_anchors[start:end].mul_(decay).add_(new_norm, alpha=1.0 - decay)
-                    # Re-normalize to ensure we stay on the hypersphere
-                    self.latent_anchors[start:end].copy_(F.normalize(self.latent_anchors[start:end], dim=1))
-                else:
-                    # Hard Refresh (Legacy Behavior)
-                    self.latent_anchors[start:end].copy_(new_norm)
-        finally:
-            # Restore training state
-            if was_training is not None:
-                encoder.train(was_training)
+        # [v42.1 SOTA Optimization] Single-Source Truth
+        # Only Rank 0 performs the refresh. Others wait for broadcast.
+        is_rank_zero = (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0)
+        
+        if is_rank_zero:
+            try:
+                for i in range(num_iters):
+                    start = i * batch_size
+                    end = min(start + batch_size, int(self.size))
+                    
+                    v_batch = self.raw_vitals[start:end]
+                    m_batch = self.raw_masks[start:end]
+                    
+                    # Re-encode using CURRENT encoder weights
+                    new_anchors = encoder(v_batch, m_batch)
+                    new_norm = F.normalize(new_anchors, dim=1)
+                    
+                    # [SOTA FIX v33.2] Momentum Stabilization (Ghost Drift Patch)
+                    if decay > 0:
+                        # Soft Update: old = decay * old + (1-decay) * new
+                        self.latent_anchors[start:end].mul_(decay).add_(new_norm, alpha=1.0 - decay)
+                        # Re-normalize to ensure we stay on the hypersphere
+                        self.latent_anchors[start:end].copy_(F.normalize(self.latent_anchors[start:end], dim=1))
+                    else:
+                        # Hard Refresh (Legacy Behavior)
+                        self.latent_anchors[start:end].copy_(new_norm)
+            finally:
+                # Restore training state
+                if was_training is not None:
+                    encoder.train(was_training)
                 
         # Re-initialize prototype to match new latent space
         if self.size > 0:
             self.prototype_ema.fill_(0.0)
             self._update_prototype(self.latent_anchors[:self.size])
+
+        # [v36.2 SOTA FIX] DDP Consensus Broadcast (The "One Bank" Protocol)
+        # Rationale: Stochastic accumulations in 'update' function cause Bank Divergence 
+        # across ranks (Rank 0 has different ghosts than Rank 1). 
+        # This causes 'Gradient Conflict' where ranks pull the model in opposing directions,
+        # leading to the 'U-Shape' Regression (GMSE 500->612).
+        # Optimization: Only Rank 0 re-encodes, then broadcasts. Saves (N-1)x compute.
+        if torch.distributed.is_initialized():
+            self._broadcast_bank_state(src_rank=0)
+
+    def _broadcast_bank_state(self, src_rank: int = 0):
+        """
+        [SOTA 2026] Hard Synchronization of the entire Bank state.
+        Ensures all ranks possess bit-exact identical buffers.
+        """
+        # 1. Metadata
+        torch.distributed.broadcast(self.ptr, src_rank)
+        torch.distributed.broadcast(self.size, src_rank)
+        torch.distributed.broadcast(self.is_full, src_rank)
+        
+        # 2. Heavy Data (Only strict necessary range if possible, but full buffer is safer)
+        # 600KB broadcast is negligible on A100/H100/Consumer Cluster.
+        torch.distributed.broadcast(self.raw_vitals, src_rank)
+        torch.distributed.broadcast(self.raw_masks, src_rank)
+        torch.distributed.broadcast(self.raw_labels, src_rank)
+        torch.distributed.broadcast(self.latent_anchors, src_rank)
+        torch.distributed.broadcast(self.uncertainties, src_rank)
+        torch.distributed.broadcast(self.prototype_ema, src_rank)
 
     def sample(self, num_ghosts: int, seed: int, mixup_alpha: float = 0.0, uncertainty_weighted: bool = False) -> Dict[str, torch.Tensor]:
         """
@@ -485,8 +519,6 @@ class SepsisGhostBank(nn.Module):
         if self.latent_adapter_strength > 0 and self.prototype_ema.abs().sum() > 0:
             out["anchors"] = (1.0 - self.latent_adapter_strength) * out["anchors"] + \
                              self.latent_adapter_strength * self.prototype_ema
-
-        return out
 
         return out
 

@@ -103,7 +103,7 @@ sepsis_clinical_28
 
 verify_patches.py
 icu/models_backup_z14
-error.md
+
 verify_end_to_end_sota_v3.py
 icu/models/wrapper_generalist copy.py
 patches_snippit_and_plan.md
@@ -143,3 +143,6 @@ mpo
 Final_SOTA_Total_Recovery_v3.md
 debug_/mp.md
 debug_/mp.md
+error.md
+debug_/mp.md
+mp.md

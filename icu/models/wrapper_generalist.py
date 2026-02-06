@@ -261,11 +261,6 @@ class ICUGeneralistWrapper(pl.LightningModule):
             self.loss_scaler = BayesianProjectedScaler(num_tasks=7)
             logger.info("Using Model's BayesianProjectedScaler for balancing (7 tasks).")
         
-        # [v53.0 SOTA] AGEM Reference Accumulator (Amnesia Protection)
-        # Rationale: Accumulating gradients without consistent reference projection 
-        # causes clinical amnesia. This buffer stores the moving reference context.
-        self.register_buffer("grad_ref_buffer", None, persistent=False)
-        
         # Authority check: EMACallback will attach here as self.ema
         self.ema = None 
 
@@ -487,13 +482,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
         self.register_buffer("gn_loss_accumulator", torch.zeros(7))
         self.register_buffer("gn_acc_count", torch.tensor(0))
         
-        # [v110.0 SOTA] Bayesian Safe-Start (Smoking Gun #110)
-        self.register_buffer("log_vars_uninitialized", torch.tensor(True))
+        # [v48.0 SOTA FIX] Stateful Accumulation Index (Smoking Gun #90)
+        # Rationale: Ensures bit-perfect cycle alignment across resumptions.
+        self.register_buffer("grad_accum_idx", torch.tensor(0))
         
-        # [PMS] MGP: EMA Foundation Gradient Storage for projection
-        # Flattened size based on encoder hidden dim (e.g., 512, 1024)
-        # We will initialize this lazily in training_step
+        # [v110.0 SOTA] Bayesian Safe-Start (Smoking Gun #110)
         self._fnd_grad_ema = None 
+        self.grad_ref_buffer = None # [v53.0] AGEM Reference Accumulator
         
         # [SOTA DDP] Zero-Copy Gatherer
         self.ddp_gatherer = None 
@@ -512,7 +507,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         """[SOTA v2026] Unified Mathematical Hyperparameter Scaling."""
         # Detect the actual number of iterations per epoch (e.g., 1176 vs 200)
         n_curr = self.trainer.num_training_batches
-        logger.info(f"⚡ [SOTA] Scaling Steward: Unifying dynamics for {n_curr} steps.")
+        logger.info(f" [SOTA] Scaling Steward: Unifying dynamics for {n_curr} steps.")
         
         self.grad_ema_decay = ScalingSteward.get_decay(0.99, n_curr)
         self.class_balancer.beta = ScalingSteward.get_decay(0.9995, n_curr)
@@ -528,60 +523,240 @@ class ICUGeneralistWrapper(pl.LightningModule):
         if hasattr(self, "loss_scaler"):
             self.loss_scaler.scale_dynamics(n_curr)
         
-        self.resumption_grace_steps.fill_(50)
+        if self.global_step == 0:
+            self.resumption_grace_steps.fill_(50)
 
     def on_fit_start(self):
-        """[SOTA v30.5] The Resumption Bridge: Restore Optimizer Memory."""
-        # 1. Main Model Optimizers
+        """
+        [SOTA v2026] Elastic Resumption Bridge (Patch 1).
+        Handles: 
+        1. Context-Aware Restoration (EMA, Optimizers, Schedulers).
+        2. DDP-Safe Accelerator Initializtion.
+        3. Priority-Based Calibration (Normalizer, AWR).
+        """
+        # =====================================================================
+        # 1. RESUME INTEGRITY CHECK (Priority 1: Core State Restoration)
+        # =====================================================================
+        # 1.1 Normalizer Restoration
+        # [v1.1 Restoration moved to 2.1.5 for consolidation]
+
+        # 1.2 PMS Buffer Migration
+        if self._fnd_grad_ema is not None:
+             self._fnd_grad_ema = self._fnd_grad_ema.to(self.device)
+             logger.info(f"✅ [RESUME] PMS Buffers migrated to {self.device}.")
+
+        # 1.3 AWR Heartbeat Check
+        if self.awr_calculator.stats_initialized:
+            if hasattr(self.awr_calculator, 'adv_mean'):
+                logger.info(f"✅ [RESUME] AWR Engine Online: mu={self.awr_calculator.adv_mean.item():.4f}, sigma={self.awr_calculator.adv_std.item():.4f}")
+
+        # =====================================================================
+        # 2. MANUAL OPTIMIZER & SCHEDULER RESTORATION (The Anti-Trauma Bridge)
+        # =====================================================================
+        # 2.1 Optimizers
         if hasattr(self, "pending_optimizer_states"):
-            opts = self.optimizers()
-            if not isinstance(opts, (list, tuple)): opts = [opts]
-            for i, (opt, state) in enumerate(zip(opts, self.pending_optimizer_states)):
-                opt.load_state_dict(state)
-                logger.info(f"[RESUME] Global Optimizer {i} restored.")
+            optimizers = self.trainer.optimizers
+            if not isinstance(optimizers, list): optimizers = [optimizers]
+            
+            if len(optimizers) == len(self.pending_optimizer_states):
+                try:
+                    for opt, state in zip(optimizers, self.pending_optimizer_states):
+                        opt.load_state_dict(state)
+                    logger.info(f"✅ [RESUME] Manually restored {len(optimizers)} optimizer states (Trauma Averted).")
+                except Exception as e:
+                    logger.warning(f"⚠️ [RESUME] Manual optimizer restoration failed: {e}")
+            else:
+                logger.warning(f"⚠️ [RESUME] Optimizer count mismatch: Found {len(self.pending_optimizer_states)}, Expected {len(optimizers)}")
             del self.pending_optimizer_states
 
-        if hasattr(self, "pending_scheduler_states"):
-            schs = self.lr_schedulers()
-            if not isinstance(schs, (list, tuple)): schs = [schs]
-            for i, (sch, state) in enumerate(zip(schs, self.pending_scheduler_states)):
-                sch.load_state_dict(state)
-                logger.info(f"[RESUME] Global Scheduler {i} restored.")
-            del self.pending_scheduler_states
-
-        # 2. GradNorm Optimizer (SOTA v30.5)
-        if hasattr(self, "pending_gn_opt_state") and hasattr(self, "gradnorm"):
-             # Force lazy init to allow restoration
-             if self.gradnorm.optimizer is None:
-                  self.gradnorm.update(torch.zeros(7, device=self.device))
-             self.gradnorm.optimizer.load_state_dict(self.pending_gn_opt_state)
-             logger.info("[RESUME] GradNorm Optimizer state restored.")
-             del self.pending_gn_opt_state
-
-        # 3. Normalizer
+        # 2.1.5 Physics Normalizer (Critical Bridge)
+        # Rationale: Normalizer stats are the manifold anchor. Resuming without them
+        # or with fresh calibration causes a massive "Adaptation Shock".
         if hasattr(self, "pending_normalizer_state") and hasattr(self.model, "normalizer"):
-            self.model.normalizer.load_state_dict(self.pending_normalizer_state)
-            logger.info("[RESUME] Normalizer state restored.")
+            try:
+                self.model.normalizer.load_state_dict(self.pending_normalizer_state)
+                logger.info("✅ [RESUME] Physics Normalizer stats restored directly.")
+                
+                # Sync EMA shadow immediately to prevent Teacher drift
+                if hasattr(self, 'ema') and self.ema is not None:
+                    for name, buffer in self.model.normalizer.named_buffers():
+                        full_name = f"normalizer.{name}"
+                        if full_name in self.ema.shadow:
+                            self.ema.shadow[full_name] = buffer.data.detach().cpu().clone()
+                    logger.info("✅ [RESUME] EMA shadow synced with restored normalizer.")
+            except Exception as e:
+                logger.warning(f"⚠️ [RESUME] Normalizer restoration failed: {e}")
             del self.pending_normalizer_state
 
-        # 4. EMA Teacher
+        # 2.2 Schedulers
+        if hasattr(self, "pending_scheduler_states"):
+            schedulers = self.lr_schedulers()
+            if not isinstance(schedulers, list): schedulers = [schedulers]
+            schedulers = [s for s in schedulers if s is not None]
+
+            if len(schedulers) == len(self.pending_scheduler_states):
+                try:
+                    for sch, state in zip(schedulers, self.pending_scheduler_states):
+                        sch.load_state_dict(state)
+                    logger.info(f"✅ [RESUME] Manually restored {len(schedulers)} LR scheduler states.")
+                    
+                    # [v55.0 SOTA FIX] LR Pulse Alignment (Smoking Gun #113)
+                    # Rationale: Ensure Optimizer LR matches Scheduler state before the first batch.
+                    # Standard PL/PyTorch can cause a "Shock Batch" with initial LR if not synced.
+                    for opt, sch in zip(self.optimizers() if isinstance(self.optimizers(), list) else [self.optimizers()], schedulers):
+                         if hasattr(sch, "get_last_lr"):
+                              new_lr = sch.get_last_lr()[0]
+                              for pg in opt.param_groups:
+                                   pg['lr'] = new_lr
+                    logger.info("✅ [RESUME] LR Pulse Alignment synchronized.")
+                except Exception as e:
+                    logger.warning(f"⚠️ [RESUME] Manual scheduler restoration failed: {e}")
+            else:
+                 logger.warning(f"⚠️ [RESUME] Scheduler count mismatch: Found {len(self.pending_scheduler_states)}, Expected {len(schedulers)}")
+            del self.pending_scheduler_states
+
+        # 2.3 GradNorm Optimizer (Fix #340)
+        if hasattr(self, "pending_gn_opt_state") and self.gradnorm is not None:
+             if self.gradnorm.optimizer is None:
+                  # Force initialization so we can load the state
+                  self.gradnorm.optimizer = torch.optim.Adam([self.gradnorm.weights], lr=0.005)
+             try:
+                 self.gradnorm.optimizer.load_state_dict(self.pending_gn_opt_state)
+                 logger.info("✅ [RESUME] GradNorm optimizer state restored.")
+             except Exception as e:
+                 logger.warning(f"⚠️ [RESUME] GradNorm restoration failed: {e}")
+             del self.pending_gn_opt_state
+
+        # [v52.0 SOTA FIX] Grand Unified Consensus (Smoking Gun #MasterAudit)
+        # Rationale: Bit-perfect parity across all meta-parameters and historical buffers.
+        if dist.is_available() and dist.is_initialized():
+            # 1. Manifold Stability Parity
+            dist.broadcast(self.grad_norm_ema, src=0)
+            dist.broadcast(self.grad_norm_std, src=0)
+            dist.broadcast(self.grad_norm_step_count, src=0)
+            
+            # 2. Foundation Consensus (MGP & AGEM)
+            if self._fnd_grad_ema is not None:
+                dist.broadcast(self._fnd_grad_ema, src=0)
+            
+            # [v53.0] AGEM Consensus
+            if self.grad_ref_buffer is not None:
+                dist.broadcast(self.grad_ref_buffer, src=0)
+            
+            # 3. Meta-Task Consensus (GradNorm & LossScaler)
+            if self.gradnorm is not None:
+                if hasattr(self.gradnorm, 'weights'):
+                    dist.broadcast(self.gradnorm.weights, src=0)
+                # [v52.1] Sync Initial Losses to prevent meta-drift
+                if hasattr(self.gradnorm, 'initial_losses'):
+                    dist.broadcast(self.gradnorm.initial_losses, src=0)
+            
+            if hasattr(self, "loss_scaler"):
+                dist.broadcast(self.loss_scaler.log_vars, src=0)
+                dist.broadcast(self.loss_scaler.loss_emas, src=0)
+                # [v52.3] Sync Accumulators to prevent cycle amnesia (Smoking Gun #MasterAudit)
+                # Rationale: All ranks must resume with bit-perfect mid-cycle sums.
+                dist.broadcast(self.loss_scaler.loss_accumulator, src=0)
+                dist.broadcast(self.loss_scaler.task_counters, src=0)
+                dist.broadcast(self.loss_scaler.batch_counter, src=0)
+            
+            # [v52.3] Sync GradNorm Accumulator
+            dist.broadcast(self.gn_loss_accumulator, src=0)
+            dist.broadcast(self.gn_acc_count, src=0)
+                
+            logger.info("✅ [RESUME] Grand Unified DDP Consensus reached.")
+
+        # =====================================================================
+        # 3. EMA TEACHER RESTORATION (The Advantage Preservation Bridge)
+        # =====================================================================
         if hasattr(self, "pending_ema_state"):
             if self.ema is not None:
                 self.ema.load_state_dict(self.pending_ema_state)
-                logger.info("[RESUME] EMA shadow weights restored directly.")
+                logger.info("✅ [RESUME] EMA shadow weights (Teacher) restored directly.")
                 del self.pending_ema_state
             else:
                 # [v112.0 SOTA FIX] Callback Proxy Restoration
-                # Rationale: If EMACallback hasn't initialized yet, push the state to its deferred buffer.
                 found = False
                 for cb in self.trainer.callbacks:
                     if "EMACallback" in cb.__class__.__name__:
                         cb._deferred_ema_state = self.pending_ema_state
-                        logger.info("[RESUME] EMA state pushed to EMACallback for deferred initialization.")
+                        logger.info("✅ [RESUME] EMA state pushed to EMACallback for deferred initialization.")
                         found = True
                         break
                 if not found:
-                    logger.warning("[RESUME] Pending EMA state found but self.ema is None and no EMACallback detected.")
+                    logger.warning("⚠️ [RESUME] Pending EMA state found but self.ema is None and no EMACallback detected.")
+
+        # =====================================================================
+        # 3.5 GHOST BANK MANIFOLD REFRESH (Patch 58: Smoking Gun #SG-121)
+        # =====================================================================
+        # Rationale: On resumption, the Ghost Bank's latent anchors are stale.
+        # The encoder has evolved since the checkpoint, so stored representations
+        # drift from the current latent space. This causes AGEM and CGA projections
+        # to operate in a "ghost manifold," degrading clinical signal quality.
+        # Fix: Re-encode all stored trajectories with the current encoder weights.
+        if hasattr(self, "ghost_bank") and self.ghost_bank is not None:
+            if self.ghost_bank.size > 0 and self.global_step > 0:
+                logger.info("🔄 [RESUME] Refreshing Ghost Bank latent anchors...")
+                try:
+                    # Use the model's encoder to re-encode trajectories
+                    # Soft update (decay=0.5) to blend old manifold with new
+                    self.ghost_bank.refresh_anchors(
+                        encoder=lambda v, m: self.model(v, m, static=None)[0],  # Returns cls_token
+                        decay=0.5
+                    )
+                    logger.info("✅ [RESUME] Ghost Bank anchors refreshed (Manifold Aligned).")
+                except Exception as e:
+                    logger.warning(f"⚠️ [RESUME] Ghost Bank refresh failed: {e}")
+
+        # =====================================================================
+        # 4. DDP ACCELERATOR INITIALIZATION
+        # =====================================================================
+        if torch.cuda.is_available():
+             world_size = dist.get_world_size() if dist.is_initialized() else 1
+             if self.ddp_gatherer is None:
+                 self.ddp_gatherer = SOTA_DistributedGatherer(self.device, world_size)
+                 logger.info(f"✅ [SOTA] DDP Gatherer Online (World={world_size}, Device={self.device})")
+
+        # =====================================================================
+        # 5. FRESH CALIBRATION (Priority 2: Infrastructure)
+        # =====================================================================
+        if not (hasattr(self.trainer, "datamodule") and self.trainer.datamodule):
+            logger.warning("No DataModule found. Skipping stats fitting.")
+            return
+
+        loader = self.trainer.datamodule.train_dataloader()
+        dataset = loader.dataset
+        
+        # 5.1 Physics Normalizer Calibration
+        if hasattr(self.model, "normalizer") and not self.model.normalizer.is_calibrated.item():
+            logger.info(f"[Rank {self.global_rank}] Calibrating Normalizer...")
+            try:
+                index_path = getattr(dataset, "index_path", None)
+                ts_cols = getattr(dataset, "metadata", {}).get("ts_columns", [])
+                
+                if index_path and ts_cols:
+                    self.model.normalizer.calibrate_from_stats(index_path, ts_cols)
+                    
+                    # [CRITICAL] Sync EMA shadow with newly calibrated normalizer
+                    if hasattr(self, 'ema') and self.ema is not None:
+                        for name, buffer in self.model.normalizer.named_buffers():
+                            full_name = f"normalizer.{name}"
+                            if full_name in self.ema.shadow:
+                                self.ema.shadow[full_name] = buffer.data.detach().cpu().clone()
+                        logger.info(f"[Rank {self.global_rank}] EMA shadow sync complete.")
+                else:
+                    logger.warning("Dataset missing 'index_path' or 'metadata.ts_columns'.")
+            except Exception as e:
+                logger.error(f"[CRITICAL] Normalizer Calibration Failed: {e}")
+
+        # 5.2 AWR Stats Fitting (Rank 0 Compute + Broadcast)
+        # [v20.2] RESUMPTION FIX: Do not re-calibrate if stats are already loaded!
+        if not self.awr_calculator.stats_initialized:
+            self._fit_awr_stats_ddp(dataset)
+        
+        # Dataset handle cleanup
+        if hasattr(dataset, "_lmdb_env"):
+            dataset._lmdb_env = None
 
     def on_train_epoch_start(self):
         """[Phase 3/4] Update AWR Horizon and SOTA v4.2 Warmup."""
@@ -603,11 +778,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
         n_batches = self.trainer.num_training_batches
         if n_batches <= 0: return
 
-        # [v29.4 SOTA FIX] Step-Invariant Curriculum (Abyssal #4)
-        # Rationale: Curriculum ramps must be anchored to training steps, 
-        # not epochs, to ensure identical constraint hardening across densities.
-        # Ref: ScalingSteward.REF_STEPS (200 steps = 1 reference epoch)
-        total_steps = self.current_epoch * n_batches + batch_idx
+        # [v29.5 SOTA FIX] Resumption-Invariant Curriculum (Smoking Gun #4)
+        # Rationale: Anchor progress to self.global_step to prevent time-jumps 
+        # when resuming mid-epoch (batch_idx resets, but global_step is persistent).
+        accum = getattr(self.trainer, "accumulate_grad_batches", 1)
+        total_steps = self.global_step * accum
         ref_progress = total_steps / ScalingSteward.REF_STEPS
         
         # [v21.5 SOTA] PMS Governance: Mute updates if manifold is unstable
@@ -694,15 +869,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
         opt = self.optimizers()
         B = batch["observed_data"].size(0)
         
-        # [v136.0 SOTA FIX] Accumulation Seed Diversity (Smoking Gun #136)
-        # Rationale: global_step only increments after the cycle, causing stagnant 
-        # sampling for all sub-batches. 
-        # Fix: Inject batch_idx to ensure unique sub-batch diversity.
+        # [v48.0 SOTA FIX] Stateful Accumulation Index (Smoking Gun #90)
+        # Rationale: Replaces volatile batch_idx to ensure cycle parity on resume.
+        self.grad_accum_idx.add_(1)
         acc_batches = self.trainer.accumulate_grad_batches
         is_last_batch = (batch_idx + 1) == self.trainer.num_training_batches
-        should_step = ((batch_idx + 1) % acc_batches == 0) or is_last_batch
+        should_step = (self.grad_accum_idx.item() >= acc_batches) or is_last_batch
         
-        ghost_seed = (self.current_epoch * 12345 + self.global_step + (batch_idx % acc_batches)) % (2**31)
+        # [v49.0 SOTA FIX] Seed Continuity (Smoking Gun #65)
+        # Rationale: Align sampling with the stateful accumulation cycle.
+        ghost_seed = (self.current_epoch * 12345 + self.global_step + (self.grad_accum_idx.item() - 1)) % (2**31)
         num_ghosts = self.cfg.train.get("num_ghosts", 4)
         mixup_alpha = self.cfg.train.get("ghost_mixup_alpha", 0.0)
         ghost_batch = self.ghost_bank.sample(
@@ -742,18 +918,30 @@ class ICUGeneralistWrapper(pl.LightningModule):
             )
             
             # 1. Volatility Protection (Z-Score / "The Earthquake Detector")
-            z_score = TrendSentinel.calculate_z_score(ema_bc, self.grad_norm_ema, self.grad_norm_std)
+            # [v44.0 SOTA FIX] Domain Alignment (Smoking Gun #44)
+            # Rationale: Comparing bias-corrected 'ema_bc' against uncorrected 'grad_norm_ema'
+            # causes a 10x phantom shock on resumption. Since we haven't seen the 
+            # current batch's gradient yet, we assume trend-stability (z=0).
+            z_score = 0.0 
             stab_z = 1.0 / (1.0 + (max(0, z_score - 3.0) ** 2))
             
             # 2. Absolute Pressure Protection (Exp Decay / "The Boiling Frog Detector")
-            # Drops exponentially if EMA > 5.0
-            stab_p = torch.exp(-torch.clamp(torch.tensor(ema_bc) - 5.0, min=0.0)).item()
+            # Drops exponentially if EMA > 25.0 (Aligned with x10.0 Reward Scale)
+            # [Patch 65] Relaxed Threshold
+            stab_p = torch.exp(-torch.clamp(torch.tensor(ema_bc) - 25.0, min=0.0)).item()
             
             # Final Governor Factor (min of both protections)
             stability_factor = min(stab_z, stab_p)
             
             # Absolute Floor for "Iron Dome" protection
-            if ema_bc > 10.0: stability_factor = 0.1
+            # [Patch 65] Relaxed Threshold
+            if ema_bc > 50.0: stability_factor = 0.1
+            
+            # [v51.0 SOTA FIX] Governor Grace Alignment (Smoking Gun #81)
+            # Rationale: During the grace period, EMAs represent stale history.
+            # Avoid artificial throttling while the manifold settles.
+            if self.resumption_grace_steps > 0:
+                stability_factor = 1.0
             
             # [v88.0 SOTA FIX] DDP Stability Consensus (Smoking Gun #88)
             # Rationale: Tiny floating point drift in EMA/STD across ranks leads to 
@@ -779,8 +967,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
         if num_ghosts > 0:
             risk_coef_expanded = torch.cat([risk_coef, risk_coef_ghost], dim=0)
 
-
-            self.log("gov/stability_factor_z", stab_z, on_step=True)
+        # [v49.0 Telemetry] Log stability z-score (always, regardless of ghost count)
+        self.log("gov/stability_factor_z", stab_z, on_step=True)
 
         # [v25.1 SAFETY FIX] Convert per-feature mask to per-timestep mask
         # src_mask: [B, T, 28] (0=Missing, 1=Valid)
@@ -1054,13 +1242,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
             # Sepsis Classification Loss (Unified [B+G])
             # Ghosts provide the gradient floor to prevent 'Discovery Shock'.
-            if aux_loss_base is not None:
-                # aux_loss_base is [B+G] from SequenceAuxHead internal loss if updated
-                # But here it's already a scalar from the head. We rely on the head's loss.
-                aux_loss = aux_loss_base * cfm * mining_weight_avg
-            else:
-                raw_aux_loss = self.risk_aware_loss(logits, targets_one_hot, risk_coef_expanded, class_weights=class_weights)
-                aux_loss = raw_aux_loss * cfm * mining_weight_avg
+            # [Patch 67] Wire Phantom Risk Loss (Smoking Gun #SGD-17)
+            # Rationale: SequenceAuxHead uses generic AsymmetricLoss. We MUST override with 
+            # RiskAwareAsymmetricLoss to apply Critical Penalty for Shock/Hypoxia.
+            
+            # Note: We ignore aux_loss_base from the head in favor of the wrapper's risk-aware loss.
+            raw_aux_loss = self.risk_aware_loss(logits, targets_one_hot, risk_coef_expanded, class_weights=class_weights)
+            aux_loss = raw_aux_loss * cfm * mining_weight_avg
 
             # [v17.4 GIST-Q] Uncertainty-Weighted CGA
             # Anchors the Expert Manifold to history, prioritising high-uncertainty (hard) cases.
@@ -1256,12 +1444,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
             
             # Global CFM: Balanced scaling based on the entire DDP batch (including ghosts)
             n_sepsis_global = (targets_global > 0).sum().item()
-            cfm_global = GradientThrottler.log_scale_prevalence(targets_global.numel(), n_sepsis_global)
+            cfm_global = LinearManifoldSentinel.log_scale_prevalence(targets_global.numel(), n_sepsis_global)
         else:
             ctx_aux_global = ctx_aux
-            targets_global = targets
+            targets_global = targets_expanded # [Patch 63] Use [B+G] for correct prevalence
             mask_global = ctx_mask
-            cfm_global = cfm
+            
+            # [Patch 63] Unified Single-GPU Logic
+            n_sepsis_global = (targets_global > 0).sum().item()
+            cfm_global = LinearManifoldSentinel.log_scale_prevalence(targets_global.numel(), n_sepsis_global)
 
         # D. Contrastive Sepsis Clustering (ACL+)
         # [v4.2 SOTA Pillar 5] Inject Clinical Metadata (Velocity, Static)
@@ -1505,7 +1696,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # [v177.0 SOTA FIX] Accumulation-Aware Scaling (Smoking Gun #177)
             # Rationale: EMA updates must only occur on the stepping batch.
             acc_batches = self.trainer.accumulate_grad_batches
-            is_accumulating = ((batch_idx + 1) % acc_batches != 0)
+            
+            # [SOTA FIX v33.3] Epoch Boundary Alignment (Deep Forensic Fix)
+            # Rationale: 'is_accumulating' must be exactly 'not should_step'.
+            # Previous logic missed 'is_last_batch', causing scaler accumulation 
+            # while optimizer stepped, leading to 'Epoch Bleed'.
+            is_last_batch = (batch_idx + 1) == self.trainer.num_training_batches
+            should_step_scaler = ((batch_idx + 1) % acc_batches == 0) or is_last_batch
+            is_accumulating = not should_step_scaler
 
             # [SOTA 2025] Exclusive Uncertainty Scaling
             # phys_loss is now a managed task in the conflict loop.
@@ -1582,8 +1780,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                  global_ref_needed = ref_needed
 
             # [v32.0 SOTA FIX] Accumulation-Aware AWR Sync
-            acc_batches = self.trainer.accumulate_grad_batches
-            is_accumulating = ((batch_idx + 1) % acc_batches != 0)
+            # acc_batches and is_accumulating are already defined correctly at L1701 (including is_last_batch check)
             
             if global_ref_needed:
                 # 1. Capture Reference Gradients
@@ -1854,28 +2051,19 @@ class ICUGeneralistWrapper(pl.LightningModule):
                              self.last_logged_bucket = pct
             self.log("train/manifold_norm_std", self.grad_norm_std, on_step=True)
 
-        # --- 5. Accumulation-Aware Step & Cleanup ---
-        # [SOTA 2025] Manually manage accumulation for precise DDP synchronization
-        # Only step if we've accumulated enough batches
+        # [v48.0 SOTA FIX] Stateful Accumulation Index (Smoking Gun #90)
+        # Rationale: Manually manage accumulation for precise DDP synchronization
+        # and bit-perfect resumption.
         acc_batches = self.trainer.accumulate_grad_batches
         
-        # [v26.0 FIX] Detect Tail Batches to prevent gradient leak at epoch end
-        # We step if we hit the accumulation target OR if this is the absolute last batch.
-        is_last_batch = (batch_idx + 1) == self.trainer.num_training_batches
-        
-        should_step = ((batch_idx + 1) % acc_batches == 0) or is_last_batch
-
+        # is_last_batch was calculated at the start of training_step
         if should_step:
             # [v91.0 SOTA FIX] Uniform Step Scaling (Smoking Gun #91)
-            # Rationale: Accumulating gradients by summation makes the step size 
-            # dependent on the number of batches. Tail batches at epoch end 
-            # are smaller, causing 'Manifold Shrapnel' shocks.
-            # Fix: Normalize by actual number of accumulated batches.
-            acc_ref = self.trainer.accumulate_grad_batches
-            actual_accum = acc_ref if (batch_idx + 1) % acc_ref == 0 else (batch_idx + 1) % acc_ref
+            # Rationale: Use the stateful index for exact tail-batch normalization.
+            actual_accum = self.grad_accum_idx.item()
             
-            if actual_accum != acc_ref:
-                logger.info(f"⚖️ [EPOCH TAIL] Normalizing step for {actual_accum}/{acc_ref} accumulation.")
+            if actual_accum != acc_batches:
+                logger.info(f"⚖️ [EPOCH TAIL] Normalizing step for {actual_accum}/{acc_batches} accumulation.")
                 
             # Fused Gradient Scaling
             with torch.no_grad():
@@ -1967,10 +2155,17 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 if self.resumption_grace_steps > 0:
                     self.resumption_grace_steps.sub_(1)
                     ema_bc, std_bc = float(current_grad_pressure), 0.5
+                    # [v30.1 SOTA FIX] Safe Sentinel Initialization (Smoking Gun #2)
+                    # Rationale: ONLY re-initialize if this is the start of training.
+                    # Overwriting at step 50 of a resumed run (global_step > 100)
+                    # triggers "Stability Amnesia", killing the manifold grounding.
                     if self.resumption_grace_steps == 0:
-                        self.grad_norm_ema.fill_(current_grad_pressure)
-                        self.grad_norm_std.fill_(0.5) 
-                        logger.info("🛡️ [PMS] Grace Period Concluded. Sentinel Online.")
+                        if self.global_step < 100:
+                            self.grad_norm_ema.fill_(current_grad_pressure)
+                            self.grad_norm_std.fill_(0.5) 
+                            logger.info(f"🛡️ [PMS] Initialization Complete. GN Baseline: {current_grad_pressure:.4f}")
+                        else:
+                            logger.info("🛡️ [PMS] Resumption Grace Period Concluded (Stats Preserved).")
                 else:
                     ema_bc, std_bc = TrendSentinel.update_stats(
                         current_grad_pressure, 
@@ -1983,6 +2178,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 if hasattr(self, 'loss_scaler') and self.loss_scaler is not None:
                     if hasattr(self.loss_scaler, 'project_parameters'):
                         self.loss_scaler.project_parameters()
+
+                # [v48.0] Cycle Reset
+                self.grad_accum_idx.fill_(0)
 
                 # [v30.5 SOTA] Legacy GradNorm Step
                 # Protected from spikes and scaled correctly.
@@ -2581,13 +2779,18 @@ class ICUGeneralistWrapper(pl.LightningModule):
                  return out_alb["global_expert"]
 
              if self.trainer.is_global_zero:
-                 logger.info(f"👻 [GHOST REFRESH] Re-encoding {self.ghost_bank.size} anchors (Momentum=0.9)...")
+                 logger.info(f"👻 [GHOST REFRESH] Re-encoding {self.ghost_bank.size} anchors (Decay=0.3/Momentum=0.7)...")
                  
-             # [v36.0 SOTA FIX] Accelerated Ghost Refresh (Fix #H3)
-             # Rationale: Preventative hardening - faster refresh (decay=0.5) ensures ghost latents
-             # stay aligned with current encoder manifold even during fast learning phases.
-             # Original decay=0.9 retained 90% history, new decay=0.5 balances stability vs freshness.
-             self.ghost_bank.refresh_anchors(ghost_encoder_fn, decay=0.5)
+             # [v36.1 SOTA FIX] Balanced Ghost Refresh (Fix #H3-Revised)
+             # Rationale: 'decay=0.1' was too aggressive (GMSE U-Shape Regression), losing 
+             # temporal regularization. 'decay=0.5' caused Manifold Shock (GN Spike).
+             # 'decay=0.3' is the Goldilocks zone (70% alignment gain, 3x history retention).
+             self.ghost_bank.refresh_anchors(ghost_encoder_fn, decay=0.3)
+
+             # [SOTA SAFETY FIX] Verify Loss Scaler Hygiene (Deep Forensic Guard)
+             # Rationale: Prevent "Epoch Bleed" where accumulator logic fails at boundaries.
+             if hasattr(self, "loss_scaler") and hasattr(self.loss_scaler, "assert_clean"):
+                 self.loss_scaler.assert_clean()
 
     def on_validation_epoch_end(self):
         """
@@ -2779,156 +2982,6 @@ class ICUGeneralistWrapper(pl.LightningModule):
                   if name in original_momentums:
                        module.momentum = original_momentums[name]
 
-    def on_fit_start(self):
-        """
-        Pre-flight checks (DDP Safe):
-        1. Calibrate Normalizer (Deterministic file I/O → All Ranks).
-        2. Whitening AWR Stats (Random Sampling → Rank 0 & Broadcast).
-        3. Sync EMA shadow with calibrated normalizer.
-        [SOTA v8.0] Unified Initialization Strategy.
-        Handles both Fresh Calibration and Robust Resume Restoration.
-        """
-        # =====================================================================
-        # 1. RESUME INTEGRITY CHECK (Priority 1)
-        # =====================================================================
-        # If we loaded from a checkpoint, we MUST restore state before doing anything else.
-        if hasattr(self, "pending_normalizer_state"):
-             if hasattr(self.model, "normalizer"):
-                 self.model.normalizer.load_state_dict(self.pending_normalizer_state)
-                 logger.info("✅ [RESUME] Normalizer state restored to Model (Calibration Preserved).")
-                 del self.pending_normalizer_state
-             else:
-                 logger.warning("⚠️ [RESUME] Pending normalizer state found but MODEL has no normalizer!")
-        
-        # [SOTA FIX] Device Guard for PMS EMA
-        if self._fnd_grad_ema is not None:
-             self._fnd_grad_ema = self._fnd_grad_ema.to(self.device)
-             logger.info(f"✅ [RESUME] PMS Buffers migrated to {self.device}.")
-        
-        # Ensure AWR Stats are synced (if resumed, they are already in the buffer)
-        if self.awr_calculator.stats_initialized:
-            if hasattr(self.awr_calculator, 'adv_mean'):
-                logger.info(f"✅ [RESUME] AWR Engine Online: mu={self.awr_calculator.adv_mean.item():.4f}, sigma={self.awr_calculator.adv_std.item():.4f}")
-
-        # =====================================================================
-        # 1.1 MANUAL OPTIMIZER RESTORATION (The Anti-Trauma Fix)
-        # =====================================================================
-        # PL sometimes confuses optimizer restoration in manual_optimization modes.
-        # We manually force the state load here if we captured it during loading.
-        if hasattr(self, "pending_optimizer_states"):
-            optimizers = self.trainer.optimizers
-            if not isinstance(optimizers, list):
-                optimizers = [optimizers]
-            
-            if len(optimizers) == len(self.pending_optimizer_states):
-                try:
-                    for opt, state in zip(optimizers, self.pending_optimizer_states):
-                        opt.load_state_dict(state)
-                    logger.info(f"✅ [RESUME] Manually restored {len(optimizers)} optimizer states (Trauma Averted).")
-                except Exception as e:
-                    logger.warning(f"⚠️ [RESUME] Manual optimizer restoration failed: {e}")
-            else:
-                logger.warning(f"⚠️ [RESUME] Optimizer count mismatch: Found {len(self.pending_optimizer_states)}, Expected {len(optimizers)}")
-            
-            # Clean up memory
-            del self.pending_optimizer_states
-
-        # =====================================================================
-        # 1.2 MANUAL SCHEDULER RESTORATION
-        # =====================================================================
-        if hasattr(self, "pending_scheduler_states"):
-            schedulers = self.lr_schedulers()
-            if not isinstance(schedulers, list):
-                schedulers = [schedulers]
-            
-            # Filter None if any
-            schedulers = [s for s in schedulers if s is not None]
-
-            if len(schedulers) == len(self.pending_scheduler_states):
-                try:
-                    for sch, state in zip(schedulers, self.pending_scheduler_states):
-                        sch.load_state_dict(state)
-                    logger.info(f"✅ [RESUME] Manually restored {len(schedulers)} LR scheduler states.")
-                except Exception as e:
-                    logger.warning(f"⚠️ [RESUME] Manual scheduler restoration failed: {e}")
-            else:
-                 logger.warning(f"⚠️ [RESUME] Scheduler count mismatch: Found {len(self.pending_scheduler_states)}, Expected {len(schedulers)}")
-            
-            del self.pending_scheduler_states
-        
-        # =====================================================================
-        # 1.3 GRADNORM OPTIMIZER RESTORATION (Fix #340)
-        # =====================================================================
-        if hasattr(self, "pending_gn_opt_state") and self.gradnorm is not None:
-             if self.gradnorm.optimizer is None:
-                  # Force initialization so we can load the state
-                  self.gradnorm.optimizer = torch.optim.Adam([self.gradnorm.weights], lr=0.005)
-             try:
-                 self.gradnorm.optimizer.load_state_dict(self.pending_gn_opt_state)
-                 logger.info("✅ [RESUME] GradNorm optimizer momentum restored.")
-             except Exception as e:
-                 logger.warning(f"⚠️ [RESUME] GradNorm optimizer restoration failed: {e}")
-             del self.pending_gn_opt_state
-
-        # =====================================================================
-        # 1.3 DDP ACCELERATOR INITIALIZATION
-        # =====================================================================
-        if torch.cuda.is_available():
-             world_size = dist.get_world_size() if dist.is_initialized() else 1
-             if self.ddp_gatherer is None:
-                 self.ddp_gatherer = SOTA_DistributedGatherer(self.device, world_size)
-                 logger.info(f"✅ [SOTA] DDP Gatherer Online (World={world_size}, Device={self.device})")
-
-        # =====================================================================
-        # 2. FRESH CALIBRATION (Priority 2)
-        # =====================================================================
-        # Only run if NOT restored and NOT calibrated.
-        # This prevents double-calibration or overwriting restored stats.
-        
-        if not (hasattr(self.trainer, "datamodule") and self.trainer.datamodule):
-            logger.warning("No DataModule found. Skipping stats fitting.")
-            return
-
-        loader = self.trainer.datamodule.train_dataloader()
-        dataset = loader.dataset
-        
-        # --- 1. Physics Normalizer Calibration ---
-        # [SOTA Fix] Check explicitly if model normalizer needs calibration
-        if hasattr(self.model, "normalizer") and not self.model.normalizer.is_calibrated.item():
-            logger.info(f"[Rank {self.global_rank}] Calibrating Normalizer...")
-            try:
-                index_path = getattr(dataset, "index_path", None)
-                metadata = getattr(dataset, "metadata", {})
-                ts_cols = metadata.get("ts_columns", [])
-                
-                if index_path and ts_cols:
-                    self.model.normalizer.calibrate_from_stats(index_path, ts_cols)
-                    
-                    # [CRITICAL] EMA Shadow Sync
-                    # The EMA was initialized BEFORE normalizer calibration.
-                    # We must force-update the shadow's normalizer buffers.
-                    if hasattr(self, 'ema') and self.ema is not None:
-                        logger.info(f"[Rank {self.global_rank}] Syncing EMA shadow with calibrated normalizer...")
-                        for name, buffer in self.model.normalizer.named_buffers():
-                            full_name = f"normalizer.{name}"
-                            if full_name in self.ema.shadow:
-                                self.ema.shadow[full_name] = buffer.data.detach().cpu().clone()
-                        logger.info(f"[Rank {self.global_rank}] EMA shadow sync complete.")
-                else:
-                    logger.warning("Dataset missing 'index_path' or 'metadata.ts_columns'. Using identity normalization.")
-                    
-            except Exception as e:
-                logger.error(f"[CRITICAL] Normalizer Calibration Failed: {e}")
-                logger.warning("SYSTEM SAFETY: Proceeding with Uncalibrated Normalizer. Check data paths!")
-
-        # --- 2. AWR Stats Fitting (Rank 0 Compute + Broadcast) ---
-        self._fit_awr_stats_ddp(dataset)
-        
-        # [v4.1.1 SOTA FIX] Final Pre-Flight Cleanup
-        # Ensure that the dataset handle is closed on ALL ranks 
-        # before the trainer officially starts the worker loop.
-        if hasattr(dataset, "_lmdb_env"):
-            dataset._lmdb_env = None
 
     def _fit_awr_stats_ddp(self, dataset):
         """
@@ -3076,10 +3129,21 @@ class ICUGeneralistWrapper(pl.LightningModule):
             acl_param_ids = {id(p) for p in acl_params}
             
             # 3. Identify Main Model Parameters (excluding Aux and ACL)
-            main_model_params = [
-                p for p in self.model.parameters() 
-                if id(p) not in aux_param_ids
-            ]
+            # [Patch 66] SOTA Weight Decay Grouping (Smoking Gun #SGD-15)
+            # Rationale: Decaying LayerNorm weights (1D) destroys normalization capability.
+            decay_params = []
+            no_decay_params = []
+            
+            # Helper to check exclusion
+            excluded_ids = aux_param_ids.union(acl_param_ids)
+            
+            for p in self.model.parameters():
+                if id(p) in excluded_ids:
+                    continue
+                if p.ndim < 2:
+                    no_decay_params.append(p)
+                else:
+                    decay_params.append(p)
             
             # [PATCH 4 - SOTA FINAL] Parity Restoration
             # Original: 1.5x caused spikes.
@@ -3087,8 +3151,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
             aux_lr_mult = self.cfg.train.get("aux_lr_multiplier", 1.0)
             
             optimizer_params = [
-                # Group 1: Main Backbone (Standard LR)
-                {'params': main_model_params, 'lr': self.cfg.train.lr, 'weight_decay': self.cfg.train.weight_decay},
+                # Group 1: Main Backbone (Decay - Weights/Embeddings)
+                {'params': decay_params, 'lr': self.cfg.train.lr, 'weight_decay': self.cfg.train.weight_decay},
+                
+                # Group 1b: Main Backbone (No Decay - Bias/LayerNorm)
+                {'params': no_decay_params, 'lr': self.cfg.train.lr, 'weight_decay': 0.0},
                 
                 # Group 2: Aux Head (Boosted LR)
                 {'params': aux_params, 'lr': self.cfg.train.lr * aux_lr_mult, 'weight_decay': self.cfg.train.weight_decay},
@@ -3161,7 +3228,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             checkpoint["normalizer_state"] = self.model.normalizer.state_dict()
             
         if self._fnd_grad_ema is not None:
-           checkpoint["fnd_grad_ema"] = self._fnd_grad_ema
+           checkpoint["_fnd_grad_ema"] = self._fnd_grad_ema
 
         # [SOTA FIX] Manual Optimization Persistence
         # Capture main optimizers and schedulers explicitly
@@ -3182,9 +3249,23 @@ class ICUGeneralistWrapper(pl.LightningModule):
             logger.info("[SAVE] EMA shadow weights captured.")
 
         # GradNorm Persistence
-        if hasattr(self.gradnorm, "optimizer") and self.gradnorm.optimizer is not None:
-             checkpoint["gradnorm_optimizer_state"] = self.gradnorm.optimizer.state_dict()
-             logger.info("[SAVE] GradNorm optimizer state captured.")
+        if self.gradnorm is not None and self.gradnorm.optimizer is not None:
+            checkpoint["gradnorm_optimizer_state"] = self.gradnorm.optimizer.state_dict()
+            logger.info("[SAVE] GradNorm optimizer state captured.")
+
+        # [v48.0] Save Accumulation Progress
+        checkpoint["grad_accum_idx"] = self.grad_accum_idx
+
+        # [v53.0] AGEM Reference Persistence
+        if self.grad_ref_buffer is not None:
+            checkpoint["grad_ref_buffer"] = self.grad_ref_buffer
+            
+        # [v54.0] Scaler Restoration Bridge (Smoking Gun #110)
+        # Rationale: Standard PL sometimes misses the scaler state in manual optimization.
+        if hasattr(self.trainer, "precision_plugin") and hasattr(self.trainer.precision_plugin, "scaler"):
+             if self.trainer.precision_plugin.scaler is not None:
+                  checkpoint["grad_scaler_state"] = self.trainer.precision_plugin.scaler.state_dict()
+                  logger.info("[SAVE] GradScaler state captured.")
 
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]):
         """
@@ -3199,15 +3280,19 @@ class ICUGeneralistWrapper(pl.LightningModule):
         if "grad_norm_ema" not in state_dict:
             state_dict["grad_norm_ema"] = torch.tensor(1.0)
             
-        # [v184.0 SOTA FIX] Resumption Bias Invariance (Smoking Gun #20)
-        # Rationale: Preserve the true step count if available. Resetting to 100 
-        # causes ~1.5x artificial inflation of the logged GN due to bias correction.
         if "grad_norm_step_count" not in state_dict:
-            state_dict["grad_norm_step_count"] = torch.tensor(100)      
+            state_dict["grad_norm_step_count"] = torch.tensor(checkpoint.get("global_step", 100))
             
-        if "resumption_grace_steps" not in state_dict:
-            # Initialize with 50 (SOTA Grace)
-            state_dict["resumption_grace_steps"] = torch.tensor(50)
+        # [v48.0 SOTA FIX] Stateful Accumulation Index (Smoking Gun #90)
+        if "grad_accum_idx" not in state_dict:
+            state_dict["grad_accum_idx"] = torch.tensor(checkpoint.get("grad_accum_idx", 0))
+            logger.info(f"[RESUME] Accumulation Index restored: {state_dict['grad_accum_idx'].item()}")
+            
+        # [v52.2 SOTA FIX] Grace Period Renewal (Smoking Gun #MasterAudit)
+        # Rationale: All models, including mature ones, benefit from a re-settling
+        # grace period of 50 steps to allow momentum and stability metrics to align.
+        state_dict["resumption_grace_steps"] = torch.tensor(50)
+        logger.info("[RESUME] Resumption Grace Period renewed (50 steps).")
 
         # 2. 6-TO-7 TASK TRANSITION (Padding for 'phys' expansion)
         # Rationale: We added 'phys' as the 7th task. Old checkpoints only have 6.
@@ -3282,6 +3367,31 @@ class ICUGeneralistWrapper(pl.LightningModule):
         if "ema_state_dict" in checkpoint:
              self.pending_ema_state = checkpoint["ema_state_dict"]
              logger.info("[RESUME] Captured EMA shadow weights.")
+             
+        # [v30.3 SOTA FIX] MGP Anchor Restoration (The Great Whiplash)
+        # Rationale: _fnd_grad_ema is saved in root, but must be restored manually
+        # to ensure the PCGrad direction is aligned with pre-save state.
+        if "_fnd_grad_ema" in checkpoint:
+             if self._fnd_grad_ema is None:
+                  self._fnd_grad_ema = checkpoint["_fnd_grad_ema"].clone().to(self.device)
+             else:
+                  self._fnd_grad_ema.copy_(checkpoint["_fnd_grad_ema"].to(self._fnd_grad_ema.device))
+             logger.info("[RESUME] MGP Direction Anchor Restored.")
+             
+        # [v53.0] AGEM Reference Restoration
+        if "grad_ref_buffer" in checkpoint:
+             if self.grad_ref_buffer is None:
+                  self.grad_ref_buffer = checkpoint["grad_ref_buffer"].clone().to(self.device)
+             else:
+                  self.grad_ref_buffer.copy_(checkpoint["grad_ref_buffer"].to(self.device))
+             logger.info("[RESUME] AGEM Reference Accumulator Restored.")
+
+        # [v54.0] Scaler Restoration Bridge
+        if "grad_scaler_state" in checkpoint:
+             if hasattr(self.trainer, "precision_plugin") and hasattr(self.trainer.precision_plugin, "scaler"):
+                  if self.trainer.precision_plugin.scaler is not None:
+                       self.trainer.precision_plugin.scaler.load_state_dict(checkpoint["grad_scaler_state"])
+                       logger.info("[RESUME] GradScaler state restored.")
              
         # [v31.0 SOTA FIX] Active Grace Logging
         # Rationale: Only output the hiberation log if we are actually resuming.

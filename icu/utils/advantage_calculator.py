@@ -98,7 +98,7 @@ SEPSIS_CONSTANTS = {
     'LACTATE_CRITICAL': 4.0,     # mmol/L (Severe metabolic dysfunction)
     
     # Respiratory Thresholds (qSOFA)
-    'RESP_UPPER': 22.0,          # bpm (qSOFA respiratory criterion)
+    'RESP_QSOFA': 22.0,          # bpm (qSOFA respiratory criterion)
     'RESP_CRITICAL': 30.0,       # bpm (Severe respiratory distress)
     
     # Other Clinical Markers
@@ -225,12 +225,16 @@ class ICUAdvantageCalculator(nn.Module):
         # qSOFA thresholds
         if qsofa_thresholds is None:
             self.qsofa_thresholds = {
-                'resp': SEPSIS_CONSTANTS['RESP_UPPER'],
+                'resp': SEPSIS_CONSTANTS['RESP_QSOFA'],
                 'sbp': SEPSIS_CONSTANTS['SBP_HYPOTENSION'],
                 'gcs': SEPSIS_CONSTANTS['GCS_LOWER']
             }
         else:
             self.qsofa_thresholds = qsofa_thresholds
+
+        # [v2026 SOTA] Clinical Integrity Guard
+        # "Sharpening the Axe": Verify all required constants exist at startup
+        self._validate_clinical_config()
 
         # Global Whitening Statistics (Welford's Algorithm state)
         # Register as buffers for persistence across checkpoints
@@ -258,6 +262,25 @@ class ICUAdvantageCalculator(nn.Module):
         # Slow Component: Wide-bridge gradient signal (5x wider)
         s_slow = torch.sigmoid(diff * (steepness * 0.2))
         return 0.5 * (s_fast + s_slow)
+
+    def _validate_clinical_config(self):
+        """
+        [SOTA 2026] Clinical Integrity Guard.
+        Ensures all required clinical thresholds are defined in SEPSIS_CONSTANTS.
+        This prevents 'Ghost Constant' crashes mid-training.
+        """
+        required_keys = [
+            'MAP_TARGET', 'SBP_HYPOTENSION', 'LACTATE_UPPER', 
+            'RESP_QSOFA', 'DENSE_REWARD_CAP', 'GCS_LOWER'
+        ]
+        missing = [k for k in required_keys if k not in SEPSIS_CONSTANTS]
+        
+        if missing:
+            error_msg = f"[CRITICAL CONFIG ERROR] Missing clinical constants: {missing}. Resolve in SEPSIS_CONSTANTS!"
+            logger.critical(error_msg)
+            raise ValueError(error_msg)
+        
+        logger.info("Γ£à [ADVANTAGE] Clinical Configuration Integrity Verified.")
 
     def set_stats(self, mean: float, std: float, beta: float = None, count: int = None):
         """
@@ -491,29 +514,33 @@ class ICUAdvantageCalculator(nn.Module):
 
             # --- 4. MAP Penalty (Sigmoid Soft-Cliff) ---
             if map_val is not None:
-                # [v132.0 SOTA FIX] Rescued Gradient (Center=60, Steepness=0.5)
-                map_penalty_score = self._clinical_sigmoid(map_val, 60.0, 0.5)
+                # [v132.0 SOTA FIX] Rescued Gradient (Target=65, Steepness=0.5)
+                # [Patch 64] Strict Sepsis-3 Alignment
+                map_penalty_score = self._clinical_sigmoid(map_val, SEPSIS_CONSTANTS['MAP_TARGET'], 0.5)
                 # Apply MAP-specific mask
                 rewards -= self.shaping_coef * map_penalty_score * get_f_mask(idx_map)
 
             # --- 5. SBP Penalty (Additional Hypotension Marker) ---
             if sbp_val is not None:
-                # [v132.0 SOTA FIX] Rescued Gradient (Center=95, Steepness=0.2)
-                sbp_penalty_score = self._clinical_sigmoid(sbp_val, 95.0, 0.2)
+                # [v132.0 SOTA FIX] Rescued Gradient (Target=100, Steepness=0.2)
+                # [Patch 64] Strict Sepsis-3 Alignment
+                sbp_penalty_score = self._clinical_sigmoid(sbp_val, SEPSIS_CONSTANTS['SBP_HYPOTENSION'], 0.2)
                 # Apply SBP-specific mask
                 rewards -= self.shaping_coef * 0.5 * sbp_penalty_score * get_f_mask(idx_sbp)
 
             # --- 6. Lactate Penalty (Sigmoid Soft-Cliff) ---
             if lactate_val is not None:
-                # [v132.0 SOTA FIX] Rescued Gradient (Center=3.0, Steepness=1.0, Inverse=True)
-                lac_penalty_score = self._clinical_sigmoid(lactate_val, 3.0, 1.0, inverse=True)
+                # [v132.0 SOTA FIX] Rescued Gradient (Target=2.0, Steepness=1.0, Inverse=True)
+                # [Patch 64] Strict Sepsis-3 Alignment
+                lac_penalty_score = self._clinical_sigmoid(lactate_val, SEPSIS_CONSTANTS['LACTATE_UPPER'], 1.0, inverse=True)
                 # Apply Lactate-specific mask
                 rewards -= self.shaping_coef * 1.5 * lac_penalty_score * get_f_mask(idx_lac)
 
             # --- 7. Respiratory Penalty (qSOFA) ---
             if resp_val is not None:
-                # [v132.0 SOTA FIX] Rescued Gradient (Center=24.0, Steepness=0.3, Inverse=True)
-                resp_penalty_score = self._clinical_sigmoid(resp_val, 24.0, 0.3, inverse=True)
+                # [v132.0 SOTA FIX] Rescued Gradient (Target=22, Steepness=0.3, Inverse=True)
+                # [Patch 64] Strict Sepsis-3 Alignment
+                resp_penalty_score = self._clinical_sigmoid(resp_val, SEPSIS_CONSTANTS['RESP_QSOFA'], 0.3, inverse=True)
                 # Apply Resp-specific mask
                 rewards -= self.shaping_coef * 0.3 * resp_penalty_score * get_f_mask(idx_resp)
 
@@ -1108,7 +1135,7 @@ class ICUAdvantageCalculator(nn.Module):
                     # If 10% clipped, beta * 1.1.
                     # This fixes the "lazy adaptation" (33 steps -> 3 steps).
                     boost_factor = 1.0 + clipped_rate
-                    self.beta = self.beta * boost_factor
+                    self.beta.copy_(self.beta * boost_factor)
                 
                 # [FIX] current_ess must be defined unconditionally for use at line 1017
                 current_ess = ess.item()
@@ -1171,16 +1198,16 @@ class ICUAdvantageCalculator(nn.Module):
             if self.beta_growth_cooldown.item() > 0:
                 self.beta_growth_cooldown.sub_(1)
 
-                # [v25.6 SOTA] ESS Momentum Buffer
-                # Stabilizes telemetry across jittery batches.
-                # [v2026] Uses Scaled Decay
-                ema_d = self.ess_ema_decay
-                self.ess_momentum_buffer.copy_(ema_d * self.ess_momentum_buffer + (1.0 - ema_d) * current_ess)
-                
-                # [v7.2 SOTA FIX] IronFloor: Strict runtime clamp
-                # Rationale: Persistence and config overrides were bypassing the Phase 6
-                # min_beta=1.0 floor, causing ESS collapse in DDP environments.
-                self.beta.clamp_(min=self.min_beta, max=self.max_beta)
+            # [v25.6 SOTA] ESS Momentum Buffer
+            # Stabilizes telemetry across jittery batches.
+            # [v2026] Uses Scaled Decay
+            ema_d = self.ess_ema_decay
+            self.ess_momentum_buffer.copy_(ema_d * self.ess_momentum_buffer + (1.0 - ema_d) * current_ess)
+            
+            # [v7.2 SOTA FIX] IronFloor: Strict runtime clamp
+            # Rationale: Persistence and config overrides were bypassing the Phase 6
+            # min_beta=1.0 floor, causing ESS collapse in DDP environments.
+            self.beta.clamp_(min=self.min_beta, max=self.max_beta)
 
                 
             # B. Adaptive Clipping (Target = 95th Percentile)

@@ -10,7 +10,7 @@ run_name: "gen_v1_${now:%Y-%m-%d_%H-%M-%S}"
 seed: 42
 compile_model: false
 save_checkpoints: false
-debug_save_epochs: [12]     # [DEBUG] List of epochs to save snapshots (e.g., [5, 10, 50])
+debug_save_epochs: [7]     # [DEBUG] List of epochs to save snapshots (e.g., [5, 10, 50])
 
 # --- Directory Paths ---
 output_dir: "outputs/phase1"           # Main output directory
