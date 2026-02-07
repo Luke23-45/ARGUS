@@ -9,8 +9,8 @@ defaults:
 run_name: "gen_v1_${now:%Y-%m-%d_%H-%M-%S}"
 seed: 42
 compile_model: false
-save_checkpoints: false
-debug_save_epochs: [4]     # [DEBUG] List of epochs to save snapshots (e.g., [5, 10, 50])
+save_checkpoints: true
+debug_save_epochs: []     # [DEBUG] List of epochs to save snapshots (e.g., [5, 10, 50])
 
 # --- Directory Paths ---
 output_dir: "outputs/phase1"           # Main output directory
@@ -82,7 +82,7 @@ train:
   horizon_ramp: 40
 
   # Debug Mode (Smoke Test)
-  debug_run: true #true
+  debug_run: false #true
   debug_limit_batches: 200
   debug_limit_val: 500
 
@@ -94,15 +94,15 @@ train:
   awr_gamma: 0.92             # [v25.9 SOTA] Synchronized with Horizon Manifold
   adaptive_beta: true
   adaptive_clipping: true
-  target_ess: 0.10            # [v10.5 SOTA] Target 10% Batch Selection (approx 230 samples)
+  target_ess: 0.12            # [v10.5 SOTA] Target 12% Batch Selection (Boosted for Recall)
   awr_momentum: 0.98          # [v38.0] Selection Smoothing Momentum (was 0.95)
-  beta_min: 0.8               # [v38.0] Selection Floor (Prevents AUROC collapse)
+  beta_min: 1.2               # [v38.0] Selection Floor (Raised to 1.2 to mimic Resumption Boost)
   alpha_min: 0.1              # [SOTA SG-2] Prevents minority task starvation
   
   # AWR Calibration Speed/Quality (v10.1 Upgrade)
   # - "full": Scans all trajectories (~5-10 min, best for final training)
   # - "sample": Random subset (~10-30 sec, best for testing)
-  awr_calibration_mode: "sample" # full for whole population scan or sample
+  awr_calibration_mode: "full" # full for whole population scan or sample
   awr_max_samples: 10000      # [SOTA FIX] Increased for Batch 2048 / Full Sepsis-3 Population
 
   

@@ -852,7 +852,7 @@ class ICUAdvantageCalculator(nn.Module):
                     # [v29.2 SOTA FIX] Softened Floor (Abyssal #2)
                     # Rationale: Increasing floor from 1e-3 to 0.01 prevents 
                     # extreme 1000x Advantage scaling during early training/resumption.
-                    bias_correction = torch.clamp(torch.tensor(1.0 - (mom ** t.item()), device=t.device), min=0.01)
+                    bias_correction = torch.as_tensor(1.0 - (mom ** t.item()), device=t.device).clamp(min=0.01)
                     
                     # Update (Uncorrected)
                     self.adv_mean.mul_(mom).add_(curr_mu, alpha=1.0 - mom)

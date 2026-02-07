@@ -632,15 +632,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
         if self.trainer.training:
             logger.info("📡 [RESUME] Grand Unified Persistence Audit:")
             if hasattr(self, "sepsis_acl"):
-                 logger.info(f"   |- [ACL] Momentum: {float(self.sepsis_acl.momentum):.4f}")
+                logger.info(f"   |- [ACL] Momentum: {float(self.sepsis_acl.momentum):.4f}")
             if hasattr(self, "class_balancer"):
-                 logger.info(f"   |- [Balancer] Sepsis Weight: {self.class_balancer.get_weights()[1].item():.4f}")
+                logger.info(f"   |- [Balancer] Sepsis Weight: {self.class_balancer.get_weights()[1].item():.4f}")
             if hasattr(self, "bgsl_loss"):
-                 logger.info(f"   |- [BGSL] Weights: Trend={self.bgsl_loss.w_t.item():.2f}, Shock={self.bgsl_loss.w_h.item():.2f}")
+                logger.info(f"   |- [BGSL] Weights: Trend={self.bgsl_loss.w_t.item():.2f}, Shock={self.bgsl_loss.w_h.item():.2f}")
             if hasattr(self, "ghost_bank"):
-                 logger.info(f"   |- [GhostBank] Size: {self.ghost_bank.size.item()}/{self.ghost_bank.capacity}")
+                logger.info(f"   |- [GhostBank] Size: {self.ghost_bank.size.item()}/{self.ghost_bank.capacity}")
             if hasattr(self, "tcb_buffer"):
-                 logger.info(f"   |- [TCB] Filled: {self.tcb_buffer.queue_filled.item()}/{self.tcb_buffer.capacity}")
+                logger.info(f"   |- [TCB] Filled: {self.tcb_buffer.queue_filled.item()}/{self.tcb_buffer.capacity}")
 
         # 2.3 GradNorm Optimizer (Fix #340)
         if hasattr(self, "pending_gn_opt_state") and self.gradnorm is not None:
@@ -677,6 +677,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 if hasattr(self.gradnorm, 'weights'):
                     dist.broadcast(self.gradnorm.weights, src=0)
 
+
+                # [v52.1] Sync Initial Losses to prevent meta-drift
+                if hasattr(self.gradnorm, 'initial_losses'):
+                    dist.broadcast(self.gradnorm.initial_losses, src=0)
             # 4. AWR Consensus (Phase 38.1)
             # Rationale: Ranks MUST have identical whitening and beta stats 
             # to prevent divergent selection pressure.
@@ -689,10 +693,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 dist.broadcast(self.awr_calculator.clip_rate_buffer, src=0)
 
             logger.info("🛡️ [PMS] Grand Unified DDP Consensus achieved (Rank Sync Complete).")
-                # [v52.1] Sync Initial Losses to prevent meta-drift
-                if hasattr(self.gradnorm, 'initial_losses'):
-                    dist.broadcast(self.gradnorm.initial_losses, src=0)
             
+                       
             if hasattr(self, "loss_scaler"):
                 dist.broadcast(self.loss_scaler.log_vars, src=0)
                 dist.broadcast(self.loss_scaler.loss_emas, src=0)
@@ -3433,9 +3435,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
              logger.info("[RESUME] AGEM Reference Accumulator Restored.")
 
         # [v54.0] Scaler Restoration Bridge
-                   if self.trainer.precision_plugin.scaler is not None:
-                        self.trainer.precision_plugin.scaler.load_state_dict(checkpoint["grad_scaler_state"])
-                        logger.info("[RESUME] GradScaler state restored.")
+        if "grad_scaler_state" in checkpoint:
+             if hasattr(self.trainer, "precision_plugin") and hasattr(self.trainer.precision_plugin, "scaler"):
+                  if self.trainer.precision_plugin.scaler is not None:
+                       self.trainer.precision_plugin.scaler.load_state_dict(checkpoint["grad_scaler_state"])
+                       logger.info("[RESUME] GradScaler state restored.")
         
         # [v38.1 SOTA] AWR Persistence Bridge
         # Rationale: Direct restoration to bypass fit_stats loop.
