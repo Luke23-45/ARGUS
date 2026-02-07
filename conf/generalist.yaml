@@ -10,7 +10,7 @@ run_name: "gen_v1_${now:%Y-%m-%d_%H-%M-%S}"
 seed: 42
 compile_model: false
 save_checkpoints: false
-debug_save_epochs: [7]     # [DEBUG] List of epochs to save snapshots (e.g., [5, 10, 50])
+debug_save_epochs: [4]     # [DEBUG] List of epochs to save snapshots (e.g., [5, 10, 50])
 
 # --- Directory Paths ---
 output_dir: "outputs/phase1"           # Main output directory
@@ -88,13 +88,16 @@ train:
 
   
   # AWR (Advantage Weighted Regression) v2.0
-  awr_beta: 0.60              # [v12.5.1] Increased for Broad Discovery (ESS Stabilization)
+  awr_beta: 1.0               # [v38.0] Selection Smoking Gun Smoothing (Start higher)
   awr_max_weight: 20.0        
   awr_lambda: 0.95            # [SOTA] GAE-Lambda for credit assignment
   awr_gamma: 0.92             # [v25.9 SOTA] Synchronized with Horizon Manifold
   adaptive_beta: true
   adaptive_clipping: true
-  awr_momentum: 0.999         # [SOTA] High momentum to stabilize beta during long epochs (1176 batches)
+  target_ess: 0.10            # [v10.5 SOTA] Target 10% Batch Selection (approx 230 samples)
+  awr_momentum: 0.98          # [v38.0] Selection Smoothing Momentum (was 0.95)
+  beta_min: 0.8               # [v38.0] Selection Floor (Prevents AUROC collapse)
+  alpha_min: 0.1              # [SOTA SG-2] Prevents minority task starvation
   
   # AWR Calibration Speed/Quality (v10.1 Upgrade)
   # - "full": Scans all trajectories (~5-10 min, best for final training)

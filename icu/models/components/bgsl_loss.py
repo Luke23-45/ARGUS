@@ -23,8 +23,8 @@ class BGSLLoss(nn.Module):
         self, 
         pos_weight: float = 5.0, 
         gamma: float = 2.0,
-        trend_coef: float = 1.0, 
-        shock_coef: float = 2.0
+        trend_coef: float = 0.5, 
+        shock_coef: float = 0.2
     ):
         """
         Args:
@@ -147,10 +147,9 @@ class BGSLLoss(nn.Module):
         else:
             l_shock = (l_shock_unreduced * num_shock.detach()).mean()
         
-        # Constant Physics Supervision
-        if self.training:
-            self.w_t.data.fill_(0.5)
-            self.w_h.data.fill_(0.2)
+        # [v38.2 SOTA FIX] Persistence Bridge
+        # Rationale: w_t and w_h are now persistent buffers. 
+        # Do not use fill_ in forward to prevent amnesia.
             
         total_loss = l_state + (self.w_t * l_trend) + (self.w_h * l_shock)
         

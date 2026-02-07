@@ -37,7 +37,7 @@ class TemporalContrastiveBuffer(nn.Module):
         self.capacity = capacity
         self.temperature = temperature
         self.base_latent_adapter_strength = latent_adapter_strength
-        self.latent_adapter_strength = latent_adapter_strength
+        self.register_buffer("latent_adapter_strength", torch.tensor(latent_adapter_strength).float())
         
         # [v27.0 FIX] Zero-initialize queue instead of random
         # This prevents meaningless InfoNCE contrasts during warmup
@@ -73,7 +73,7 @@ class TemporalContrastiveBuffer(nn.Module):
         # Scale adapter: (1 - strength) is the retention factor.
         retention_ref = 1.0 - self.base_latent_adapter_strength
         retention_curr = ScalingSteward.get_decay(retention_ref, n_curr)
-        self.latent_adapter_strength = 1.0 - retention_curr
+        self.latent_adapter_strength.fill_(1.0 - retention_curr)
         
         # [v31.0 SOTA FIX] Prototype Momentum Scaling (Smoking Gun #330)
         # Rationale: Manifold anchoring must adapt at the same epoch-rate.
@@ -191,9 +191,9 @@ class TemporalContrastiveBuffer(nn.Module):
         # [v29.6 SOTA FIX] Ancestral Alignment (Abyssal #304)
         # Rationale: Historical negatives drift. Soft-align them toward current prototype.
         effective_queue = self.queue[:filled].detach()
-        if self.latent_adapter_strength > 0 and self.prototype_ema.abs().sum() > 0:
-             effective_queue = (1.0 - self.latent_adapter_strength) * effective_queue + \
-                               self.latent_adapter_strength * self.prototype_ema
+        if float(self.latent_adapter_strength) > 0 and self.prototype_ema.abs().sum() > 0:
+             effective_queue = (1.0 - float(self.latent_adapter_strength)) * effective_queue + \
+                               float(self.latent_adapter_strength) * self.prototype_ema
              effective_queue = F.normalize(effective_queue, dim=1)
 
         l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1) # [B, 1]

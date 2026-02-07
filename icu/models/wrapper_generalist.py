@@ -164,7 +164,7 @@ class DynamicClassBalancer(nn.Module):
     def __init__(self, num_classes: int, beta: float = 0.99, prior_pos_weight: float = None):
         super().__init__()
         self.num_classes = num_classes
-        self.beta = beta
+        self.register_buffer("beta", torch.tensor(beta).float())
         self.register_buffer("counts", torch.zeros(num_classes))
         self.register_buffer("initialized", torch.tensor(False))
         
@@ -197,7 +197,7 @@ class DynamicClassBalancer(nn.Module):
         """[SOTA v2026] Unifies class-weight momentum across step densities."""
         if n_curr <= 0: return
         # Baseline: 0.9995 beta for 200 steps (Standard Stability)
-        self.beta = ScalingSteward.get_decay(0.9995, n_curr)
+        self.beta.fill_(ScalingSteward.get_decay(0.9995, n_curr))
 
     def get_weights(self) -> torch.Tensor:
         safe_counts = self.counts + 1.0 
@@ -275,8 +275,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
             gamma=cfg.train.get("awr_gamma", 0.99),
             adaptive_beta=cfg.train.get("adaptive_beta", True),
             adaptive_clipping=cfg.train.get("adaptive_clipping", True),
-            beta_momentum=cfg.train.get("awr_momentum", 0.999), # [SOTA] Stabilize AWR for long epochs
-            target_ess=cfg.train.get("target_ess", 20.0)        # [SOTA 2025] Adaptive Target ESS
+            beta_momentum=cfg.train.get("awr_momentum", 0.98), # [v38.0] Smoother AWR transition
+            target_ess=cfg.train.get("target_ess", 0.10),      # Grounded to % since lop6
+            min_beta=cfg.train.get("beta_min", 0.5)            # [v38.0] Selection Floor
         )
         
         # =====================================================================
@@ -296,7 +297,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             self.gradnorm = GradNormBalancer(
                 num_tasks=7, 
                 shared_params=shared_params,
-                alpha=cfg.train.get("gradnorm_alpha", 1.5)
+                alpha=cfg.train.get("alpha_min", 0.1) # [SOTA SG-2] Reduced for Sepsis sensitivity
             ).to(self.device)
         
         self.base_phys_weight = cfg.train.get("phys_loss_weight", 0.2)
@@ -510,7 +511,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         logger.info(f" [SOTA] Scaling Steward: Unifying dynamics for {n_curr} steps.")
         
         self.grad_ema_decay = ScalingSteward.get_decay(0.99, n_curr)
-        self.class_balancer.beta = ScalingSteward.get_decay(0.9995, n_curr)
+        self.class_balancer.scale_dynamics(n_curr)
         
         ref_warmup = 1500 
         self.trainer.warmup_steps = ScalingSteward.get_steps(ref_warmup, n_curr)
@@ -615,6 +616,32 @@ class ICUGeneralistWrapper(pl.LightningModule):
                  logger.warning(f"⚠️ [RESUME] Scheduler count mismatch: Found {len(self.pending_scheduler_states)}, Expected {len(schedulers)}")
             del self.pending_scheduler_states
 
+        # 2.2.5 AWR Calculator (The Amnesia Fix #38.1)
+        # Rationale: Direct buffer restoration ensures bit-perfect parity 
+        # for whitening and adaptive beta dynamics.
+        if hasattr(self, "pending_awr_state") and hasattr(self, "awr_calculator"):
+            try:
+                self.awr_calculator.load_awr_state(self.pending_awr_state)
+                logger.info("✅ [RESUME] AWR Engine internal state restored.")
+            except Exception as e:
+                logger.warning(f"⚠️ [RESUME] AWR restoration failed: {e}")
+            del self.pending_awr_state
+
+        # 2.2.6 Grand Unified Persistence Telemetry (Phase 38.2)
+        # Rationale: Provide clear forensic proof of restoration for all components.
+        if self.trainer.training:
+            logger.info("📡 [RESUME] Grand Unified Persistence Audit:")
+            if hasattr(self, "sepsis_acl"):
+                 logger.info(f"   |- [ACL] Momentum: {float(self.sepsis_acl.momentum):.4f}")
+            if hasattr(self, "class_balancer"):
+                 logger.info(f"   |- [Balancer] Sepsis Weight: {self.class_balancer.get_weights()[1].item():.4f}")
+            if hasattr(self, "bgsl_loss"):
+                 logger.info(f"   |- [BGSL] Weights: Trend={self.bgsl_loss.w_t.item():.2f}, Shock={self.bgsl_loss.w_h.item():.2f}")
+            if hasattr(self, "ghost_bank"):
+                 logger.info(f"   |- [GhostBank] Size: {self.ghost_bank.size.item()}/{self.ghost_bank.capacity}")
+            if hasattr(self, "tcb_buffer"):
+                 logger.info(f"   |- [TCB] Filled: {self.tcb_buffer.queue_filled.item()}/{self.tcb_buffer.capacity}")
+
         # 2.3 GradNorm Optimizer (Fix #340)
         if hasattr(self, "pending_gn_opt_state") and self.gradnorm is not None:
              if self.gradnorm.optimizer is None:
@@ -634,6 +661,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
             dist.broadcast(self.grad_norm_ema, src=0)
             dist.broadcast(self.grad_norm_std, src=0)
             dist.broadcast(self.grad_norm_step_count, src=0)
+            dist.broadcast(self.phys_grad_ema, src=0)
+            dist.broadcast(self.diff_grad_ema, src=0)
             
             # 2. Foundation Consensus (MGP & AGEM)
             if self._fnd_grad_ema is not None:
@@ -647,6 +676,19 @@ class ICUGeneralistWrapper(pl.LightningModule):
             if self.gradnorm is not None:
                 if hasattr(self.gradnorm, 'weights'):
                     dist.broadcast(self.gradnorm.weights, src=0)
+
+            # 4. AWR Consensus (Phase 38.1)
+            # Rationale: Ranks MUST have identical whitening and beta stats 
+            # to prevent divergent selection pressure.
+            if hasattr(self, "awr_calculator"):
+                dist.broadcast(self.awr_calculator.adv_mean, src=0)
+                dist.broadcast(self.awr_calculator.adv_std, src=0)
+                dist.broadcast(self.awr_calculator.stats_count, src=0)
+                dist.broadcast(self.awr_calculator.beta, src=0)
+                dist.broadcast(self.awr_calculator.ess_buffer, src=0)
+                dist.broadcast(self.awr_calculator.clip_rate_buffer, src=0)
+
+            logger.info("🛡️ [PMS] Grand Unified DDP Consensus achieved (Rank Sync Complete).")
                 # [v52.1] Sync Initial Losses to prevent meta-drift
                 if hasattr(self.gradnorm, 'initial_losses'):
                     dist.broadcast(self.gradnorm.initial_losses, src=0)
@@ -1636,11 +1678,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
             
             # [SOTA v4.0] Raised Alpha Floor (Gradient Starvation Prevention)
             # Rationale: alpha_min=0.01 allows 100x gradient suppression.
-            # Raising to 0.1 limits suppression to 10x, preserving diffusion signal.
-            # [SOTA v4.1] Raised Alpha Floor (Phase 9 Recovery)
-            # Rationale: alpha_min=0.1 allowed 10x suppression which caused
-            # stagnation after architectural shifts. 0.5 ensures backbone priority.
-            alpha_min = getattr(self.cfg, "alpha_min", 0.5)
+            # [SOTA v10.5] Clinical Gradient Preservation (Grid-Search Proven)
+            # Rationale: alpha_min=0.5 caused "Generative Dominance" (60% Diffusion weight).
+            # Lowering to 0.1 allows the Clinical task to dominate when sepsis signal is strong.
+            alpha_min = getattr(self.cfg, "alpha_min", 0.1)
             raw_alpha = (a_ema / (d_ema + 1e-8))
             # [SOTA v4.0] Upper bound at 1.5 to allow boosting when diffusion is underweighted
             stabilized_alpha = torch.clamp(raw_alpha, min=alpha_min, max=1.5)
@@ -1937,7 +1978,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 acl_loss,
                 l_bgsl,
                 l_tcb,
-                torch.tensor(0.0, device=self.device, requires_grad=True) # [v33.4 FIX] Phys Placeholder for GradNorm Shape Parity
+                phys_loss
             ])
             
             # [v107.0 SOTA FIX] GradNorm Accumulation Parity (Smoking Gun #107)
@@ -1954,7 +1995,6 @@ class ICUGeneralistWrapper(pl.LightningModule):
             
             # 2. Weighted losses for CAGrad surgery
             # [v33.4 FIX] Full Task Synchronization (Forensic #33.4)
-            # Rationale: All tasks monitored by GradNorm must contribute to the gradient pass.
             weighted_tasks = [
                 diff_loss_unweighted * task_weights[0], 
                 critic_loss * task_weights[1], 
@@ -1962,7 +2002,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 acl_loss * task_weights[3],
                 l_bgsl * task_weights[4],
                 l_tcb * task_weights[5],
-                torch.tensor(0.0, device=self.device, requires_grad=True) * task_weights[6]
+                phys_loss * task_weights[6]
             ]
             total_loss = torch.stack([t.detach() for t in weighted_tasks]).sum()
             loss_dict = {
@@ -2583,9 +2623,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Pass raw physical data directly.
             # [DEBUG TELEMETRY OOD v2] Channel-Wise Focus
             obs = subset["observed_data"]
-            # Slice: Indices 0-7 (HR, O2, SBP, DBP, MAP, Resp, Temp, Lactate)
-            obs_hemo = obs[..., :7]
-            pred_hemo = pred_safe[..., :7]
+            # Slice: Indices 0-8 (Includes Lactate at index 7)
+            obs_hemo = obs[..., :8]
+            pred_hemo = pred_safe[..., :8]
             
             logger.info(f"[OOD DEBUG] Obs Hemo (0-7): Mean={obs_hemo.mean().item():.2f}, Max={obs_hemo.max().item():.2f}, Min={obs_hemo.min().item():.2f}")
             logger.info(f"[OOD DEBUG] Pred Hemo (0-7): Mean={pred_hemo.mean().item():.2f}, Max={pred_hemo.max().item():.2f}, Min={pred_hemo.min().item():.2f}")
@@ -2644,7 +2684,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
             safety_results = self.safety_guardian.check_trajectories(
                 subset["observed_data"], 
-                pred_safe, 
+                raw_pred, # [SOTA SG-10] Use raw prediction to catch instability spikes
                 src_mask=s_mask,
                 force_clinical=True
             )
@@ -3267,6 +3307,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
                   checkpoint["grad_scaler_state"] = self.trainer.precision_plugin.scaler.state_dict()
                   logger.info("[SAVE] GradScaler state captured.")
 
+        # [v38.1 SOTA] AWR Persistence Bridge (Smoking Gun #SG-123)
+        # Rationale: Captures all adaptive whitening stats and beta dynamics.
+        if hasattr(self, "awr_calculator") and self.awr_calculator is not None:
+            checkpoint["awr_state"] = self.awr_calculator.get_awr_state()
+            logger.info("[SAVE] AWR internal state captured (Whitening/Adaptive).")
+
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]):
         """
         [SOTA v2026] Elastic Resumption Engine.
@@ -3387,11 +3433,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
              logger.info("[RESUME] AGEM Reference Accumulator Restored.")
 
         # [v54.0] Scaler Restoration Bridge
-        if "grad_scaler_state" in checkpoint:
-             if hasattr(self.trainer, "precision_plugin") and hasattr(self.trainer.precision_plugin, "scaler"):
-                  if self.trainer.precision_plugin.scaler is not None:
-                       self.trainer.precision_plugin.scaler.load_state_dict(checkpoint["grad_scaler_state"])
-                       logger.info("[RESUME] GradScaler state restored.")
+                   if self.trainer.precision_plugin.scaler is not None:
+                        self.trainer.precision_plugin.scaler.load_state_dict(checkpoint["grad_scaler_state"])
+                        logger.info("[RESUME] GradScaler state restored.")
+        
+        # [v38.1 SOTA] AWR Persistence Bridge
+        # Rationale: Direct restoration to bypass fit_stats loop.
+        if "awr_state" in checkpoint:
+             self.pending_awr_state = checkpoint["awr_state"]
+             logger.info("[RESUME] AWR state captured for manual restoration bridge.")
              
         # [v31.0 SOTA FIX] Active Grace Logging
         # Rationale: Only output the hiberation log if we are actually resuming.

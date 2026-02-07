@@ -48,9 +48,9 @@ class SepsisGhostBank(nn.Module):
         self.feature_dim = feature_dim
         self.latent_dim = latent_dim
         self.similarity_threshold = similarity_threshold
-        self.prototype_ema_decay = prototype_ema_decay
-        self.base_latent_adapter_strength = latent_adapter_strength # [v29.6 FIX] Store Base
-        self.latent_adapter_strength = latent_adapter_strength
+        self.register_buffer("prototype_ema_decay", torch.tensor(prototype_ema_decay).float())
+        self.base_latent_adapter_strength = latent_adapter_strength 
+        self.register_buffer("latent_adapter_strength", torch.tensor(latent_adapter_strength).float())
 
         # [v17.3 Hardened] Replay-Aware Buffers
         # Storing raw trajectories forces the model to perform a full forward pass
@@ -107,7 +107,7 @@ class SepsisGhostBank(nn.Module):
             self.prototype_ema.copy_(batch_avg)
         else:
             # [v2026 Phase 12 FIX] Momentum Burst (Smoking Gun #Phase12)
-            eff_decay = decay_override if decay_override is not None else self.prototype_ema_decay
+            eff_decay = decay_override if decay_override is not None else float(self.prototype_ema_decay)
             self.prototype_ema.mul_(eff_decay).add_(batch_avg, alpha=1 - eff_decay)
         
         # Rescale to unit hypersphere for stable similarity mapping
@@ -118,11 +118,11 @@ class SepsisGhostBank(nn.Module):
         if n_curr <= 0: return
         
         # 1. Scale EMA Decays
-        self.prototype_ema_decay = ScalingSteward.get_decay(0.99, n_curr)
+        self.prototype_ema_decay.fill_(ScalingSteward.get_decay(0.99, n_curr))
         # Adapt mix rate: (1 - strength) is the retention factor.
         retention_ref = 1.0 - self.base_latent_adapter_strength
         retention_curr = ScalingSteward.get_decay(retention_ref, n_curr)
-        self.latent_adapter_strength = 1.0 - retention_curr
+        self.latent_adapter_strength.fill_(1.0 - retention_curr)
         
         # 2. Scale Capacity Linearly
         # Note: We re-allocate buffers to maintain identical epoch-time coverage.

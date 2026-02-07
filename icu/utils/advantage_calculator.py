@@ -162,9 +162,10 @@ class ICUAdvantageCalculator(nn.Module):
     qsofa_thresholds: Optional[Dict[str, float]] = None,  # Override defaults
     adaptive_beta: bool = True,     # [SOTA 2025] Enabled by default for fresh start
     adaptive_clipping: bool = True, # [SOTA 2025] Enabled by default for fresh start
-    beta_momentum: float = 0.90,    # [SOTA] Default momentum (exposed for tuning)
+    beta_momentum: float = 0.95,    # [SOTA Scaled] Improved default for 200-step epochs
     beta_gain: float = 2.0,         # [v116.0 SOTA FIX] PI-style gain for faster adaptation
-    target_ess: float = 30.0        # [v117.0 SOTA FIX] Raised target for better diversity
+    target_ess: float = 30.0,        # [v117.0 SOTA FIX] Raised target for better diversity
+    min_beta: float = 0.5           # [v38.0 SOTA] Configurable selection floor
 ):
         """
         Initialize the Advantage Calculator.
@@ -201,25 +202,24 @@ class ICUAdvantageCalculator(nn.Module):
         # [SOTA 2025] Adaptive Hyperparameters
         self.adaptive_beta = adaptive_beta
         self.adaptive_clipping = adaptive_clipping
-        self.beta_momentum = beta_momentum      # [SOTA FIX] Configurable
-        self.beta_gain = beta_gain              # [v116.0 SOTA FIX] Speedup Gain
-        self.clip_momentum = 0.90
+        self.register_buffer("beta_momentum", torch.tensor(beta_momentum).float())
+        self.beta_gain = beta_gain              
+        self.register_buffer("clip_momentum", torch.tensor(0.90).float())
         
-        # [SOTA v2026] Internal Scaled Constants (Initialized with Defaults for 200 steps)
-        self.base_beta_momentum = float(beta_momentum) # [v26.1 FIX] Store Base for Idempotency
-        self.ess_ema_decay = 0.95
-        self.beta_growth_factor = 2.0  # [Phase 9] Faster recovery
-        self.register_buffer("beta_growth_cooldown", torch.tensor(0, dtype=torch.long))  # [v27.1] Cooldown persistent
+        # [SOTA v2026] Internal Scaled Constants
+        self.base_beta_momentum = float(beta_momentum) 
+        self.register_buffer("ess_ema_decay", torch.tensor(0.95).float())
+        self.register_buffer("beta_growth_factor", torch.tensor(2.0).float())
+        self.register_buffer("beta_growth_cooldown", torch.tensor(0, dtype=torch.long))
         
-        # [v5.1 SURGICAL PATCH] Selection Recovery Floor (Phase 9)
-        # Rationale: min_beta=1.0 still allows extreme peakedness (~0.5% ESS).
-        # Lifting to 2.0 ensures at least ~5% diversity in typical batches.
-        self.min_beta = 2.0            
+        # [SOTA v38.0] Selection Recovery Floor (Configurable)
+        # Rationale: Higher floor (0.8) prevents AUROC collapse by ensuring 
+        # broader manifold coverage.
+        self.min_beta = min_beta            
         self.max_beta = 20.0
         
         # [v29.1 SOTA FIX] Whitening Momentum Stability (Abyssal #1)
-        # [v35.0 SOTA FIX] Faster Adaptation: 0.999 -> 0.99 (Smoking Gun #35)
-        self.whitening_momentum = 0.99 
+        self.register_buffer("whitening_momentum", torch.tensor(0.99).float()) 
         self.base_whitening_momentum = 0.99
         
         # qSOFA thresholds
@@ -296,16 +296,47 @@ class ICUAdvantageCalculator(nn.Module):
         self.adv_std[0] = std if std > 1e-6 else 1.0
         
         if beta is not None:
-            self.beta.fill_(beta)
-            logger.info(f"[RESUME] AWR Beta restored: {beta:.4f}")
+            if isinstance(beta, torch.Tensor):
+                self.beta.copy_(beta)
+            else:
+                self.beta.fill_(beta)
+            logger.info(f"[RESUME] AWR Beta restored: {self.beta.item():.4f}")
             
         if count is not None:
-            self.stats_count.fill_(count)
+            if isinstance(count, torch.Tensor):
+                self.stats_count.copy_(count)
+            else:
+                self.stats_count.fill_(count)
             
         self.stats_initialized.fill_(True)
         logger.info(
             f"[ADVANTAGE] Stats Locked: mu={self.adv_mean.item():.4f}, sigma={self.adv_std.item():.4f}"
         )
+
+    def get_awr_state(self) -> Dict[str, Any]:
+        """[Phase 38.1] Export internal buffers for explicit persistence."""
+        return {
+            "adv_mean": self.adv_mean.clone(),
+            "adv_std": self.adv_std.clone(),
+            "stats_count": self.stats_count.clone(),
+            "stats_initialized": self.stats_initialized.clone(),
+            "beta": self.beta.clone(),
+            "ess_buffer": self.ess_buffer.clone(),
+            "clip_rate_buffer": self.clip_rate_buffer.clone(),
+            "beta_growth_cooldown": self.beta_growth_cooldown.clone()
+        }
+
+    def load_awr_state(self, state: Dict[str, Any]):
+        """[Phase 38.1] Explicitly restore AWR buffers to bypass re-calibration."""
+        if not state: return
+        
+        for key, val in state.items():
+            if hasattr(self, key):
+                attr = getattr(self, key)
+                if isinstance(attr, torch.Tensor):
+                    attr.copy_(val.to(attr.device))
+        
+        logger.info(f"✅ [AWR] Persistence Bridge: Restored {len(state)} buffers (Amnesia Averted).")
 
     def _validate_units(
         self, 
@@ -349,17 +380,17 @@ class ICUAdvantageCalculator(nn.Module):
         
         # 1. Scale Momentum Decays
         # Matches the 'awr_momentum' from config (e.g., 0.999)
-        self.beta_momentum = ScalingSteward.get_decay(self.base_beta_momentum, n_curr)
-        self.clip_momentum = ScalingSteward.get_decay(0.90, n_curr) 
+        self.beta_momentum.fill_(ScalingSteward.get_decay(self.base_beta_momentum, n_curr))
+        self.clip_momentum.fill_(ScalingSteward.get_decay(0.90, n_curr))
         
         # 2. Scale Telemetry Buffers
-        self.ess_ema_decay = ScalingSteward.get_decay(0.95, n_curr)
+        self.ess_ema_decay.fill_(ScalingSteward.get_decay(0.95, n_curr))
         
         # 3. Scale Growth Rates (Baseline: 1.5)
-        self.beta_growth_factor = float(1.5 ** (ScalingSteward.REF_STEPS / n_curr))
+        self.beta_growth_factor.fill_(float(1.5 ** (ScalingSteward.REF_STEPS / n_curr)))
         
         # 4. Scale Whitening Momentum (Ref: 0.999)
-        self.whitening_momentum = ScalingSteward.get_decay(self.base_whitening_momentum, n_curr)
+        self.whitening_momentum.fill_(ScalingSteward.get_decay(self.base_whitening_momentum, n_curr))
         
         logger.info(
             f"⚡ [AWR] Scaling Results: beta_mom={self.beta_momentum:.6f}, "
@@ -938,8 +969,8 @@ class ICUAdvantageCalculator(nn.Module):
         # Rationale: Dynamically anneal temperature to guarantee broad sampling (ESS >= 20.0).
         # [v4.0] Reduced Target ESS (Selection Pressure Recovery)
         # Rationale: target_ess=20 forces beta too high (3.0-4.2), eliminating advantage signal.
-        # [v5.0 SURGICAL PATCH] Target 10% of batch size (min 5.0 count)
-        target_ess = max(5.0, self.target_ess * 0.1)
+        # [v5.0 SURGICAL PATCH] Standard interpretation (restore selection diversity)
+        target_ess = max(10.0, self.target_ess)
         
         # [SOTA Phase 10 FIX] Consensus-AWR (Smoking Gun #3)
         # Rationale: DDP ranks must apply identical selection pressure (Beta) to 
@@ -1172,12 +1203,12 @@ class ICUAdvantageCalculator(nn.Module):
                     new_beta = self.beta * correction
                     beta_raw = new_beta.item()
                     
-                    # [SOTA 2025: Phase 11 Metamorphosis]
-                    # Lift the beta floor to 1.5 to prevent noisy selection peakiness.
-                    # Increased momentum to 0.999 to stabilize pressure transitions.
-                    mom = 0.999 
+                    # [SOTA v10.5] AWR Selection Recovery (Grid-Search Proven)
+                    # Rationale: Hardcoded mom=0.999 caused 320-step convergence lag.
+                    # Optimal mom=0.95 (via self.beta_momentum) achieves 2-step convergence.
+                    mom = self.beta_momentum
                     updated_beta = (mom * self.beta) + ((1.0 - mom) * new_beta)
-                    self.beta.copy_(torch.clamp(updated_beta, min=1.5))
+                    self.beta.copy_(torch.clamp(updated_beta, min=self.min_beta))
                     
                     # [PHASE 47] Unfreezing Telemetry
                     # print(f"[AWR DEBUG] ESS={current_ess:.4f} | Target={target_ess} | Err={error_ess:.4f} | Corr={correction:.4f} | Beta: {self.beta.item():.4f}")

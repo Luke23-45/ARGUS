@@ -18,16 +18,16 @@ class AsymmetricContrastiveLoss(nn.Module):
         self.d_model = d_model
         self.num_classes = num_classes
         self.temperature = temperature
-        self.base_momentum = 0.99
-        self.momentum = 0.99
+        self.register_buffer("base_momentum", torch.tensor(0.99).float())
+        self.register_buffer("momentum", torch.tensor(0.99).float())
         
         self.register_buffer('centroids', F.normalize(torch.randn(num_classes, d_model), dim=1))
         self.register_buffer('initialized', torch.zeros(1, dtype=torch.bool))
 
     def scale_dynamics(self, n_curr: int):
         if n_curr <= 0: return
-        raw_momentum = ScalingSteward.get_decay(self.base_momentum, n_curr)
-        self.momentum = min(0.999, raw_momentum)
+        raw_momentum = ScalingSteward.get_decay(float(self.base_momentum), n_curr)
+        self.momentum.fill_(min(0.999, raw_momentum))
 
     def forward(self, z: torch.Tensor, y: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         """
