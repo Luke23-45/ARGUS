@@ -17,7 +17,7 @@ output_dir: "outputs/phase1"           # Main output directory
 checkpoint_dir: "/content/icu/checkpoints/"  # [OK] Large files, infrequent writes
 log_dir: "/content/icu/logs/"         # [CRITICAL] Must be LOCAL for WandB (High freq IO)
 backup_dir: null                        # Remote/backup directory
-resume_from: null #"/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-29_16-52-27-latest-epoch=13.ckpt"
+resume_from: "/content/drive/MyDrive/pda/icu/checkpoints/icu_model-epoch=02-val/clinical_auroc=0.741.ckpt" #"/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-29_16-52-27-latest-epoch=13.ckpt"
 # resume_from: "/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-25_12-31-59-latest-epoch=05.ckpt"     # Explicit checkpoint to resume from (optional)
 # "/content/drive/MyDrive/pda/models/checkpoints/icu_model-epoch=05-val/clinical_auroc=0.747.ckpt"          
 #"/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-16_16-21-21-latest-epoch=17.ckpt"
@@ -97,7 +97,7 @@ train:
   target_ess: 0.12            # [v10.5 SOTA] Target 12% Batch Selection (Boosted for Recall)
   awr_momentum: 0.98          # [v38.0] Selection Smoothing Momentum (was 0.95)
   beta_min: 1.2               # [v38.0] Selection Floor (Raised to 1.2 to mimic Resumption Boost)
-  alpha_min: 0.1              # [SOTA SG-2] Prevents minority task starvation
+  alpha_min: 0.1              # [SOTA SG-2] Prevents minority task starvation;
   
   # AWR Calibration Speed/Quality (v10.1 Upgrade)
   # - "full": Scans all trajectories (~5-10 min, best for final training)

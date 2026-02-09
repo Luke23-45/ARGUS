@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple
+import torch.distributed as dist
+from typing import Dict, Tuple, Optional
 from icu.utils.train_utils import ScalingSteward
 
 class BayesianProjectedScaler(nn.Module):
@@ -157,12 +158,12 @@ class BayesianProjectedScaler(nn.Module):
                 for i, key in enumerate(active_keys):
                     idx, name = key
                     # [v2026 Phase 12 FIX] Governor Decoupling (Smoking Gun #Phase12)
-                    # Rationale: Relax threshold from 2x -> 5x and implement floor.
+                    # Rationale: Relax threshold from 5x -> 20x and implement floor.
                     # Prevents starvation of hard tasks (Sepsis) once easy tasks converge.
-                    if self.loss_emas[idx] > 5.0 * fundamental_signal:
-                        throttle = (5.0 * fundamental_signal) / (self.loss_emas[idx] + 1e-8)
-                        # Ensure priority doesn't drop below 0.5 (Safety Floor)
-                        clinical_weights[idx] *= max(0.5, throttle)
+                    if self.loss_emas[idx] > 20.0 * fundamental_signal:
+                        throttle = (20.0 * fundamental_signal) / (self.loss_emas[idx] + 1e-8)
+                        # Ensure priority doesn't drop below 1.0 (Safety Floor)
+                        clinical_weights[idx] *= max(1.0, throttle)
 
             # [v27.1 FIX] Apply Adaptive Governor with Floor
             effective_sf = max(0.5, stability_factor)
@@ -215,6 +216,14 @@ class BayesianProjectedScaler(nn.Module):
         We guarantee that Sepsis uncertainty (aux) never exceeds Diffusion uncertainty,
         ensuring that the Sepsis task always maintains its priority signal.
         """
+        # [v164.0 SOTA FIX] DDP Parameter Synchronization (Smoking Gun #164)
+        # Rationale: Ranks can drift slightly during Bayesian optimization due to 
+        # local precision noise. Explicitly sync log_vars to ensure identical 
+        # task priorities across the cluster.
+        if dist.is_available() and dist.is_initialized():
+             dist.all_reduce(self.log_vars, op=dist.ReduceOp.SUM)
+             self.log_vars.div_(dist.get_world_size())
+
         # 1. [v27.1 FIX] Tightened Bayesian Boundary Projection
         # Rationale: Old bounds [-2, 5] create 1097x precision ratio
         # New bounds [-1.5, 3] create 90x ratio (12x improvement)

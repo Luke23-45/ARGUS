@@ -390,6 +390,11 @@ class SepsisGhostBank(nn.Module):
                     else:
                         # Hard Refresh (Legacy Behavior)
                         self.latent_anchors[start:end].copy_(new_norm)
+                    
+                    # [v2026 RAM SPIKE FIX] Per-batch memory cleanup (Smoking Gun #RAM-04)
+                    # Rationale: Free activations immediately to prevent accumulation across
+                    # the 24+ iterations, which can cause ~500MB RAM spike.
+                    del new_anchors, new_norm, v_batch, m_batch
             finally:
                 # Restore training state
                 if was_training is not None:

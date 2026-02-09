@@ -341,42 +341,115 @@ class ICUSpecialistWrapper(pl.LightningModule):
 
     def on_fit_start(self):
         """
-        SOTA Pre-Flight Checks (DDP Safe).
+        [SOTA v2026] Elastic Resumption Bridge (Specialist Edition).
+        Fuses DDP-Safe Pre-Flight checks with Manual State Restoration.
         
-        Executes critical initialization steps:
-        1. Normalizer calibration from dataset statistics
-        2. AWR advantage statistics computation
-        3. EMA shadow synchronization
-        
-        This method runs BEFORE any training begins, ensuring all ranks
-        have consistent initialization state.
+        Executes:
+        1. Context-Aware Restoration (Optimizers, Schedulers, Normalizer, AWR, GradNorm).
+        2. Normalizer Calibration (if not restored).
+        3. AWR Statistics (if not restored).
+        4. DDP Barriers for safety.
         """
-        logger.info("[PRE-FLIGHT] Starting DDP-safe initialization...")
+        logger.info("[PRE-FLIGHT] Starting DDP-safe initialization & restoration...")
+
+        # =====================================================================
+        # 1. MANUAL STATE RESTORATION (The Anti-Trauma Bridge)
+        # =====================================================================
         
-        # 1. Normalizer Calibration (All ranks must execute)
-        self._calibrate_normalizer_safe()
+        # 1.1 Optimizers
+        if hasattr(self, "pending_optimizer_states"):
+            optimizers = self.trainer.optimizers
+            if not isinstance(optimizers, list): optimizers = [optimizers]
+            
+            if len(optimizers) == len(self.pending_optimizer_states):
+                try:
+                    for opt, state in zip(optimizers, self.pending_optimizer_states):
+                        opt.load_state_dict(state)
+                    logger.info(f"✅ [RESUME] Manually restored {len(optimizers)} optimizer states.")
+                except Exception as e:
+                    logger.warning(f"⚠️ [RESUME] Manual optimizer restoration failed: {e}")
+            del self.pending_optimizer_states
+
+        # 1.2 Schedulers
+        if hasattr(self, "pending_scheduler_states"):
+            schedulers = self.lr_schedulers()
+            if not isinstance(schedulers, list): schedulers = [schedulers]
+            schedulers = [s for s in schedulers if s is not None]
+
+            if len(schedulers) == len(self.pending_scheduler_states):
+                try:
+                    for sch, state in zip(schedulers, self.pending_scheduler_states):
+                        sch.load_state_dict(state)
+                    logger.info(f"✅ [RESUME] Manually restored {len(schedulers)} LR scheduler states.")
+                    
+                    # [v55.0 SOTA FIX] LR Pulse Alignment
+                    opts = self.optimizers()
+                    if not isinstance(opts, list): opts = [opts]
+                    for opt, sch in zip(opts, schedulers):
+                         if hasattr(sch, "get_last_lr"):
+                              new_lr = sch.get_last_lr()[0]
+                              for pg in opt.param_groups:
+                                   pg['lr'] = new_lr
+                    logger.info("✅ [RESUME] LR Pulse Alignment synchronized.")
+                except Exception as e:
+                    logger.warning(f"⚠️ [RESUME] Manual scheduler restoration failed: {e}")
+            del self.pending_scheduler_states
+            
+        # 1.3 GradNorm State
+        if hasattr(self, "pending_gradnorm_state") and self.gradnorm is not None:
+            if getattr(self.gradnorm, 'optimizer', None) is not None:
+                try:
+                    self.gradnorm.optimizer.load_state_dict(self.pending_gradnorm_state)
+                    logger.info("✅ [RESUME] GradNorm optimizer state restored.")
+                except Exception as e:
+                    logger.warning(f"⚠️ [RESUME] GradNorm restoration failed: {e}")
+            del self.pending_gradnorm_state
+            
+        # 1.4 AWR State
+        if self.awr_calculator.stats_initialized:
+             logger.info(f"✅ [RESUME] AWR Engine restored (mu={self.awr_calculator.adv_mean.item():.4f}, sigma={self.awr_calculator.adv_std.item():.4f})")
+
+        # =====================================================================
+        # 2. NORMALIZER CALIBRATION (or Restoration)
+        # =====================================================================
+        restored_normalizer = False
+        if hasattr(self, "pending_normalizer_state") and hasattr(self.model, "normalizer"):
+            try:
+                self.model.normalizer.load_state_dict(self.pending_normalizer_state)
+                logger.info("✅ [RESUME] Physics Normalizer stats restored directly.")
+                restored_normalizer = True
+                
+                # Sync EMA shadow immediately
+                if hasattr(self, 'ema') and self.ema is not None:
+                    self._sync_ema_normalizer()
+            except Exception as e:
+                logger.warning(f"⚠️ [RESUME] Normalizer restoration failed: {e}")
+            del self.pending_normalizer_state
+
+        if not restored_normalizer:
+            # Fallback to calibration if not restored
+            self._calibrate_normalizer_safe()
         
-        # 2. DDP Barrier - Synchronize before AWR stats
+        # DDP Barrier
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
-            logger.info(f"[PRE-FLIGHT] Rank {self.global_rank} passed normalizer barrier")
+            logger.info(f"[PRE-FLIGHT] Rank {self.global_rank} passed normalizer/optimizer barrier")
         
-        # 3. AWR Statistics (Rank 0 computes, then broadcasts)
-        if hasattr(self.trainer, "datamodule") and self.trainer.datamodule:
-            dataset = self.trainer.datamodule.train_dataloader().dataset
-            self._fit_awr_stats_ddp(dataset)
-        else:
-            logger.warning(
-                "[PRE-FLIGHT] No DataModule found. AWR stats will use default N(0,1).\n"
-                "This may cause unstable training weights!"
-            )
+        # =====================================================================
+        # 3. AWR STATISTICS (If not restored)
+        # =====================================================================
+        if not self.awr_calculator.stats_initialized:
+            if hasattr(self.trainer, "datamodule") and self.trainer.datamodule:
+                dataset = self.trainer.datamodule.train_dataloader().dataset
+                self._fit_awr_stats_ddp(dataset)
+            else:
+                logger.warning("[PRE-FLIGHT] No DataModule. AWR stats using defaults.")
         
-        # 4. Final DDP Barrier
+        # Final DDP Barrier
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
             
-        # [v13.0 SOTA FIX] Forensic Stability Auditor
-        # Unmasks explosions that the normalizer might hide.
+        # Forensic Stability Auditor
         self.forensic_auditor = ForensicStabilityAuditor(guardian=self.safety_guardian)
         logger.info("[PRE-FLIGHT] Initialization complete. All systems nominal.")
 
@@ -474,39 +547,32 @@ class ICUSpecialistWrapper(pl.LightningModule):
             logger.info("[AWR SYNC] Computing advantage statistics on Rank 0...")
             advantages_list = []
             
-            # [v15.4] Robusified: Calibration Mode Toggle
+            # [v15.5 SOTA FIX] Explicit Calibration Mode Priority
             sample_count = len(dataset)
             config_mode = self.cfg.train.get("awr_calibration_mode", "sample")
             max_samples = self.cfg.train.get("awr_max_samples", 5000)
 
-            # [SOTA FORENSIC FORCE] Override "full" if max_samples implies intention to sample
-            if max_samples < sample_count and max_samples > 0:
-                if config_mode != "sample":
-                    logger.warning(f"[AWR SYNC FORCE] Config says '{config_mode}' but max_samples={max_samples} << {sample_count}. FORCING 'sample' mode.")
-                    mode = "sample"
+            # Priority Logic: "full" overrides "sample" regardless of max_samples
+            if config_mode == "full":
+                mode = "full"
+                logger.info(f"[AWR SYNC] Mode restricted to 'full' by config. Ignoring max_samples={max_samples}.")
+            else:
+                # Mode is "sample" or default
+                if max_samples >= sample_count or max_samples <= 0:
+                    logger.info(f"[AWR SYNC] Requested samples ({max_samples}) >= population ({sample_count}). Falling back to FULL scan.")
+                    mode = "full"
                 else:
                     mode = "sample"
-            else:
-                mode = config_mode
             
-            logger.info(f"[AWR SYNC Config] Mode='{mode}' (Orig='{config_mode}'), MaxSamples={max_samples}, Population={sample_count}")
+            logger.info(f"[AWR SYNC Config] Final Mode='{mode}' (Orig='{config_mode}'), MaxSamples={max_samples}, Population={sample_count}")
 
             if mode == "sample":
-                if max_samples >= sample_count:
-                    logger.info(f"[AWR SYNC] Requested samples ({max_samples}) >= population ({sample_count}). Falling back to FULL scan.")
-                    idxs = torch.arange(sample_count)
-                    actual_count = sample_count
-                elif max_samples <= 0:
-                    logger.warning(f"[AWR SYNC] Invalid awr_max_samples={max_samples}. Defaulting to FULL scan.")
-                    idxs = torch.arange(sample_count)
-                    actual_count = sample_count
-                else:
-                    logger.info(f"[AWR SYNC] Sampling trajectories (N={max_samples} of {sample_count})...")
-                    # Ensure sampling is consistent across ranks (though handled by Rank 0)
-                    g = torch.Generator(device='cpu')
-                    g.manual_seed(self.cfg.seed + 2024)
-                    idxs = torch.randperm(sample_count, generator=g)[:max_samples]
-                    actual_count = max_samples
+                 logger.info(f"[AWR SYNC] Sampling trajectories (N={max_samples} of {sample_count})...")
+                 # Ensure sampling is consistent across ranks (though handled by Rank 0)
+                 g = torch.Generator(device='cpu')
+                 g.manual_seed(self.cfg.seed + 2024)
+                 idxs = torch.randperm(sample_count, generator=g)[:max_samples]
+                 actual_count = max_samples
             else:
                 logger.info(f"[AWR SYNC] Starting Full Population Scan (N={sample_count})...")
                 idxs = torch.arange(sample_count)
@@ -1243,45 +1309,63 @@ class ICUSpecialistWrapper(pl.LightningModule):
 
     def configure_optimizers(self):
         """
-        SOTA Specialist Optimizer Configuration v2.0 (Step-Wise).
-        
-        Features:
-        - Robust AdamW with Fused Kernels (20-30% speedup on H100)
-        - Step-wise Cosine Annealing (Smoother warmup than epoch-wise)
-        - Precise step counting using estimated_stepping_batches
-        
-        Returns:
-            Dict with optimizer and LR scheduler configuration
+        [SOTA v2026] Conflict-Averse Optimizer Configuration (Specialist Edition).
+        Wraps robust AdamW with CAGrad for surgical conflict resolution.
         """
-        # 1. Configure Parameters
-        optimizer_params = [{"params": self.model.parameters()}]
+        # 1. Parameter Grouping (Blind Weight Decay Fix - Patch 66)
+        # Rationale: Decaying LayerNorm weights (1D) destroys normalization capability.
+        decay_params = []
+        no_decay_params = []
         
-        # [v25.3] Add Uncertainty Parameters if in SOTA mode
+        # Identify special sets
+        uw_params = [self.log_var_diff, self.log_var_router] if self.balancing_mode == "sota_2025" else []
+        uw_ids = {id(p) for p in uw_params}
+        
+        for p in self.model.parameters():
+            if id(p) in uw_ids:
+                continue
+            if p.ndim < 2:
+                no_decay_params.append(p)
+            else:
+                decay_params.append(p)
+        
+        optimizer_groups = [
+            # Group 1: Main Backbone (Decay - Weights/Embeddings)
+            {'params': decay_params, 'lr': self.cfg.train.lr, 'weight_decay': self.cfg.train.weight_decay},
+            
+            # Group 2: Main Backbone (No Decay - Bias/LayerNorm)
+            {'params': no_decay_params, 'lr': self.cfg.train.lr, 'weight_decay': 0.0},
+        ]
+        
         if self.balancing_mode == "sota_2025":
-            uw_lr = self.cfg.train.get("uw_lr", 0.025)
-            optimizer_params.append({
-                "params": [self.log_var_diff, self.log_var_router],
-                "lr": uw_lr,
-                "weight_decay": 0.0
+            optimizer_groups.append({
+                'params': uw_params, 
+                'lr': self.cfg.train.get("uw_lr", 0.005), 
+                'weight_decay': 0.0
             })
-
+            
+        # 2. Configure Robust AdamW
         base_optimizer = torch.optim.AdamW(
-            optimizer_params,
+            optimizer_groups,
             lr=self.cfg.train.lr,
             weight_decay=self.cfg.train.weight_decay,
-            fused=True
+            betas=(0.9, 0.999),
+            eps=1e-5, # [v130.0 SOTA FIX] Epsilon Hardening (Smoking Gun #130)
+            fused=False # [v12.8.5 SOTA FIX] Use foreach=True (robuster for compiled models)
         )
         
-        # 2. Wrap with CAGrad
-        optimizer = CAGrad(base_optimizer, c=self.cfg.train.get("cagrad_c", 0.5))
-        
-        # 2. Learning Rate Scheduler (Step-based SOTA)
-        # Use estimated_stepping_batches for accurate total count
-        # (Handles accumulation, limit_batches, and DDP sharding correctly)
+        # 3. Method Wrapping
+        if self.balancing_mode == "legacy_surgical":
+            # CAGrad for Multi-Task surgical updating
+            optimizer = CAGrad(base_optimizer, c=self.cfg.train.get("cagrad_c", 0.5))
+        else:
+            # SOTA 2025: Pure optimizer (UW handles balancing)
+            optimizer = base_optimizer
+            
+        # 4. Learning Rate Scheduler
         total_steps = self.trainer.estimated_stepping_batches
         warmup_steps = int(total_steps * self.cfg.train.get("warmup_ratio", 0.05))
         
-        # Note: We schedule the WRAPPER optimizer
         scheduler = get_cosine_schedule_with_warmup(
             optimizer, 
             num_warmup_steps=warmup_steps, 
@@ -1290,16 +1374,95 @@ class ICUSpecialistWrapper(pl.LightningModule):
         )
         
         logger.info(
-            f"[SCHEDULER] Step-wise Cosine: Warmup={warmup_steps}/{total_steps} steps"
+            f"[SCHEDULER] Step-wise Cosine: Warmup={warmup_steps}/{total_steps} steps. "
+            f"Mode={self.balancing_mode}"
         )
         
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "step",        # [FIX] Step-wise updates
+                "interval": "step",
                 "frequency": 1,
                 "monitor": "val/auroc_sepsis",
                 "strict": False
             }
         }
+
+    # =========================================================================
+    # PERSISTENCE BRIDGE (Zero-Amnesia Protocol)
+    # =========================================================================
+
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]):
+        """
+        [SOTA v2026] Universal Resumption Bridge (Specialist Edition).
+        Ensures perfect memory restoration for MoE Manual Optimization.
+        """
+        # 1. Normalizer Persistence
+        if hasattr(self.model, "normalizer"):
+            checkpoint["normalizer_state"] = self.model.normalizer.state_dict()
+            
+        # 2. Manual Optimization Persistence (Critical for MoE)
+        opts = self.optimizers()
+        if not isinstance(opts, (list, tuple)): opts = [opts]
+        checkpoint["optimizer_states"] = [o.state_dict() for o in opts]
+        
+        schs = self.lr_schedulers()
+        if schs is not None:
+            if not isinstance(schs, (list, tuple)): schs = [schs]
+            checkpoint["lr_schedulers"] = [s.state_dict() for s in schs]
+
+        # 3. EMA Persistence (Shadow Weights)
+        if hasattr(self, 'ema') and self.ema is not None:
+            checkpoint["ema_state_dict"] = self.ema.state_dict()
+            logger.info("[SAVE] EMA shadow weights captured.")
+
+        # 4. GradNorm Persistence
+        if self.gradnorm is not None and getattr(self.gradnorm, 'optimizer', None) is not None:
+             checkpoint["gradnorm_optimizer_state"] = self.gradnorm.optimizer.state_dict()
+             logger.info("[SAVE] GradNorm optimizer state captured.")
+
+        # 5. AWR Persistence (Adaptive Whitening)
+        if hasattr(self, "awr_calculator") and self.awr_calculator is not None:
+            checkpoint["awr_state"] = self.awr_calculator.get_awr_state()
+            logger.info("[SAVE] AWR internal state captured.")
+            
+        # 6. Accumulation State
+        checkpoint["grad_accum_idx"] = getattr(self, "grad_accum_idx", 0)
+
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]):
+        """
+        [SOTA v2026] Elastic Resumption Engine (Specialist Edition).
+        Prepares state for manual restoration in on_fit_start.
+        """
+        state_dict = checkpoint.get("state_dict", {})
+        
+        # 1. Capture Optimization States for Manual Restore
+        if "optimizer_states" in checkpoint:
+            self.pending_optimizer_states = checkpoint["optimizer_states"]
+        if "lr_schedulers" in checkpoint:
+            self.pending_scheduler_states = checkpoint["lr_schedulers"]
+            
+        # 2. Capture Normalizer State
+        if "normalizer_state" in checkpoint:
+            self.pending_normalizer_state = checkpoint["normalizer_state"]
+            
+        # 3. Restore EMA
+        if "ema_state_dict" in checkpoint and hasattr(self, 'ema') and self.ema is not None:
+            self.ema.load_state_dict(checkpoint["ema_state_dict"])
+            logger.info("[LOAD] EMA shadow weights restored.")
+            
+        # 4. Restore AWR State
+        if "awr_state" in checkpoint and hasattr(self, "awr_calculator"):
+            self.awr_calculator.load_awr_state(checkpoint["awr_state"])
+            logger.info("[LOAD] AWR internal state restored.")
+            
+        # 5. Restore GradNorm State
+        if "gradnorm_optimizer_state" in checkpoint:
+            self.pending_gradnorm_state = checkpoint["gradnorm_optimizer_state"]
+            
+        # 6. Restore Accumulation Index
+        if "grad_accum_idx" in checkpoint:
+            self.grad_accum_idx = checkpoint["grad_accum_idx"]
+            
+        logger.info("[LOAD] Specialist checkpoint loaded. Manual restoration queued for on_fit_start.")

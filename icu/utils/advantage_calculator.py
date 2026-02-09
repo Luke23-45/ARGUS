@@ -162,10 +162,10 @@ class ICUAdvantageCalculator(nn.Module):
     qsofa_thresholds: Optional[Dict[str, float]] = None,  # Override defaults
     adaptive_beta: bool = True,     # [SOTA 2025] Enabled by default for fresh start
     adaptive_clipping: bool = True, # [SOTA 2025] Enabled by default for fresh start
-    beta_momentum: float = 0.95,    # [SOTA Scaled] Improved default for 200-step epochs
+    beta_momentum: float = 0.98,    # [v2026 SOTA] Smoother transition for high-frequency updates
     beta_gain: float = 2.0,         # [v116.0 SOTA FIX] PI-style gain for faster adaptation
-    target_ess: float = 30.0,        # [v117.0 SOTA FIX] Raised target for better diversity
-    min_beta: float = 0.5           # [v38.0 SOTA] Configurable selection floor
+    target_ess: float = 0.10,        # [v2026 SOTA] Tightened to 10% for sharper selection pressure
+    min_beta: float = 0.1           # [v38.0 SOTA] Sharp selection floor
 ):
         """
         Initialize the Advantage Calculator.

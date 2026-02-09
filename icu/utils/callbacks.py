@@ -736,6 +736,64 @@ class DebugSnapshotCallback(Callback):
 
 
 # ==============================================================================
+# 5.8  PERSISTENCE: LATEST SHADOW MIRROR (RAM OPTIMIZATION)
+# ==============================================================================
+
+class SOTALatestMirror(Callback):
+    """
+    [v2026 RAM SPIKE FIX] Lightweight Metadata Mirror (Smoking Gun #RAM-02).
+    Rationale: Instead of a full second ModelCheckpoint trigger (Redundant 2.2GB RAM), 
+    this callback creates a file-system shadow of 'last.ckpt'.
+    
+    This preserves the user's '{run_name}-latest-epoch={XX}' naming convention 
+    without the OOM risk of parallel serialization.
+    """
+    def __init__(self, run_name: str, dirpath: str):
+        super().__init__()
+        self.run_name = run_name
+        self.dirpath = Path(dirpath)
+        
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        """
+        [v2026 HARDENED] Mirroring occurs at the absolute end of the training epoch.
+        This ensures ModelCheckpoint has flushed 'last.ckpt' to disk.
+        """
+        if not is_main_process(): return
+        self._mirror_checkpoint(trainer)
+
+    def _mirror_checkpoint(self, trainer: pl.Trainer):
+        # 1. Locate last.ckpt (The Internal Source of Truth)
+        last_path = self.dirpath / "last.ckpt"
+        if not last_path.exists():
+            return
+            
+        # 2. Format Destination: {run_name}-latest-epoch={epoch:02d}.ckpt
+        latest_name = f"{self.run_name}-latest-epoch={trainer.current_epoch:02d}.ckpt"
+        latest_path = self.dirpath / latest_name
+        
+        # [v2026 TRANSACTIONAL SAFETY] Copy FIRST, Delete LATER.
+        # This prevents losing the 'latest' backup if a disk-full error occurs during copy.
+        copy_success = False
+        try:
+            if not latest_path.exists():
+                import shutil
+                shutil.copy2(last_path, latest_path)
+                copy_success = True
+                logger.info(f"✨ [MIRROR] Shadow Checkpoint Created: {latest_name}")
+        except Exception as e:
+            logger.warning(f"⚠️ [MIRROR] Failed to create shadow: {e}")
+        
+        if copy_success:
+            # 3. Cleanup Old Mirror Files (Emulate save_top_k=1)
+            for old_file in self.dirpath.glob(f"{self.run_name}-latest-epoch=*.ckpt"):
+                if old_file.name != latest_name:
+                    try:
+                        old_file.unlink()
+                    except Exception:
+                        pass
+
+
+# ==============================================================================
 # 6. SOTA FACTORY
 # ==============================================================================
 
@@ -763,19 +821,10 @@ def get_sota_callbacks(cfg: DictConfig) -> List[Callback]:
     )
     callbacks.append(saver_cb)
     
-    # [USER-REQUESTED] Latest Epoch Saver
-    # Saves strictly the current epoch, overwriting the previous one.
-    # Naming format: {project/run_name}-{epoch}
-    latest_ckpt_cb = ModelCheckpoint(
-        dirpath=save_dir,
-        filename=f"{cfg.run_name}-latest-epoch={{epoch:02d}}",
-        monitor=None, # Save based on timing (latest)
-        save_top_k=1, # Keep only 1 (delete previous)
-        every_n_epochs=1,
-        save_weights_only=False,
-        auto_insert_metric_name=False # Cleaner filenames
-    )
-    callbacks.append(latest_ckpt_cb)
+    # [v2026 RAM SPIKE FIX] Shadow Mirror (Replaces latest_ckpt_cb)
+    # Rationale: Provides the specific '{run_name}-latest-epoch={XX}' naming requested,
+    # but does so via file-system mirroring from 'last.ckpt' to avoid 2.2GB RAM spike.
+    callbacks.append(SOTALatestMirror(run_name=cfg.run_name, dirpath=save_dir))
     
     # [BACKUP] Optional Remote Mirroring (Simple Copy)
     remote_dir = cfg.get("remote_dir", None)

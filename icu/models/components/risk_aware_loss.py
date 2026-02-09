@@ -24,7 +24,7 @@ class RiskAwareAsymmetricLoss(nn.Module):
                  gamma_pos: float = 1, 
                  clip: float = 0.05, 
                  eps: float = 1e-8,
-                 critical_multiplier: float = 2.0):
+                 critical_multiplier: float = 5.0): # [SOTA FIX] 5x pressure for Red Zones (2.0 -> 5.0)
         super().__init__()
         self.gamma_neg = gamma_neg
         self.gamma_pos = gamma_pos
