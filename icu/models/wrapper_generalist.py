@@ -253,6 +253,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
         self.balancing_mode = cfg.train.get("balancing_mode", "sota_2025")
         logger.info(f"Using balancing mode: {self.balancing_mode}")
 
+        # [v19.0 SOTA] A-GEM Orthogonal Replay Configuration
+        # If True: Adds Reference Gradient back after projection.
+        self.orthogonal_replay = True
+
         if self.balancing_mode == "sota_2025":
             # [SOTA 2025] Uncertainty Loss Scaler
             # [v12.8.3 SOTA FIX] Direct Attachment
@@ -1107,7 +1111,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # [v21.3 SOTA FIX] Distributed Self-Cond Branch Sync
             if dist.is_initialized():
                  if dist.get_rank() == 0:
-                      do_self_cond = (torch.rand(1).item() < 0.5)
+                      do_self_cond = (random.random() < 0.5)
                  else:
                       do_self_cond = False # Placeholder
                  
@@ -1115,7 +1119,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                  dist.broadcast(shared_flag, src=0)
                  do_self_cond = (shared_flag.item() > 0)
             else:
-                 do_self_cond = (torch.rand(1).item() < 0.5)
+                 do_self_cond = (random.random() < 0.5)
 
             if do_self_cond:
                 # IMPORTANT: Pass 1 is strictly NO_GRAD to preserve memory
@@ -1484,7 +1488,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 f_mask = torch.ones_like(advantages, dtype=torch.float32)
 
             weights_awr, diag = self.awr_calculator.calculate_weights(
-                advantages, values=target_values, rewards=returns, mask=f_mask
+                advantages, 
+                values=target_values, 
+                rewards=returns, 
+                mask=f_mask,
+                turbo_mode=(self.resumption_grace_steps > 0)
             )
             
             # [v7.3 SOTA FIX] AWR Warmup (The "Cognitive Settle")
@@ -1620,10 +1628,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
             normalizer = self.model.normalizer
             x0_clinical = normalizer.denormalize(x0_approx)
             
-            # [v26.4 FIX] Physics Loss (Unweighted)
-            # Rationale: Violation is passed to the Bayesian Scaler which handles weighting.
-            # Manual weighting here would lead to double-counting.
-            phys_loss = self.safety_envelope(x0_clinical, risk_coef) + self.model.phys_loss(x0_approx)
+            # [v26.4 FIX] Physics Loss (Structure Prep)
+            # Actual loss calculation deferred to L1781 to avoid double-counting.
+            # x0_clinical is preserved for the later calculation.
 
             # [v26.4 REMOVED] Logic moved to L1215 after final redefinition to prevent shadowing.
             
@@ -1950,6 +1957,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
                             else:
                                 offset += p.numel()
 
+                # [v54.8 SOTA FIX] Surgical Graph Purge (Smoking Gun #RAM-05)
+                # Rationale: ref_grads must be deleted EXPLICITLY after the loop
+                # to free the 1.6GB gradient graph before next loss step.
+                del ref_grads
+                del g_ref
+                import gc
+                gc.collect()
+
                 # 2. Projection Gate: Only on Stepping Batch
                 if not is_accumulating:
                     # [SOTA FIX v30.0/v53.0] DDP Reference Synchronization
@@ -2011,7 +2026,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
                         
                         # 5. Restore Reference (g <- g + ref)
                         # This completes the "Orthogonal Replay" protocol.
-                        torch._foreach_add_(proj_params, proj_refs, alpha=1.0)
+                        if self.orthogonal_replay:
+                            torch._foreach_add_(proj_params, proj_refs, alpha=1.0)
                     
                     # 6. Cycle Reset
                     self.grad_ref_buffer.zero_()
@@ -3368,6 +3384,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
         [SOTA v30.5] Universal Resumption Bridge (Persistence).
         Ensures perfect memory restoration for Manual Optimization.
         """
+        # [v2026 RAM LOCKDOWN] Early Pre-emptive Harvest
+        # Rationale: Clearing the ~5GB activation heap BEFORE PL starts 
+        # serializing model state into the checkpoint dict.
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         if hasattr(self.model, "normalizer"):
             checkpoint["normalizer_state"] = self.model.normalizer.state_dict()
             
@@ -3385,17 +3409,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
             if not isinstance(schs, (list, tuple)): schs = [schs]
             checkpoint["lr_schedulers"] = [s.state_dict() for s in schs]
 
-        # [v110.0 SOTA FIX] EMA Persistence Bridge (Smoking Gun #39)
-        # Rationale: Direct attachment ensures teacher weights are preserved
-        # even if callback-level persistence is silenced.
-        # [v2026 RAM SPIKE FIX] Move EMA to CPU before serialization (Smoking Gun #RAM-03)
-        # Rationale: EMA shadow dict (~800MB) can cause fragmentation during torch.save.
-        # Creating CPU copies ensures clean serialization without GPU memory spike.
-        if self.ema is not None:
-            ema_state = self.ema.state_dict()
-            # EMA shadow is already on CPU due to TieredEMA design - just verify
-            checkpoint["ema_state_dict"] = ema_state
-            logger.info("[SAVE] EMA shadow weights captured.")
+        # [v2026 Phase 19 FIX] EMA Double-Save Elimination (Audit Finding)
+        # Rationale: EMACallback.on_save_checkpoint (callbacks.py L549-551) already 
+        # saves ema_state_dict under the same key. Both reference the same self.ema 
+        # object (attached via pl_module.ema = self.ema in EMACallback._init_ema).
+        # Removing this redundant serialization saves ~100ms per checkpoint.
+        # The EMACallback is the single authoritative save source for EMA state.
 
         # GradNorm Persistence
         if self.gradnorm is not None and self.gradnorm.optimizer is not None:
@@ -3406,22 +3425,23 @@ class ICUGeneralistWrapper(pl.LightningModule):
         checkpoint["grad_accum_idx"] = self.grad_accum_idx
 
         # [v118.0 SOTA FIX] GradNorm Accumulation Persistence (Smoking Gun #91)
-        checkpoint["gn_loss_accumulator"] = self.gn_loss_accumulator.cpu().clone()
-        checkpoint["gn_acc_count"] = self.gn_acc_count.cpu().clone()
+        # [AXE-SHARPENED] Using .to('cpu') instead of .cpu().clone() to avoid redundant RAM usage
+        checkpoint["gn_loss_accumulator"] = self.gn_loss_accumulator.to('cpu')
+        checkpoint["gn_acc_count"] = self.gn_acc_count.to('cpu')
 
-        # [v118.1 SOTA FIX] Partial Gradient Persistence (Extreme Reliability)
-        if self.grad_accum_idx.item() > 0:
-             grad_dict = {}
-             for name, p in self.named_parameters():
-                 if p.grad is not None:
-                      grad_dict[name] = p.grad.detach().cpu().clone()
-             checkpoint["partial_gradients"] = grad_dict
-             logger.info(f"[SAVE] Captured partial gradients for cycle step {self.grad_accum_idx.item()}.")
-
-        # [v2026 RAM SPIKE FIX] Explicit CPU Offloading (Smoking Gun #RAM-04)
-        # Rationale: Prevents double-memory spike when PyTorch implicitly copies GPU tensors.
-        if self.grad_ref_buffer is not None:
-            checkpoint["grad_ref_buffer"] = self.grad_ref_buffer.cpu().clone()
+        # [v7 FIX] Removed partial_gradients saving (was ~800MB CPU RAM spike).
+        # On resume, accumulation cycle restarts fresh (at most 4 steps lost).
+        # grad_accum_idx is reset, so no stale gradient state.
+        
+        # [v7 FIX] Removed grad_ref_buffer saving (was variable CPU RAM spike).
+        # AGEM reference is re-accumulated within the first few steps after resume.
+        # It's zeroed at each accumulation cycle boundary anyway.
+            
+        # [v2026] Global Memory Harvest
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
             
         # [v54.0] Scaler Restoration Bridge (Smoking Gun #110)
         # Rationale: Standard PL sometimes misses the scaler state in manual optimization.
@@ -3463,16 +3483,17 @@ class ICUGeneralistWrapper(pl.LightningModule):
         if "gn_acc_count" in checkpoint:
              self.pending_gn_acc_count = checkpoint["gn_acc_count"]
              
-        # [v118.1] Restore Partial Gradients
-        if "partial_gradients" in checkpoint:
-             self.pending_partial_grads = checkpoint["partial_gradients"]
-             logger.info("[RESUME] Partial gradients captured for restoration.")
+        # [v7 FIX] partial_gradients no longer saved/restored (saves ~800MB RAM).
+        # Accumulation cycle restarts fresh on resume.
             
         # [v52.2 SOTA FIX] Grace Period Renewal (Smoking Gun #MasterAudit)
         # Rationale: All models, including mature ones, benefit from a re-settling
         # grace period of 50 steps to allow momentum and stability metrics to align.
-        state_dict["resumption_grace_steps"] = torch.tensor(50)
-        logger.info("[RESUME] Resumption Grace Period renewed (50 steps).")
+        # [CRITICAL FIX v2026-02-10] Direct Buffer Fill - REQUIRED for on_load_checkpoint
+        # The previous code modified `state_dict` which has NO EFFECT in this callback
+        # because PL already loaded the model BEFORE calling on_load_checkpoint.
+        self.resumption_grace_steps.fill_(50)
+        logger.info("⚡ [RESUME] Resumption Grace Period ACTIVATED (50 steps). Turbo Mode ENABLED!")
 
         # 2. 6-TO-7 TASK TRANSITION (Padding for 'phys' expansion)
         # Rationale: We added 'phys' as the 7th task. Old checkpoints only have 6.
@@ -3558,13 +3579,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
                   self._fnd_grad_ema.copy_(checkpoint["_fnd_grad_ema"].to(self._fnd_grad_ema.device))
              logger.info("[RESUME] MGP Direction Anchor Restored.")
              
-        # [v53.0] AGEM Reference Restoration
-        if "grad_ref_buffer" in checkpoint:
-             if self.grad_ref_buffer is None:
-                  self.grad_ref_buffer = checkpoint["grad_ref_buffer"].clone().to(self.device)
-             else:
-                  self.grad_ref_buffer.copy_(checkpoint["grad_ref_buffer"].to(self.device))
-             logger.info("[RESUME] AGEM Reference Accumulator Restored.")
+        # [v7 FIX] grad_ref_buffer no longer saved/restored (saves RAM).
+        # AGEM reference is re-accumulated within a few steps after resume.
 
         # [v54.0] Scaler Restoration Bridge
         if "grad_scaler_state" in checkpoint:

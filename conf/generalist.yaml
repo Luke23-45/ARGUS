@@ -17,7 +17,7 @@ output_dir: "outputs/phase1"           # Main output directory
 checkpoint_dir: "/content/icu/checkpoints/"  # [OK] Large files, infrequent writes
 log_dir: "/content/icu/logs/"         # [CRITICAL] Must be LOCAL for WandB (High freq IO)
 backup_dir: null                        # Remote/backup directory
-resume_from: "/content/drive/MyDrive/pda/icu/checkpoints/icu_model-epoch=02-val/clinical_auroc=0.741.ckpt" #"/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-29_16-52-27-latest-epoch=13.ckpt"
+resume_from: "/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-02-09_08-18-33-latest-epoch=03.ckpt" #"/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-29_16-52-27-latest-epoch=13.ckpt"
 # resume_from: "/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-25_12-31-59-latest-epoch=05.ckpt"     # Explicit checkpoint to resume from (optional)
 # "/content/drive/MyDrive/pda/models/checkpoints/icu_model-epoch=05-val/clinical_auroc=0.747.ckpt"          
 #"/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-16_16-21-21-latest-epoch=17.ckpt"
@@ -108,6 +108,9 @@ train:
   
   ema_decay: 0.999
   ema_update_every: 10        # [SOTA] Staggered updates to fix I/O bottleneck
+  
+  # [TUNING] AUC Recovery Suite
+  acl_throttle_factor: 1.0     # [v2.2] Boosted from 0.7 to 1.0 (Full Contrastive Signal)
   manual_ema_update: true     # [v14.1 FIX] Handled manually in wrapper to prevent double-update
   monitor: "val/sepsis_auroc"
   patience: 10
@@ -122,9 +125,9 @@ train:
   acl_centroid_reg: 0.05      # [v12.5.1] Higher to prevent contrastive collapse
   
   # Risk-Aware Asymmetric Loss
-  asl_gamma_neg: 2.0          # [SOTA OPTIMIZED] Reduced from 4.0/6.0 based on AUROC sweep (v2.0 improves sensitivity)
+  asl_gamma_neg: 1.0          # [TUNING] Lowered from 2.0 to 1.0 (Recover AUC sensitivity)
   asl_gamma_pos: 1.0          # Standard focusing
-  risk_multiplier: 2.0        # Red-Zone penalty scale
+  risk_multiplier: 5.0        # [TUNING] Boosted from 2.0 to 5.0 (Sepsis Clinical Priority)
   
   # Optimization Groups
   backbone_lr_ratio: 1.0

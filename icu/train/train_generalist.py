@@ -318,6 +318,17 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
         # Just in case any other logic touched the dataset before this point.
         self.train_ds._lmdb_env = None
         
+        # [v16.0 SOTA FIX] Worker RNG Seeding (Smoking Gun #1)
+        # Rationale: Default workers might inherit identical RNG states. 
+        # We must explicitly seed numpy/random based on worker_id.
+        def worker_init_fn(worker_id):
+            import numpy as np
+            import random
+            # Use torch.initial_seed() which is correctly set by PyTorch per worker
+            seed = (torch.initial_seed() + worker_id) % 2**32
+            np.random.seed(seed)
+            random.seed(seed)
+        
         return DataLoader(
             self.train_ds,
             batch_size=self.cfg.train.batch_size,
@@ -328,13 +339,22 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
             pin_memory=self.pin_memory,
             persistent_workers=True if num_workers > 0 else False,
             # [PERF] Prefetch only if workers exist to avoid PyTorch warning
-            prefetch_factor=2 if num_workers > 0 else None,
-            drop_last=False # Sampler handles dropping logic if needed, but usually redundant with sampler
+            prefetch_factor=4 if num_workers > 0 else None,
+            drop_last=False, # Sampler handles dropping logic if needed
+            worker_init_fn=worker_init_fn
         )
 
     def val_dataloader(self) -> DataLoader:
         """Returns the validation DataLoader."""
         num_workers = self.cfg.train.num_workers
+        
+        def worker_init_fn(worker_id):
+            import numpy as np
+            import random
+            seed = (torch.initial_seed() + worker_id) % 2**32
+            np.random.seed(seed)
+            random.seed(seed)
+            
         return DataLoader(
             self.val_ds,
             batch_size=self.cfg.train.batch_size,
@@ -343,7 +363,8 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
             collate_fn=robust_collate_fn,
             pin_memory=self.pin_memory,
             persistent_workers=True if num_workers > 0 else False,
-            prefetch_factor=2 if num_workers > 0 else None
+            prefetch_factor=4 if num_workers > 0 else None,
+            worker_init_fn=worker_init_fn
         )
 
 
@@ -461,9 +482,9 @@ def main(cfg: DictConfig):
     
     strategy = hw_ctx["strategy"]
     if strategy == "ddp":
-        # [ROBUSTNESS] find_unused_parameters=True required for AuxHead handling
-        # independent of loss weighting. Prevents DDP crash on unused subgraphs.
-        strategy = DDPStrategy(find_unused_parameters=True)
+        # [AXE-SHARPENED] Increased timeout to 60m for massive 3GB checkpoint saves
+        from datetime import timedelta
+        strategy = DDPStrategy(find_unused_parameters=True, timeout=timedelta(minutes=60))
     
     # Configure Callbacks (SOTA)
     # Configure Callbacks (SOTA)
@@ -542,6 +563,17 @@ def main(cfg: DictConfig):
     try:
         # Check for resume checkpoint
         ckpt_path = cfg.get("resume_from", None)
+        
+        # [v2026 AXE-SHARPENED] Auto-Discovery Safety
+        # Rationale: If the user doesn't specify a path, we check for last.ckpt 
+        # to prevent accidental 'Fresh Starts' that waste 5 days of compute.
+        if not ckpt_path:
+            save_dir = f"{cfg.output_dir}/{cfg.run_name}/checkpoints"
+            auto_bridge = Path(save_dir) / "resumption_bridge.ckpt"
+            if auto_bridge.exists():
+                logger.info(f"🔍 [AUTO-RESUME] Found existing root-bridge: {auto_bridge}")
+                ckpt_path = str(auto_bridge)
+
         if ckpt_path and not os.path.exists(ckpt_path):
             logger.warning(f"Checkpoint {ckpt_path} not found. Starting fresh.")
             ckpt_path = None

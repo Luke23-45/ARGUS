@@ -116,7 +116,8 @@ class SOTA_DistributedGatherer:
              dim_total = int(dim_tensor.item())
 
         if len(processed_tensors) > 0:
-            fused_local = torch.cat(processed_tensors, dim=1)
+            # We already computed fused_local in Phase 0
+            pass 
         else:
             fused_local = torch.empty(0, dim_total, device=self.device)
 

@@ -216,13 +216,14 @@ class BayesianProjectedScaler(nn.Module):
         We guarantee that Sepsis uncertainty (aux) never exceeds Diffusion uncertainty,
         ensuring that the Sepsis task always maintains its priority signal.
         """
-        # [v164.0 SOTA FIX] DDP Parameter Synchronization (Smoking Gun #164)
-        # Rationale: Ranks can drift slightly during Bayesian optimization due to 
-        # local precision noise. Explicitly sync log_vars to ensure identical 
-        # task priorities across the cluster.
-        if dist.is_available() and dist.is_initialized():
-             dist.all_reduce(self.log_vars, op=dist.ReduceOp.SUM)
-             self.log_vars.div_(dist.get_world_size())
+        # [v2026 Phase 19 FIX] Removed DDP Parameter Averaging (Audit Finding F-1)
+        # Rationale: log_vars gradients are already synced via all_reduce in 
+        # training_step (L2266-2270) BEFORE opt.step(). Since all ranks start 
+        # with identical parameters (ensured by on_fit_start DDP consensus) and
+        # receive identical gradients, the post-step parameters are already identical.
+        # Averaging parameters here caused AdamW momentum (m/v) misalignment because
+        # the optimizer tracked pre-averaged values while parameters were overwritten.
+        # The clamp/projection below is sufficient to prevent rank drift.
 
         # 1. [v27.1 FIX] Tightened Bayesian Boundary Projection
         # Rationale: Old bounds [-2, 5] create 1097x precision ratio

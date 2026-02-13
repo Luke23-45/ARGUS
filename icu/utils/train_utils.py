@@ -117,6 +117,45 @@ class ScalingSteward:
         if n_curr <= 0: return ref_steps
         return int(ref_steps * (n_curr / ScalingSteward.REF_STEPS))
 
+    @staticmethod
+    def get_decay(base_decay: float, num_steps: int) -> float:
+        """
+        [SOTA 2026] Scales decay rates to preserve effective memory window.
+        
+        Formula: gamma_new = gamma_ref ^ (N_ref / N_new)
+        This ensures that the "half-life" of the moving average covers the 
+        same percentage of the epoch regardless of epoch length.
+        """
+        if num_steps <= 0: return base_decay
+        
+        # [Safety Logic] If steps are very small (debugging), don't scale aggressively
+        if num_steps < 10: return base_decay
+        
+        # Calculate scaling exponent
+        exponent = ScalingSteward.REF_STEPS / float(num_steps)
+        
+        # Apply scaling
+        # Note: We clamp the exponent to avoid numerical instability
+        exponent = max(0.1, min(10.0, exponent))
+        
+        return math.pow(base_decay, exponent)
+
+    @staticmethod
+    def get_turbo_decay(base_decay: float) -> float:
+        """
+        [SOTA 2026] Returns a turbo-charged decay rate for resumption grace periods.
+        
+        Rationale: During resumption, we want to 'forget' the stale history
+        and adapt to the current batch dynamics as fast as possible.
+        Mid-range decay (0.5-0.8) is optimal for this 'Reflexive Mode'.
+        """
+        # Map 0.9X -> 0.50 (Very fast adaptation)
+        # Map 0.99X -> 0.80 (Fast but stable)
+        if base_decay < 0.95:
+             return 0.50
+        else:
+             return 0.80
+
 
 # =============================================================================
 # 1. DISTRIBUTED HARDWARE GUARDRAILS

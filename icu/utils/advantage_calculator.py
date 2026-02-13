@@ -770,7 +770,8 @@ class ICUAdvantageCalculator(nn.Module):
     def calculate_awr_weights(
         self, 
         advantages: torch.Tensor,
-        mask: Optional[torch.Tensor] = None
+        mask: Optional[torch.Tensor] = None,
+        turbo_mode: bool = False
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Computes safe AWR weights with FP16 protection.
@@ -808,6 +809,11 @@ class ICUAdvantageCalculator(nn.Module):
                 if mask.dim() == 1 and mask.shape[0] == advantages.shape[0]:
                     mask = mask.bool()
                     advantages = advantages[mask]
+                    # [v2026-02-10 FIX] Prevent Double Masking
+                    # Since we've already filtered advantages, we must clear the mask
+                    # to prevent downstream logic (lines 817, 1008) from trying to 
+                    # index the now-smaller tensor with the original large mask.
+                    mask = None
                     # if values is not None: values = values[mask] # values not passed to this function
                     # if rewards is not None: rewards = rewards[mask] # rewards not passed to this function
         
@@ -816,6 +822,33 @@ class ICUAdvantageCalculator(nn.Module):
             adv_flat = advantages[mask.bool()]
         else:
             adv_flat = advantages.reshape(-1)
+
+        # [Operation: SHARP AXE] Forced Recalibration (Heartbeat)
+        # [CRITICAL FIX v2026-02-10] ALWAYS force recalibrate in turbo_mode
+        # The previous code required stats_initialized=False, but during resumption
+        # we restore AWR state which sets stats_initialized=True, so recalibration
+        # never triggered! Now we ALWAYS recalibrate on first turbo step.
+        if turbo_mode and adv_flat.numel() > 0:
+             # Instant Global Sync
+             if dist.is_initialized():
+                  l_sum = adv_flat.sum()
+                  l_sq_sum = (adv_flat ** 2).sum()
+                  l_count = torch.tensor(float(adv_flat.numel()), device=adv_flat.device)
+                  stats = torch.stack([l_sum, l_sq_sum, l_count])
+                  dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                  g_sum, g_sq, g_count = stats[0], stats[1], stats[2]
+                  
+                  if g_count > 1:
+                       mu = g_sum / g_count
+                       var = (g_sq / g_count) - (mu ** 2)
+                       sigma = torch.sqrt(var.clamp(min=1e-5))
+                       self.set_stats(mu.item(), sigma.item(), count=500)
+                       logger.info(f"⚡ [SHARP AXE] Forced Global Recalibration: mu={mu:.4f}, sigma={sigma:.4f}")
+             else:
+                  mu = adv_flat.mean()
+                  sigma = adv_flat.std().clamp(min=1e-5)
+                  self.set_stats(mu.item(), sigma.item(), count=500)
+                  logger.info(f"⚡ [SHARP AXE] Forced Local Recalibration: mu={mu:.4f}, sigma={sigma:.4f}")
 
         # --- 1. Global Whitening & Winsorization ---
         # [v39.0 SOTA FIX] Adaptive Advantage Whitening (Smoking Gun #39)
@@ -1100,7 +1133,8 @@ class ICUAdvantageCalculator(nn.Module):
             if self.adaptive_beta or self.adaptive_clipping:
                 beta_raw = self._update_adaptive_stats(
                     advantages, weights, ess, clipped_rate.item(), 
-                    total_batch_size=float(g_numel)
+                    total_batch_size=float(g_numel),
+                    turbo_mode=turbo_mode
                 )
             
             # Weight Entropy (Information Theoretic)
@@ -1144,12 +1178,26 @@ class ICUAdvantageCalculator(nn.Module):
 
     def _update_adaptive_stats(
         self, advantages: torch.Tensor, weights: torch.Tensor, ess: torch.Tensor, clipped_rate: float,
-        total_batch_size: float = None
+        total_batch_size: float = None,
+        turbo_mode: bool = False
     ) -> float:
         """
         [SOTA 2025] Dynamically adapts hyperparameters to squeeze performance.
         Returns the raw (un-momentum-ed) beta target for forensics.
+        
+        Args:
+            turbo_mode: If True, uses aggressive momentum decay (0.50) for rapid adaptation.
         """
+        if turbo_mode:
+             # [SHARP AXE] Turbo Adaptation
+             # Momentum=0.0 means "Instant Update" (No history). 
+             # Gain=8x means "Slam the brakes" if ESS is high.
+             effective_momentum = 0.0
+             effective_gain = self.beta_gain * 8.0 
+        else:
+             effective_momentum = self.beta_momentum.item()
+             effective_gain = self.beta_gain
+             
         beta_raw = self.beta.item()
         with torch.no_grad():
             # A. Adaptive Beta (Target ESS = 10%)
@@ -1159,7 +1207,11 @@ class ICUAdvantageCalculator(nn.Module):
                 # If this happens, the controller mistakenly tries to lower beta further,
                 # causing a collapse to min_beta.
                 # FIX: If saturation is high (>5%), force-increase Beta to restore gradients.
-                if clipped_rate > 0.05:
+                # [SHARP AXE] In Turbo Mode, we tolerate EXTREME saturation (95%) to force ESS down.
+                # We only back off if we effectively collapse to Uniform (all clipped).
+                saturation_threshold = 0.95 if turbo_mode else 0.05
+                
+                if clipped_rate > saturation_threshold:
                     # Saturation Recovery Mode (Turbo-Charged)
                     # [SOTA FIX]: Boost beta proportional to clipping severity.
                     # If 100% clipped, beta doubles instantly.
@@ -1197,21 +1249,28 @@ class ICUAdvantageCalculator(nn.Module):
 
                     # P-Controller with Anti-Windup
                     error_ess = (target_val - current_val)
-                    correction = math.exp(10.0 * error_ess * self.beta_gain)
+                    correction = math.exp(10.0 * error_ess * effective_gain)
                     
-                    correction = max(0.5, min(2.0, correction))
+                    # [SHARP AXE] Wider correction bounds in Turbo Mode for rapid recovery
+                    if turbo_mode:
+                        correction = max(0.05, min(20.0, correction))  # Allow 20x drop per step
+                    else:
+                        correction = max(0.5, min(2.0, correction))    # Standard bounds
                     new_beta = self.beta * correction
                     beta_raw = new_beta.item()
                     
                     # [SOTA v10.5] AWR Selection Recovery (Grid-Search Proven)
                     # Rationale: Hardcoded mom=0.999 caused 320-step convergence lag.
                     # Optimal mom=0.95 (via self.beta_momentum) achieves 2-step convergence.
-                    mom = self.beta_momentum
+                    mom = effective_momentum
                     updated_beta = (mom * self.beta) + ((1.0 - mom) * new_beta)
                     self.beta.copy_(torch.clamp(updated_beta, min=self.min_beta))
                     
                     # [PHASE 47] Unfreezing Telemetry
-                    # print(f"[AWR DEBUG] ESS={current_ess:.4f} | Target={target_ess} | Err={error_ess:.4f} | Corr={correction:.4f} | Beta: {self.beta.item():.4f}")
+                    if turbo_mode:
+                        pass
+                        # logger.info(f"⚡ [AWR TURBO] ESS={current_ess:.1f}, Beta={self.beta.item():.4f}, Mom={mom:.2f}")
+
                 else:
                     pass
                     # print(f"[AWR DEBUG] Saturation Mode! ClipRate={clipped_rate:.4f} | Beta Boosting...")
@@ -1223,7 +1282,10 @@ class ICUAdvantageCalculator(nn.Module):
                     # Rationale: Preventative hardening - 10-step cooldown allowed up to 20
                     # emergency growths per epoch, causing potential beta ratcheting.
                     # New 50-step cooldown limits to ~4 per epoch for stable selection pressure.
-                    self.beta.copy_(torch.clamp(self.beta * self.beta_growth_factor, min=1.5))
+                    growth = self.beta_growth_factor
+                    if turbo_mode: growth *= 2.0 # Super-growth in turbo mode if ESS collapses
+                    
+                    self.beta.copy_(torch.clamp(self.beta * growth, min=1.5))
                     self.beta_growth_cooldown = 50  # Extended cooldown: 50 steps between emergency growths
                  # [v27.1 FIX] Tensor-Safe Cooldown Update
             if self.beta_growth_cooldown.item() > 0:
@@ -1292,26 +1354,18 @@ class ICUAdvantageCalculator(nn.Module):
         advantages: torch.Tensor,
         values: Optional[torch.Tensor] = None,
         rewards: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None
+        mask: Optional[torch.Tensor] = None,
+        turbo_mode: bool = False
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Full AWR weight calculation with explained variance diagnostic.
         
-        This is the primary entry point for weight calculation, including
-        additional diagnostics like explained variance when critic outputs
-        are available.
-        
         Args:
-            advantages: (B, T) or (B,) Tensor of advantages
-            values: Optional (B, T) critic value predictions (for diagnostics)
-            rewards: Optional (B, T) reward tensor (for diagnostics)
-        
-        Returns:
-            weights: Tensor of AWR weights
-            diagnostics: Dict with ESS, entropy, explained variance, etc.
+            turbo_mode: [SOTA 2026] If True, activates rapid adaptation (0.50 momentum)
+                        to recover from resumption trauma or distribution shifts.
         """
         # Core AWR weight calculation
-        weights, diagnostics = self.calculate_awr_weights(advantages, mask=mask)
+        weights, diagnostics = self.calculate_awr_weights(advantages, mask=mask, turbo_mode=turbo_mode)
         
         # --- Additional Diagnostics ---
         

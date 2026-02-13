@@ -1240,7 +1240,7 @@ class ICUUnifiedPlanner(nn.Module):
             self_cond_tensor = torch.zeros_like(noisy_fut)
             
             # 50% probability of using a preliminary x0 estimate
-            if self.training and (torch.rand(1).item() < 0.5):
+            if self.training and (random.random() < 0.5):
                 with torch.no_grad():
                     # Pass 1: "Guess" noisy epsilon
                     guess_eps = self.backbone(

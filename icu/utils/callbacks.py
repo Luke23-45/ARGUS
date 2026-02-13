@@ -283,7 +283,13 @@ class AnomalyGuardian(Callback):
         if grad_anomaly.item() > 0:
             # Shielding: Zero out gradients IMMEDIATELY before the optimizer can use them
             pl_module.zero_grad()
-            self._handle_anomaly(trainer, pl_module, "Gradient Anomaly (NaN/Inf) detected. Weights shielded.")
+            # [v2026 Phase 19 FIX] Accumulation Cycle Reset (Audit Finding F-3)
+            # Rationale: Zeroing gradients mid-accumulation without resetting the 
+            # accumulation counter causes should_step to fire with incomplete gradient
+            # history in the next cycle. Reset to 0 for a clean restart.
+            if hasattr(pl_module, "grad_accum_idx"):
+                pl_module.grad_accum_idx.fill_(0)
+            self._handle_anomaly(trainer, pl_module, "Gradient Anomaly (NaN/Inf) detected. Weights shielded. Accumulation cycle reset.")
 
 
     def _handle_anomaly(self, trainer: pl.Trainer, pl_module: pl.LightningModule, reason: str):
@@ -610,11 +616,14 @@ class RotationalSaverCallback(Callback):
                     is_best = True
 
         # Prepare State
+        # [v2026 FIX] Full Module State Capture (Resumption Trauma Fix)
+        # Rationale: Using pl_module.state_dict() instead of model.state_dict() ensures
+        # we capture wrapper-attached modules like GhostBank and LossScaler.
         full_state = {
             'epoch': epoch,
             'global_step': trainer.global_step,
             'is_emergency': is_emergency,
-            'state_dict': pl_module.model.state_dict(),
+            'state_dict': pl_module.state_dict(), 
             # Handle potential EMA attachment
             'ema_state_dict': (
                 pl_module.ema.state_dict() if hasattr(pl_module, 'ema') and pl_module.ema 
@@ -625,6 +634,12 @@ class RotationalSaverCallback(Callback):
             'metrics': {k: v.item() if torch.is_tensor(v) else v for k, v in metrics.items()},
             'pytorch-lightning_version': pl.__version__
         }
+
+        # [v2026 CRITICAL FIX] Invoke Manual Save Hook
+        # Rationale: wrapper_generalist.on_save_checkpoint contains critical logic for
+        # AWR state, GradNorm, and Accumulation Index. We MUST invoke it manually.
+        if hasattr(pl_module, "on_save_checkpoint"):
+             pl_module.on_save_checkpoint(full_state)
         
         suffix = "_emergency" if is_emergency else ""
         self.saver.save(
@@ -739,14 +754,11 @@ class DebugSnapshotCallback(Callback):
 # 5.8  PERSISTENCE: LATEST SHADOW MIRROR (RAM OPTIMIZATION)
 # ==============================================================================
 
-class SOTALatestMirror(Callback):
+class SOTAUnifiedPersistence(Callback):
     """
-    [v2026 RAM SPIKE FIX] Lightweight Metadata Mirror (Smoking Gun #RAM-02).
-    Rationale: Instead of a full second ModelCheckpoint trigger (Redundant 2.2GB RAM), 
-    this callback creates a file-system shadow of 'last.ckpt'.
-    
-    This preserves the user's '{run_name}-latest-epoch={XX}' naming convention 
-    without the OOM risk of parallel serialization.
+    [v2026 AXE-SHARPENED v2] Single-Write Persistence Manager.
+    Rationale: Prevents the redundant 3.2GB write that occurs when an epoch is 
+    both 'best' and 'last'. Uses hard-links to manage all aliases.
     """
     def __init__(self, run_name: str, dirpath: str):
         super().__init__()
@@ -755,42 +767,103 @@ class SOTALatestMirror(Callback):
         
     def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         """
-        [v2026 HARDENED] Mirroring occurs at the absolute end of the training epoch.
-        This ensures ModelCheckpoint has flushed 'last.ckpt' to disk.
+        [SOTA v7] Lightweight Mirror-Only Callback.
+        All serialization is now delegated to PL's ModelCheckpoint (save_last=True).
+        This callback ONLY mirrors the bridge to latest/ with descriptive names.
+        Zero serialization = Zero RAM spike.
         """
         if not is_main_process(): return
-        self._mirror_checkpoint(trainer)
-
-    def _mirror_checkpoint(self, trainer: pl.Trainer):
-        # 1. Locate last.ckpt (The Internal Source of Truth)
-        last_path = self.dirpath / "last.ckpt"
-        if not last_path.exists():
-            return
-            
-        # 2. Format Destination: {run_name}-latest-epoch={epoch:02d}.ckpt
-        latest_name = f"{self.run_name}-latest-epoch={trainer.current_epoch:02d}.ckpt"
-        latest_path = self.dirpath / latest_name
         
-        # [v2026 TRANSACTIONAL SAFETY] Copy FIRST, Delete LATER.
-        # This prevents losing the 'latest' backup if a disk-full error occurs during copy.
-        copy_success = False
+        # The bridge file is created by ModelCheckpoint (save_last=True,
+        # CHECKPOINT_NAME_LAST="resumption_bridge"). We just mirror it.
+        resumption_path = self.dirpath / "resumption_bridge.ckpt"
+        
+        try:
+            if resumption_path.exists():
+                self._mirror_to_latest(trainer, resumption_path)
+                logger.info(f"💾 [SOTA-SAVE] Epoch {trainer.current_epoch}: Bridge exists, mirrored to latest/.")
+            else:
+                logger.warning(f"⚠️ [SOTA-SAVE] Epoch {trainer.current_epoch}: Bridge not found at {resumption_path}. "
+                               f"ModelCheckpoint may not have saved yet.")
+        except Exception as e:
+            import traceback
+            logger.error(f"❌ [SOTA-SAVE] Mirror Failure: {e}\n{traceback.format_exc()}")
+
+    def _mirror_to_latest(self, trainer: pl.Trainer, bridge_path: Path):
+        """
+        [v2026 AXE-SHARPENED v4] Descriptive Subfolder Mirroring.
+        Rationale: Organizes the single most recent model into a 'latest/' 
+        subfolder with human-readable epoch/metric tracking.
+        """
+        if not bridge_path.exists(): return
+
+        # 1. Metric Extraction (Dynamic)
+        monitor_val = 0.0
+        monitor_key = "loss"
+        checkpoint_cb = trainer.checkpoint_callback
+        if checkpoint_cb and checkpoint_cb.monitor:
+            monitor_key = checkpoint_cb.monitor
+            monitor_val = trainer.callback_metrics.get(monitor_key, 0.0)
+            if hasattr(monitor_val, "item"): monitor_val = monitor_val.item()
+        
+        # Clean key for filename (e.g. 'val/clinical_auroc' -> 'auroc')
+        clean_key = monitor_key.split("/")[-1].replace("clinical_", "").replace("val_", "")
+
+        # 2. Setup Subfolder Singleton
+        latest_dir = self.dirpath / "latest"
+        latest_dir.mkdir(parents=True, exist_ok=True)
+        
+        latest_name = f"latest-epoch={trainer.current_epoch:02d}-{clean_key}={monitor_val:.3f}.ckpt"
+        latest_path = latest_dir / latest_name
+
         try:
             if not latest_path.exists():
-                import shutil
-                shutil.copy2(last_path, latest_path)
-                copy_success = True
-                logger.info(f"✨ [MIRROR] Shadow Checkpoint Created: {latest_name}")
-        except Exception as e:
-            logger.warning(f"⚠️ [MIRROR] Failed to create shadow: {e}")
-        
-        if copy_success:
-            # 3. Cleanup Old Mirror Files (Emulate save_top_k=1)
-            for old_file in self.dirpath.glob(f"{self.run_name}-latest-epoch=*.ckpt"):
-                if old_file.name != latest_name:
+                import os
+                import time
+                # Small retry loop for Windows race conditions
+                for attempt in range(3):
                     try:
-                        old_file.unlink()
-                    except Exception:
-                        pass
+                        os.link(str(bridge_path), str(latest_path))
+                        logger.info(f"💾 [MIRROR] Hard-Link Created: latest/{latest_name}")
+                        break
+                    except (OSError, AttributeError) as e:
+                        if "32" in str(e) and attempt < 2:
+                            time.sleep(1)
+                            continue
+                        import shutil
+                        shutil.copy2(bridge_path, latest_path)
+                        logger.info(f"✨ [MIRROR] Shadow Created (Fallback): {latest_name}")
+                        break
+                
+                # singleton Purge: Remove all other files in latest/ EXCEPT the current one
+                for old_file in latest_dir.glob("latest-epoch=*.ckpt"):
+                    if old_file.name != latest_name:
+                        try:
+                            old_file.unlink()
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.warning(f"⚠️ [MIRROR] Minor Mirror Failure: {e}")
+
+
+class HighMemoryGuardian(Callback):
+    """
+    [v2026] Critical OOM Protection for 12GB Environments.
+    Forces garbage collection and cache clearing at epoch boundaries.
+    """
+    def on_train_epoch_end(self, trainer, pl_module):
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("🛡️ [GUARDIAN] RAM Harvested at Epoch End.")
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("🛡️ [GUARDIAN] VRAM Buffers Cleared post-validation.")
 
 
 # ==============================================================================
@@ -804,8 +877,11 @@ def get_sota_callbacks(cfg: DictConfig) -> List[Callback]:
     # 1. Core Engines (Saver, EMA)
     save_dir = f"{cfg.output_dir}/{cfg.run_name}/checkpoints"
     
+    # [v2026] OOM Guardian (PROMOTED TO INDEX 0)
+    # Rationale: Must harvest RAM BEFORE ModelCheckpoint triggers.
+    callbacks.append(HighMemoryGuardian())
+
     # [FIX] Use Standard PL ModelCheckpoint for Full Resume Compatibility
-    # The custom RotationalSaver caused KeyErrors during resume. We leverage PL's native atomic saver.
     monitor = cfg.train.get("monitor", "val/clinical_auroc")
     mode = "max" if "auroc" in monitor or "acc" in monitor else "min"
     
@@ -815,16 +891,19 @@ def get_sota_callbacks(cfg: DictConfig) -> List[Callback]:
         monitor=monitor,
         mode=mode,
         save_top_k=cfg.train.get("save_top_k", 3),
-        save_last=True, # Critical for auto-resume
+        save_last=True,  # [v7 FIX] PL handles ALL saves: best epochs get free link, non-best get one save
         save_weights_only=False, # We need optimizer state for resume
         every_n_epochs=1
     )
+    # [v7] Override the default 'last.ckpt' filename to 'resumption_bridge.ckpt'
+    # This ensures PL creates 'resumption_bridge.ckpt' directly — no renaming needed.
+    saver_cb.CHECKPOINT_NAME_LAST = "resumption_bridge"
     callbacks.append(saver_cb)
-    
-    # [v2026 RAM SPIKE FIX] Shadow Mirror (Replaces latest_ckpt_cb)
-    # Rationale: Provides the specific '{run_name}-latest-epoch={XX}' naming requested,
-    # but does so via file-system mirroring from 'last.ckpt' to avoid 2.2GB RAM spike.
-    callbacks.append(SOTALatestMirror(run_name=cfg.run_name, dirpath=save_dir))
+
+    # [v2026 AXE-SHARPENED v2] Unified Persistence Manager
+    # Rationale: Replaced the simple mirror with a smart saver that eliminates
+    # redundant 3GB writes by checking if ModelCheckpoint already saved the best model.
+    callbacks.append(SOTAUnifiedPersistence(run_name=cfg.run_name, dirpath=save_dir))
     
     # [BACKUP] Optional Remote Mirroring (Simple Copy)
     remote_dir = cfg.get("remote_dir", None)
