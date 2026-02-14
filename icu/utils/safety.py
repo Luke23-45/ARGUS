@@ -71,6 +71,7 @@ class OODGuardian:
     2.  Dynamics Violations (Impossible jumps).
     3.  Physiological Bounds (Hallucinations).
     """
+    def __init__(self, verbose: bool = False):
         self.verbose = verbose
         self.cfg = SafetyConfig()
         self._warned_normalized = False  # [FIX: v14.0] Flag for "warn once" pattern

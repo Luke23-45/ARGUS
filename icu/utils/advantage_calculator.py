@@ -458,6 +458,7 @@ class ICUAdvantageCalculator(nn.Module):
         B, T, C = vitals.shape
         device = vitals.device
         rewards = torch.zeros(B, T, device=device)
+        reward_cap = SEPSIS_CONSTANTS.get('DENSE_REWARD_CAP', 2.0)
         
         # If units are broken, we ONLY compute sparse outcome rewards (which don't depend on vitals)
         # We skip all dense physiological logic.
@@ -489,6 +490,11 @@ class ICUAdvantageCalculator(nn.Module):
         # Mask: Only apply sparse reward at true episode end
         # [FIX: Mask-Aware Terminal Placement]
         is_terminal = dones.bool()
+        if is_terminal.dim() == 1:
+            # [v25.6 SOTA FIX] Handle [B] to [B, T] broadcasting
+            # Rationale: Sample-level 'done' signals represent the entire chunk.
+            # We broadcast and then let the scatter logic below place the reward at the last valid index.
+            is_terminal = is_terminal.unsqueeze(1).expand(-1, T)
         
         # If we have a source mask, intersect terminal with it
         if src_mask is not None:
@@ -504,7 +510,10 @@ class ICUAdvantageCalculator(nn.Module):
             last_valid_idx = valid_indices.max(dim=1).values # [B]
             
             # batch_has_terminal: Any 'done' signal in the batch window
-            batch_has_terminal = (is_terminal.sum(dim=1) > 0) # [B]
+            if is_terminal.dim() >= 2:
+                batch_has_terminal = (is_terminal.sum(dim=1) > 0) # [B]
+            else:
+                batch_has_terminal = is_terminal # [B]
             
             is_last_valid = torch.zeros_like(m, dtype=torch.bool)
             # Only set last_valid logic if batch_has_terminal is True AND last_valid_idx >= 0
@@ -531,80 +540,80 @@ class ICUAdvantageCalculator(nn.Module):
 
         # --- DENSE REWARD BLOCK (SAFE) ---
         # Note: units_ok is used as a gating tensor
-            # [SOTA FIX] Fine-Grained Imputation Awareness
-            # We only penalize if the specific signal is valid (mask=1)
-            # Assumption: src_mask is [B, T, C] or [B, T]
-            def get_f_mask(idx):
-                if src_mask is None: return torch.ones(B, T, device=vitals.device)
-                if src_mask.dim() == 2: return src_mask.float()
-                if idx < src_mask.shape[-1]: return src_mask[..., idx].float()
-                return torch.ones(B, T, device=vitals.device)
+        # [SOTA FIX] Fine-Grained Imputation Awareness
+        # We only penalize if the specific signal is valid (mask=1)
+        # Assumption: src_mask is [B, T, C] or [B, T]
+        def get_f_mask(idx):
+            if src_mask is None: return torch.ones(B, T, device=vitals.device)
+            if src_mask.dim() == 2: return src_mask.float()
+            if idx < src_mask.shape[-1]: return src_mask[..., idx].float()
+            return torch.ones(B, T, device=vitals.device)
 
-            # --- 4. MAP Penalty (Sigmoid Soft-Cliff) ---
-            if map_val is not None:
-                # [v132.0 SOTA FIX] Rescued Gradient (Target=65, Steepness=0.5)
-                # [Patch 64] Strict Sepsis-3 Alignment
-                map_penalty_score = self._clinical_sigmoid(map_val, SEPSIS_CONSTANTS['MAP_TARGET'], 0.5)
-                # Apply MAP-specific mask
-                rewards -= self.shaping_coef * map_penalty_score * get_f_mask(idx_map)
+        # --- 4. MAP Penalty (Sigmoid Soft-Cliff) ---
+        if map_val is not None:
+            # [v132.0 SOTA FIX] Rescued Gradient (Target=65, Steepness=0.5)
+            # [Patch 64] Strict Sepsis-3 Alignment
+            map_penalty_score = self._clinical_sigmoid(map_val, SEPSIS_CONSTANTS['MAP_TARGET'], 0.5)
+            # Apply MAP-specific mask
+            rewards -= self.shaping_coef * map_penalty_score * get_f_mask(idx_map)
 
-            # --- 5. SBP Penalty (Additional Hypotension Marker) ---
-            if sbp_val is not None:
-                # [v132.0 SOTA FIX] Rescued Gradient (Target=100, Steepness=0.2)
-                # [Patch 64] Strict Sepsis-3 Alignment
-                sbp_penalty_score = self._clinical_sigmoid(sbp_val, SEPSIS_CONSTANTS['SBP_HYPOTENSION'], 0.2)
-                # Apply SBP-specific mask
-                rewards -= self.shaping_coef * 0.5 * sbp_penalty_score * get_f_mask(idx_sbp)
+        # --- 5. SBP Penalty (Additional Hypotension Marker) ---
+        if sbp_val is not None:
+            # [v132.0 SOTA FIX] Rescued Gradient (Target=100, Steepness=0.2)
+            # [Patch 64] Strict Sepsis-3 Alignment
+            sbp_penalty_score = self._clinical_sigmoid(sbp_val, SEPSIS_CONSTANTS['SBP_HYPOTENSION'], 0.2)
+            # Apply SBP-specific mask
+            rewards -= self.shaping_coef * 0.5 * sbp_penalty_score * get_f_mask(idx_sbp)
 
-            # --- 6. Lactate Penalty (Sigmoid Soft-Cliff) ---
+        # --- 6. Lactate Penalty (Sigmoid Soft-Cliff) ---
+        if lactate_val is not None:
+            # [v132.0 SOTA FIX] Rescued Gradient (Target=2.0, Steepness=1.0, Inverse=True)
+            # [Patch 64] Strict Sepsis-3 Alignment
+            lac_penalty_score = self._clinical_sigmoid(lactate_val, SEPSIS_CONSTANTS['LACTATE_UPPER'], 1.0, inverse=True)
+            # Apply Lactate-specific mask
+            rewards -= self.shaping_coef * 1.5 * lac_penalty_score * get_f_mask(idx_lac)
+
+        # --- 7. Respiratory Penalty (qSOFA) ---
+        if resp_val is not None:
+            # [v132.0 SOTA FIX] Rescued Gradient (Target=22, Steepness=0.3, Inverse=True)
+            # [Patch 64] Strict Sepsis-3 Alignment
+            resp_penalty_score = self._clinical_sigmoid(resp_val, SEPSIS_CONSTANTS['RESP_QSOFA'], 0.3, inverse=True)
+            # Apply Resp-specific mask
+            rewards -= self.shaping_coef * 0.3 * resp_penalty_score * get_f_mask(idx_resp)
+
+        # --- 8. Delta Trends (Reward Recovery) ---
+        if T > 1:
+            # A. Lactate Improvement: Reward DECREASE in lactate
             if lactate_val is not None:
-                # [v132.0 SOTA FIX] Rescued Gradient (Target=2.0, Steepness=1.0, Inverse=True)
-                # [Patch 64] Strict Sepsis-3 Alignment
-                lac_penalty_score = self._clinical_sigmoid(lactate_val, SEPSIS_CONSTANTS['LACTATE_UPPER'], 1.0, inverse=True)
-                # Apply Lactate-specific mask
-                rewards -= self.shaping_coef * 1.5 * lac_penalty_score * get_f_mask(idx_lac)
+                # positive delta = lactate going DOWN (good)
+                lac_delta = lactate_val[:, :-1] - lactate_val[:, 1:]
+                lac_improvement = torch.clamp(lac_delta, min=0.0, max=2.0)
+                # Use mask from previous step to ensure "start" was real
+                rewards[:, 1:] += self.shaping_coef * 2.0 * lac_improvement * get_f_mask(idx_lac)[:, :-1]
 
-            # --- 7. Respiratory Penalty (qSOFA) ---
-            if resp_val is not None:
-                # [v132.0 SOTA FIX] Rescued Gradient (Target=22, Steepness=0.3, Inverse=True)
-                # [Patch 64] Strict Sepsis-3 Alignment
-                resp_penalty_score = self._clinical_sigmoid(resp_val, SEPSIS_CONSTANTS['RESP_QSOFA'], 0.3, inverse=True)
-                # Apply Resp-specific mask
-                rewards -= self.shaping_coef * 0.3 * resp_penalty_score * get_f_mask(idx_resp)
+            # B. MAP Improvement: Reward INCREASE in MAP (if was low)
+            if map_val is not None:
+                map_delta = map_val[:, 1:] - map_val[:, :-1]
+                # Only reward MAP increase if it was in danger zone (<75)
+                map_was_low = (map_val[:, :-1] < 75.0).float()
+                map_improvement = torch.clamp(map_delta, min=0.0, max=10.0) * map_was_low
+                rewards[:, 1:] += self.shaping_coef * 0.5 * map_improvement * get_f_mask(idx_map)[:, :-1]
 
-            # --- 8. Delta Trends (Reward Recovery) ---
-            if T > 1:
-                # A. Lactate Improvement: Reward DECREASE in lactate
-                if lactate_val is not None:
-                    # positive delta = lactate going DOWN (good)
-                    lac_delta = lactate_val[:, :-1] - lactate_val[:, 1:]
-                    lac_improvement = torch.clamp(lac_delta, min=0.0, max=2.0)
-                    # Use mask from previous step to ensure "start" was real
-                    rewards[:, 1:] += self.shaping_coef * 2.0 * lac_improvement * get_f_mask(idx_lac)[:, :-1]
+            # C. SBP Improvement: Reward INCREASE in SBP (if was low)
+            if sbp_val is not None:
+                sbp_delta = sbp_val[:, 1:] - sbp_val[:, :-1]
+                sbp_was_low = (sbp_val[:, :-1] < 110.0).float()
+                sbp_improvement = torch.clamp(sbp_delta, min=0.0, max=15.0) * sbp_was_low
+                rewards[:, 1:] += self.shaping_coef * 0.2 * sbp_improvement * get_f_mask(idx_sbp)[:, :-1]
 
-                # B. MAP Improvement: Reward INCREASE in MAP (if was low)
-                if map_val is not None:
-                    map_delta = map_val[:, 1:] - map_val[:, :-1]
-                    # Only reward MAP increase if it was in danger zone (<75)
-                    map_was_low = (map_val[:, :-1] < 75.0).float()
-                    map_improvement = torch.clamp(map_delta, min=0.0, max=10.0) * map_was_low
-                    rewards[:, 1:] += self.shaping_coef * 0.5 * map_improvement * get_f_mask(idx_map)[:, :-1]
-
-                # C. SBP Improvement: Reward INCREASE in SBP (if was low)
-                if sbp_val is not None:
-                    sbp_delta = sbp_val[:, 1:] - sbp_val[:, :-1]
-                    sbp_was_low = (sbp_val[:, :-1] < 110.0).float()
-                    sbp_improvement = torch.clamp(sbp_delta, min=0.0, max=15.0) * sbp_was_low
-                    rewards[:, 1:] += self.shaping_coef * 0.2 * sbp_improvement * get_f_mask(idx_sbp)[:, :-1]
-
-            # [v2026 SOTA] Vectorized Reward Gating
-            # Zero out rewards if units are broken (Safety Layer)
-            rewards = torch.where(units_ok, rewards, torch.zeros_like(rewards))
-            rewards = torch.clamp(rewards, min=-reward_cap * 2, max=reward_cap)
-            
-            # [SOTA FIX] NaN-Robustness (Zero-Sync)
-            # Rationale: Replaced .any() branching with atomic nan_to_num.
-            rewards = rewards.nan_to_num(0.0)
+        # [v2026 SOTA] Vectorized Reward Gating
+        # Zero out rewards if units are broken (Safety Layer)
+        rewards = torch.where(units_ok, rewards, torch.zeros_like(rewards))
+        rewards = torch.clamp(rewards, min=-reward_cap * 2, max=reward_cap)
+        
+        # [SOTA FIX] NaN-Robustness (Zero-Sync)
+        # Rationale: Replaced .any() branching with atomic nan_to_num.
+        rewards = rewards.nan_to_num(0.0)
 
         # --- 10. Apply Source Mask (Zero out padding) ---
         if src_mask is not None:

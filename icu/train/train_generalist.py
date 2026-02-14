@@ -287,6 +287,20 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
              self.pending_sampler_state = state_dict["sampler_state"]
              logger.info("[RESUME] Sampler state captured in DataModule.")
 
+    @staticmethod
+    def worker_init_fn(worker_id):
+        """
+        [v16.0 SOTA FIX] Worker RNG Seeding (Smoking Gun #1).
+        Rationale: Default workers might inherit identical RNG states on Windows/Spawn.
+        Must be a static method (or top-level) to be picklable.
+        """
+        import numpy as np
+        import random
+        # Use torch.initial_seed() which is correctly set by PyTorch per worker
+        seed = (torch.initial_seed() + worker_id) % 2**32
+        np.random.seed(seed)
+        random.seed(seed)
+
     def train_dataloader(self) -> DataLoader:
         """Returns the training DataLoader."""
         from icu.utils.samplers import EpisodeAwareSampler
@@ -318,17 +332,6 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
         # Just in case any other logic touched the dataset before this point.
         self.train_ds._lmdb_env = None
         
-        # [v16.0 SOTA FIX] Worker RNG Seeding (Smoking Gun #1)
-        # Rationale: Default workers might inherit identical RNG states. 
-        # We must explicitly seed numpy/random based on worker_id.
-        def worker_init_fn(worker_id):
-            import numpy as np
-            import random
-            # Use torch.initial_seed() which is correctly set by PyTorch per worker
-            seed = (torch.initial_seed() + worker_id) % 2**32
-            np.random.seed(seed)
-            random.seed(seed)
-        
         return DataLoader(
             self.train_ds,
             batch_size=self.cfg.train.batch_size,
@@ -341,20 +344,13 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
             # [PERF] Prefetch only if workers exist to avoid PyTorch warning
             prefetch_factor=4 if num_workers > 0 else None,
             drop_last=False, # Sampler handles dropping logic if needed
-            worker_init_fn=worker_init_fn
+            worker_init_fn=self.worker_init_fn
         )
 
     def val_dataloader(self) -> DataLoader:
         """Returns the validation DataLoader."""
         num_workers = self.cfg.train.num_workers
         
-        def worker_init_fn(worker_id):
-            import numpy as np
-            import random
-            seed = (torch.initial_seed() + worker_id) % 2**32
-            np.random.seed(seed)
-            random.seed(seed)
-            
         return DataLoader(
             self.val_ds,
             batch_size=self.cfg.train.batch_size,
@@ -364,7 +360,7 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
             pin_memory=self.pin_memory,
             persistent_workers=True if num_workers > 0 else False,
             prefetch_factor=4 if num_workers > 0 else None,
-            worker_init_fn=worker_init_fn
+            worker_init_fn=self.worker_init_fn
         )
 
 

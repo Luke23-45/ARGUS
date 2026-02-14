@@ -918,7 +918,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
         # 2. Gamma: Step-Invariant Horizon Ramp (Abyssal #5)
         new_gamma = self.horizon_scheduler.get_gamma_step(total_steps)
-        self.awr_calculator.gamma = new_gamma
+        # Note: We'll update the buffer after the potential DDP sync below
+        
         
         # 3. Tau: Ramp from 0.5 to 0.7 between 'Epoch' 5 and 15 (Ref Steps 1000 to 3000)
         tau_val = 0.5
@@ -949,29 +950,26 @@ class ICUGeneralistWrapper(pl.LightningModule):
         else:
              curr_beta = 0.15
              
-        # Beta Lock: Only update if not in adaptive mode
-        if not self.awr_calculator.adaptive_beta:
-             self.awr_calculator.beta.fill_(curr_beta)
+        # Beta update handled after sync below
+        pass
 
         # 7. Update and Synchronize (Broadcast Rank 0 to others)
         if dist.is_initialized():
-             vars_tensor = torch.tensor([tau_val, sigma_val, curr_beta, new_gamma, phys_clamp_val], device=self.device)
+             vars_tensor = torch.tensor([tau_val, sigma_val, curr_beta, float(new_gamma), phys_clamp_val], device=self.device)
              dist.broadcast(vars_tensor, src=0)
-             # Extract without .item() where possible to stay in graph
-             # Note: calculator fields like gamma are now buffers.
-             tau_val, sigma_val, curr_beta, new_gamma, phys_clamp_val = vars_tensor
+             # Unpack synced values
+             tau_val, sigma_val, curr_beta, new_gamma, phys_clamp_val = vars_tensor.tolist()
         
-        self.curr_tau.copy_(tau_val)
-        self.curr_sigma_scale.copy_(sigma_val)
-        self.curr_phys_clamp.copy_(phys_clamp_val)
+        # [v2026 SOTA] Atomic Buffer Registration (Atomic #1)
+        # Rationale: Using .fill_() is safe for both floats and tensors.
+        self.curr_tau.fill_(tau_val)
+        self.curr_sigma_scale.fill_(sigma_val)
+        self.curr_phys_clamp.fill_(phys_clamp_val)
         
-        # Update calculator if sync broadcast changed them
         if not self.awr_calculator.adaptive_beta:
-             self.awr_calculator.beta.copy_(curr_beta)
+             self.awr_calculator.beta.fill_(curr_beta)
         
-        # [v2026 SOTA FIX] Vectorized Horizon Update (Zero-Sync)
-        # Rationale: Using copy_ on the buffer prevents per-step or periodic .item() syncs.
-        self.awr_calculator.gamma.copy_(new_gamma)
+        self.awr_calculator.gamma.fill_(new_gamma)
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -3221,17 +3219,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
             num_samples = len(dataset)
             # [SOTA FIX] Default to "sample" to prevent 15-minute stalls on missing keys
             config_mode = self.cfg.train.get("awr_calibration_mode", "sample")
-            # [SOTA FIX] Population Coverage Boost (10k -> 60k)
-            max_samples = self.cfg.train.get("awr_max_samples", 60000)
+            # [SOTA FIX] Adaptive Calibration Speed (20k is statistically significant for 451k)
+            max_samples = self.cfg.train.get("awr_max_samples", 20000)
             
-            # [SOTA FORENSIC FORCE] Override "full" if max_samples implies intention to sample
-            # [USER REQUEST] Strict Mode Adherence: "full" means FULL, regardless of max_samples.
+            # [SOTA FORENSIC FIX] "full" means scan entire population. Use with caution.
             if config_mode == "full":
                 mode = "full"
-                if max_samples < num_samples:
-                     logger.info(f"[AWR] Mode is 'full'. Bypassing max_samples ({max_samples}) to use entire population ({num_samples}).")
             elif max_samples < num_samples and max_samples > 0:
-                 # Logic for implicit sampling if max_samples is defined and small
                  mode = "sample"
             else:
                  mode = config_mode
@@ -3271,22 +3265,41 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 
                 with torch.no_grad():
                     # [v25.5 FIX] Calibration Parity: Include sparse rewards and masking
-                    # rewards_list.append(r.mean().item()) -> Use rewards collected with terminal awareness
+                    s_mask = sample.get("future_mask").to(self.device).unsqueeze(0)
                     r = self.awr_calculator.compute_clinical_reward(
                         future, 
                         label, 
                         dones=sample.get("is_terminal").unsqueeze(0).to(self.device),
                         feature_indices=self.clinical_feat_idx,
                         normalizer=None,
-                        src_mask=sample.get("future_mask").unsqueeze(0).to(self.device)
+                        src_mask=s_mask
                     )
-                    rewards_list.append(r.mean().item())
+                    
+                    # [v25.6 SOTA FIX] Solve "AWR Amnesia" & "Shape Mismatch"
+                    # Rationale 1: mask can be [T_full, C] or [T_full], but rewards (r) is [1, T_curr].
+                    # Rationale 2: T_curr might be < T_full for short trajectories.
+                    # Rationale 3: We reduce to sequence-level mask before indexing.
+                    m_raw = sample.get("future_mask")
+                    m_step = torch.as_tensor(m_raw).to(self.device).float()
+                    
+                    if m_step.dim() > 1:
+                        m_step = m_step.any(dim=-1).float()
+                    
+                    # Force alignment with reward sequence length (handle partial windows)
+                    T_actual = r.shape[1]
+                    m_step = m_step[:T_actual]
+                    
+                    # Filter by mask to only keep "real" clinical data steps
+                    valid_rewards = r.view(-1)[m_step.view(-1) > 0.5]
+                    if valid_rewards.numel() > 0:
+                        rewards_list.append(valid_rewards.cpu()) # Move to CPU
             
             if len(rewards_list) > 0:
-                r_arr = np.array(rewards_list)
-                stats_tensor[0] = float(r_arr.mean())
-                stats_tensor[1] = float(r_arr.std())
-                logger.info(f"AWR Stats: Mean={stats_tensor[0]:.4f}, Std={stats_tensor[1]:.4f}")
+                # [v25.6] Efficient aggregation
+                all_rewards = torch.cat(rewards_list)
+                stats_tensor[0] = all_rewards.mean().item()
+                stats_tensor[1] = all_rewards.std().item() + 1e-8
+                logger.info(f"AWR Stats (True Population): Mean={stats_tensor[0]:.4f}, Std={stats_tensor[1]:.4f}, Points={all_rewards.numel()}")
             else:
                 logger.warning("No valid samples found for AWR calibration. Using defaults.")
                 stats_tensor[0] = 0.0

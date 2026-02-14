@@ -149,9 +149,10 @@ mp.md
 sota_optimization_bridge.md
 awr_optimization_report.md
 awr_simulation_results.txt
-error12.md
+# error12.md
 temp_test_ckpt/mp/diffusion.py
 scripts/dump_git_diffs.py
 pending_changes.diff
 verification_report.md
 l3.md
+error12.md
