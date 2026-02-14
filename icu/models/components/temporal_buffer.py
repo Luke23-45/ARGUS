@@ -250,7 +250,7 @@ class TemporalContrastiveBuffer(nn.Module):
              else:
                   # [v31.0 SOTA FIX] Use scaled momentum for density-invariance
                   mom = float(self.prototype_momentum)
-                  self.prototype_ema.mul_(mom).add_(batch_avg, alpha=1.0 - mom)
+                  self.prototype_ema.lerp_(batch_avg, 1.0 - mom)
              self.prototype_ema.copy_(F.normalize(self.prototype_ema, dim=1))
         
         return {

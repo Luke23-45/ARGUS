@@ -537,17 +537,18 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # to match the new buffers, otherwise PyTorch's load_state_dict 
             # will ignore them or fail (even with strict=False).
             new_state_dict = state_dict.copy()
-            for name, buffer in self.named_buffers():
+            model_state = self.state_dict()
+            for name, expected_tensor in model_state.items():
                 if name in new_state_dict:
                     checkpoint_tensor = new_state_dict[name]
                     # Case 1: scalar ([]) in checkpoint, vector ([1]) in model
-                    if checkpoint_tensor.dim() == 0 and buffer.dim() == 1 and buffer.shape[0] == 1:
+                    if checkpoint_tensor.dim() == 0 and expected_tensor.dim() == 1 and expected_tensor.shape[0] == 1:
                         new_state_dict[name] = checkpoint_tensor.view(1)
                         logger.debug(f"  [Reshape] {name}: [] -> [1]")
                     
-                    # Case 2: int/long cast (e.g. GN count)
-                    if checkpoint_tensor.dtype != buffer.dtype:
-                        new_state_dict[name] = checkpoint_tensor.to(buffer.dtype)
+                    # Case 2: int/long cast
+                    if checkpoint_tensor.dtype != expected_tensor.dtype:
+                        new_state_dict[name] = checkpoint_tensor.to(expected_tensor.dtype)
 
             return super().load_state_dict(new_state_dict, strict=False)
             
@@ -1710,13 +1711,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Also fixes a mask-safety bug by using the scalar 'diff_loss' variable 
             # (which correctly handles f_mask division from L613).
             loss_dict = {
-                'diffusion': diff_loss,       # [v5.2] Scale Restored: 1.0 (Mask-Safe)
+                'diffusion': diff_loss.mean(),       # [v2026 SOTA] Enforce 0D scalar
                 # [PHASE 35 SOTA FIX] Critic Regime Normalization (Smoking Gun #22)
                 # Evidence: V=5.6 while D=0.16. Scaling to 0.1 achieves ~0.56, 
                 # ensuring head gradients provide selection pressure to the manifold.
-                'critic': critic_loss * 0.1,
-                'aux': aux_loss,              # Clinical Anchor (0.5)
-                'acl': acl_loss               # (1.5)
+                'critic': (critic_loss * 0.1).mean(),
+                'aux': aux_loss.mean(),              # Clinical Anchor (0.5)
+                'acl': acl_loss.mean()               # (1.5)
             }
             
             # [v4.0 PERFECT] Add BGSL and TCB to the balance

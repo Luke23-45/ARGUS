@@ -151,13 +151,14 @@ class BGSLLoss(nn.Module):
         # Rationale: w_t and w_h are now persistent buffers. 
         # Do not use fill_ in forward to prevent amnesia.
             
-        total_loss = l_state + (self.w_t * l_trend) + (self.w_h * l_shock)
+        # [v2026 SOTA FIX] Explicit Reduction to 0D Scalar
+        total_loss = l_state.mean() + (self.w_t * l_trend.mean()) + (self.w_h * l_shock.mean())
         
         return {
             "loss": total_loss,
-            "l_state": l_state,
-            "l_trend": l_trend,
-            "l_shock": l_shock,
+            "l_state": l_state.mean(),
+            "l_trend": l_trend.mean(),
+            "l_shock": l_shock.mean(),
             "w_trend": self.w_t,
             "w_shock": self.w_h
         }

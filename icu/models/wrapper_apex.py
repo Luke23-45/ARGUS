@@ -162,8 +162,8 @@ class ICUSpecialistWrapper(pl.LightningModule):
         if self.balancing_mode == "sota_2025":
             # Learnable log-variances for Uncertainty Weighting
             # Specialist mode balances [Diffusion, Router] - Critic is detached.
-            self.log_var_diff = nn.Parameter(torch.tensor(0.0))
-            self.log_var_router = nn.Parameter(torch.tensor(0.0))
+            self.log_var_diff = nn.Parameter(torch.tensor([0.0]))
+            self.log_var_router = nn.Parameter(torch.tensor([0.0]))
             logger.info("Initializing Uncertainty Weighting Parameters (Specialist)...")
         
         # [v4.2.1] Internal State for Sampler Restoration
@@ -328,17 +328,18 @@ class ICUSpecialistWrapper(pl.LightningModule):
             
             # 2. [v2026 SOTA] Scalar-to-Vector Normalization
             new_state_dict = state_dict.copy()
-            for name, buffer in self.named_buffers():
+            model_state = self.state_dict()
+            for name, expected_tensor in model_state.items():
                 if name in new_state_dict:
                     checkpoint_tensor = new_state_dict[name]
                     # Case 1: scalar ([]) in checkpoint, vector ([1]) in model
-                    if checkpoint_tensor.dim() == 0 and buffer.dim() == 1 and buffer.shape[0] == 1:
+                    if checkpoint_tensor.dim() == 0 and expected_tensor.dim() == 1 and expected_tensor.shape[0] == 1:
                         new_state_dict[name] = checkpoint_tensor.view(1)
                         logger.debug(f"  [Reshape] {name}: [] -> [1]")
                     
                     # Case 2: int/long cast
-                    if checkpoint_tensor.dtype != buffer.dtype:
-                        new_state_dict[name] = checkpoint_tensor.to(buffer.dtype)
+                    if checkpoint_tensor.dtype != expected_tensor.dtype:
+                        new_state_dict[name] = checkpoint_tensor.to(expected_tensor.dtype)
 
             return super().load_state_dict(new_state_dict, strict=False)
             

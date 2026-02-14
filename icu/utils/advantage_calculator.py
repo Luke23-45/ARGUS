@@ -887,8 +887,8 @@ class ICUAdvantageCalculator(nn.Module):
                     bias_correction = (1.0 - torch.pow(mom, t)).clamp(min=0.01)
                     
                     # Update (Uncorrected)
-                    self.adv_mean.mul_(mom).add_(curr_mu, alpha=1.0 - mom)
-                    self.adv_std.mul_(mom).add_(curr_sigma, alpha=1.0 - mom)
+                    self.adv_mean.mul_(mom).add_(curr_mu, alpha=(1.0 - mom).item())
+                    self.adv_std.mul_(mom).add_(curr_sigma, alpha=(1.0 - mom).item())
                     
                     mu = self.adv_mean / bias_correction
                     sigma = self.adv_std / bias_correction

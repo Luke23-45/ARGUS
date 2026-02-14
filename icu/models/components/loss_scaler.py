@@ -62,14 +62,19 @@ class BayesianProjectedScaler(nn.Module):
         active_keys = []
         for i, key in enumerate(self.keys):
             if key in loss_dict:
-                losses.append(loss_dict[key])
+                # [v2026 SOTA] Enforce 1D vector format ([1])
+                # Rationale: Prevents RuntimeError during stack if some are [] and some are [1].
+                losses.append(loss_dict[key].reshape(-1))
                 active_keys.append((i, key))
         
         has_losses = len(losses) > 0
         device = next(self.parameters()).device
         
         if has_losses:
-            losses_tensor = torch.stack(losses)
+            # [v2026 SOTA FIX] Explicit shape squeeze
+            # Rationale: Ensures a 1D tensor even if inputs were [1].
+            # Prevents [N, 1] broadcast crash during accumulation.
+            losses_tensor = torch.stack(losses).squeeze(-1)
             indices = torch.tensor([idx for idx, _ in active_keys], device=losses_tensor.device)
             local_raw = losses_tensor.detach()
             
@@ -79,8 +84,9 @@ class BayesianProjectedScaler(nn.Module):
                 self.task_counters[indices] += batch_size
                 self.batch_counter += batch_size
         else:
-            # Neutral tensors for empty-batch ranks
-            losses_tensor = torch.tensor(0.0, device=device, requires_grad=True)
+            # [v2026 SOTA] Standardized empty-batch rank fallback
+            # Rationale: All ranks must return 1D vectors [1] for stack compatibility.
+            losses_tensor = torch.tensor([0.0], device=device, requires_grad=True)
             indices = torch.tensor([], dtype=torch.long, device=device)
             local_raw = torch.tensor([], device=device)
 
@@ -130,12 +136,13 @@ class BayesianProjectedScaler(nn.Module):
                 avg_losses = avg_losses_all[indices] if has_losses else torch.tensor([], device=device)
                 # [SOTA v4.0] Conservative Warmup (matches DDP case)
                 curr_decay = torch.where(self.step_count < 200, torch.as_tensor([0.95], device=device), self.decay)
+                # [v2026 SOTA FIX] Atomic EMA Update (lerp_) for consistency
                 self.loss_emas.lerp_(avg_losses_all, 1.0 - curr_decay)
                 self.loss_accumulator.zero_()
                 self.task_counters.zero_()
                 self.batch_counter.zero_()
             else:
-                avg_losses = local_raw
+                avg_losses = local_raw.squeeze(-1) if local_raw.dim() > 1 else local_raw
                 avg_losses_all = local_raw # Fallback for logging
         
         # 4. Return early if no losses to weight (after DDP sync)
