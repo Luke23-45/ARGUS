@@ -19,7 +19,7 @@ class DynamicThresholding(nn.Module):
         self.ema_decay = ema_decay
         
         # [v27.0 FIX] EMA-smoothed percentile for gradient stability
-        self.register_buffer("ema_s", torch.tensor(threshold))
+        self.register_buffer("ema_s", torch.tensor([threshold]))
 
     def forward(self, x: torch.Tensor, update_ema: bool = True) -> torch.Tensor:
         B = x.shape[0]

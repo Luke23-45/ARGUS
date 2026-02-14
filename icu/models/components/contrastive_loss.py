@@ -18,8 +18,8 @@ class AsymmetricContrastiveLoss(nn.Module):
         self.d_model = d_model
         self.num_classes = num_classes
         self.temperature = temperature
-        self.register_buffer("base_momentum", torch.tensor(0.99).float())
-        self.register_buffer("momentum", torch.tensor(0.99).float())
+        self.register_buffer("base_momentum", torch.tensor([0.99]).float())
+        self.register_buffer("momentum", torch.tensor([0.99]).float())
         
         self.register_buffer('centroids', F.normalize(torch.randn(num_classes, d_model), dim=1))
         self.register_buffer('initialized', torch.zeros(1, dtype=torch.bool))
@@ -111,7 +111,7 @@ class AsymmetricContrastiveLoss(nn.Module):
                     # If init: w = 1-momentum. 
                     # If not init: w = 1.0.
                     
-                    w = torch.where(self.initialized, 1.0 - self.momentum, torch.tensor(1.0, device=device))
+                    w = torch.where(self.initialized, 1.0 - self.momentum, torch.tensor([1.0], device=device))
                     self.centroids[c].lerp_(global_center, w)
                         
             if local_sync[:, self.d_model].sum() > 0:

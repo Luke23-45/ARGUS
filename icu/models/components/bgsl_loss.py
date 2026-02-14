@@ -40,8 +40,8 @@ class BGSLLoss(nn.Module):
         self.shock_coef = shock_coef
         
         # [v4.0 PERFECT] Dynamic Balancing Buffers
-        self.register_buffer("w_t", torch.tensor(trend_coef))
-        self.register_buffer("w_h", torch.tensor(shock_coef))
+        self.register_buffer("w_t", torch.tensor([trend_coef]))
+        self.register_buffer("w_h", torch.tensor([shock_coef]))
 
     def state_loss_fn(self, logits: torch.Tensor, targets: torch.Tensor, stability_factor: float = 1.0) -> torch.Tensor:
         """

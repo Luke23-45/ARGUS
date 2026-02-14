@@ -111,7 +111,7 @@ class VolatilityAwareGate(nn.Module):
             nn.SiLU(),
             nn.Linear(d_model, d_model)
         )
-        self.volatility_gate = nn.Parameter(torch.tensor(1.0))
+        self.volatility_gate = nn.Parameter(torch.tensor([1.0]))
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, smooth_ctx: torch.Tensor, raw_ctx: torch.Tensor, raw_past: torch.Tensor) -> torch.Tensor:

@@ -42,10 +42,10 @@ class TemporalContrastiveBuffer(nn.Module):
         # [v27.0 FIX] Zero-initialize queue instead of random
         # This prevents meaningless InfoNCE contrasts during warmup
         self.register_buffer("queue", torch.zeros(capacity, d_model))
-        self.register_buffer("queue_ptr", torch.tensor(0, dtype=torch.long))
-        self.register_buffer("queue_filled", torch.tensor(0, dtype=torch.long))
+        self.register_buffer("queue_ptr", torch.tensor([0], dtype=torch.long))
+        self.register_buffer("queue_filled", torch.tensor([0], dtype=torch.long))
         self.register_buffer("prototype_ema", torch.zeros(1, d_model)) # [v29.6] Manifold Anchor
-        self.register_buffer("prototype_momentum", torch.tensor(0.99)) # [v31.0] Adaptive Anchor
+        self.register_buffer("prototype_momentum", torch.tensor([0.99])) # [v31.0] Adaptive Anchor
 
     def scale_dynamics(self, n_curr: int):
         """[SOTA v2026] Unifies buffer capacity across step densities."""

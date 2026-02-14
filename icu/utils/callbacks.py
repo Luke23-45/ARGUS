@@ -519,7 +519,7 @@ class EMACallback(Callback):
                 stats = ""
                 if "weight" in self._deferred_ema_state:
                     w = self._deferred_ema_state["weight"]
-                    stats = f" (W: mean={w.mean():.4f}, std={w.std():.4f})"
+                    stats = f" (W: mean={w.mean().item():.4f}, std={w.std().item():.4f})"
                 
                 logger.info(f"EMA: Applying deferred state_dict from Checkpoint.{stats}")
                 self.ema.load_state_dict(self._deferred_ema_state)

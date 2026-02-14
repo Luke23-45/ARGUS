@@ -517,16 +517,40 @@ class ICUGeneralistWrapper(pl.LightningModule):
     
     def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True):
         """
-        [SOTA v2026] resilient State Loading.
-        Forces strict=False when loading from a checkpoint to prevent crashes
-        from newly added buffers or parameters.
+        [SOTA v2026] Resilient State Loading.
+        
+        Features:
+        1.  Shape-Aware Bridge: Automatically reshapes scalar buffers ([]) from 
+            older checkpoints into the new 1D vector format ([1]).
+        2.  Relaxed Constraint: Uses strict=False for checkpoints to allow 
+            seamless addition of new stability buffers.
         """
-        # Detection of checkpoint loading vs manual state_dict application
+        # 1. Detection of checkpoint loading vs manual state_dict application
         is_checkpoint = any("model." in k for k in state_dict.keys()) or any("awr_calculator." in k for k in state_dict.keys())
         
         if is_checkpoint:
-             logger.info("🛡️ [PMS] resilient Loading: Using strict=False for restoration bridge.")
-             return super().load_state_dict(state_dict, strict=False)
+            logger.info("🛡️ [PMS] Resilient Loading: Initializing restoration bridge...")
+            
+            # 2. [v2026 SOTA] Scalar-to-Vector Normalization
+            # Rationale: Many scalar buffers were upgraded from shape [] to [1]
+            # to ensure DDP consistency. We must reshape them in the state_dict
+            # to match the new buffers, otherwise PyTorch's load_state_dict 
+            # will ignore them or fail (even with strict=False).
+            new_state_dict = state_dict.copy()
+            for name, buffer in self.named_buffers():
+                if name in new_state_dict:
+                    checkpoint_tensor = new_state_dict[name]
+                    # Case 1: scalar ([]) in checkpoint, vector ([1]) in model
+                    if checkpoint_tensor.dim() == 0 and buffer.dim() == 1 and buffer.shape[0] == 1:
+                        new_state_dict[name] = checkpoint_tensor.view(1)
+                        logger.debug(f"  [Reshape] {name}: [] -> [1]")
+                    
+                    # Case 2: int/long cast (e.g. GN count)
+                    if checkpoint_tensor.dtype != buffer.dtype:
+                        new_state_dict[name] = checkpoint_tensor.to(buffer.dtype)
+
+            return super().load_state_dict(new_state_dict, strict=False)
+            
         return super().load_state_dict(state_dict, strict=strict)
     
     
@@ -1080,7 +1104,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Absolute Floor for "Iron Dome" protection
             # [Patch 65] Relaxed Threshold
             # [v2026 SOTA] Vectorized floor
-            stability_factor = torch.where(torch.as_tensor(ema_bc, device=self.device) > 50.0, torch.tensor(0.1, device=self.device), stability_factor)
+            # [v2026 SOTA] Standardized Broadcast Protection
+            stability_factor = torch.where(torch.as_tensor(ema_bc, device=self.device) > 50.0, torch.tensor([0.1], device=self.device), stability_factor)
             
             # [v51.0 SOTA FIX] Governor Grace Alignment (Smoking Gun #81)
             # Rationale: During the grace period, EMAs represent stale history.
@@ -2360,7 +2385,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                     if self.global_step < 100:
                         self.grad_norm_ema.fill_(current_grad_pressure)
                         self.grad_norm_std.fill_(0.5) 
-                        logger.info(f"🛡️ [PMS] Initialization Complete. GN Baseline: {current_grad_pressure:.4f}")
+                        logger.info(f"🛡️ [PMS] Initialization Complete. GN Baseline: {current_grad_pressure.item():.4f}")
                     else:
                         # Log conclusion once (Note: logic for 'once' is handled by grace decrement)
                         # but we only log if we were actually IN grace (checked via step count or flag).
@@ -2424,7 +2449,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                           else:
                                self.gradnorm.optimizer.step()
             else:
-                logger.warning(f"⚠️ Gradient Spike Detected (Norm={grad_norm_val:.2f}). Skipping optimization step for batch {batch_idx}.")
+                logger.warning(f"⚠️ Gradient Spike Detected (Norm={grad_norm_val.item():.2f}). Skipping optimization step for batch {batch_idx}.")
             
             # [v23.0 SOTA FIX] Mandatory Reservoir Purge (Smoking Gun #224)
             # Rationale: Regardless of step success, we MUST wipe the gradients 

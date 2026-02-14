@@ -223,7 +223,7 @@ class RobustLossScaler(nn.Module):
             
             # Dynamic Floor Calculation
             # If loss > 5.0, floor = 5.0, else 2.0
-            floors = torch.where(self.loss_emas > 5.0, torch.as_tensor(5.0, device=L.device), torch.as_tensor(2.0, device=L.device))
+            floors = torch.where(self.loss_emas > 5.0, torch.as_tensor([5.0], device=L.device), torch.as_tensor([2.0], device=L.device))
         
         # 3. Apply Clamping and Weighting
         # log_var = self.log_vars.clamp(min=-2.0, max=floors) 
@@ -342,7 +342,7 @@ class OrthogonalGuard(object):
                 params.extend([p for p in extra_params if p.grad is not None])
             
             if not params:
-                return torch.tensor(0.0, device=next(model.parameters()).device)
+                return torch.tensor([0.0], device=next(model.parameters()).device)
                 
             # [Optimization] Fused Norm (Zero-Copy)
             # torch._foreach_norm returns a list of scalars (L2 norm of each tensor)
@@ -438,7 +438,7 @@ class TrendSentinel:
                 step_tensor.add_(1)
                 bias_correction = (1.0 - torch.pow(decay, step_tensor)).clamp(min=0.01)
             else:
-                bias_correction = torch.tensor(1.0, device=ema.device)
+                bias_correction = torch.tensor([1.0], device=ema.device)
 
             delta = current_val - ema
             # Update Mean (Uncorrected)

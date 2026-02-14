@@ -592,7 +592,7 @@ def main(cfg: DictConfig):
             logger.info("[SUCCESS] Phase 1 Training Complete!")
             if trainer.checkpoint_callback:
                 logger.info(f"[BEST MODEL] {trainer.checkpoint_callback.best_model_path}")
-                logger.info(f"[BEST SCORE] val/sepsis_auroc = {trainer.checkpoint_callback.best_model_score:.4f}")
+                logger.info(f"[BEST SCORE] val/sepsis_auroc = {trainer.checkpoint_callback.best_model_score.item():.4f}")
                 
                 # [BACKUP] Copy best model to backup_dir if configured
                 if cfg.get("backup_dir") and trainer.checkpoint_callback.best_model_path:

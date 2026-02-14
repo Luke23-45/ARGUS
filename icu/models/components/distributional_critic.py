@@ -110,10 +110,9 @@ class DistributionalValueHead(nn.Module):
         N = self.num_quantiles
         taus_q = torch.linspace(1/(2*N), 1 - 1/(2*N), N, device=quantiles.device)
         
-        # [Pessimistic Weighting]
-        # tau_w: Risk-adjusted weights. 
-        # if tau > 0.5, we emphasize lower (taus_q < 0.5) quantiles.
-        tau_w = torch.where(taus_q < 0.5, tau, 1.0 - tau)
+        # [v2026 SOTA] Standardized Weighting
+        tau_t = torch.as_tensor([tau], device=quantiles.device)
+        tau_w = torch.where(taus_q < 0.5, tau_t, 1.0 - tau_t)
         uni_w = torch.ones_like(taus_q)
         
         # 50/50 Consensus (Pessimistic + Neutral)
@@ -158,8 +157,9 @@ class IQLQuantileLoss(nn.Module):
         # 1. Conservative IQL Expectile Baseline
         v_pred_mean = pred_quantiles.mean(dim=-1)
         diff = target_returns - v_pred_mean
-        # Expectile weight (Asymmetric L2)
-        weight_iql = torch.where(diff < 0, 1 - self.tau, self.tau)
+        # [v2026 SOTA] Standardized Weighting
+        tau_t = torch.as_tensor([self.tau], device=device)
+        weight_iql = torch.where(diff < 0, 1.0 - tau_t, tau_t)
         expectile_loss = (weight_iql * (diff**2)).mean()
         
         # 2. QR-DQN Distributional Hub (Quantile Huber)

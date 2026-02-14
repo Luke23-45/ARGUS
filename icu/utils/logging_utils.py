@@ -33,11 +33,21 @@ class BufferedCSVLogger:
         """
         Add a row to the buffer.
         """
+        # [v2026 SOTA] Tensor-to-Scalar Normalization
+        # Rationale: Standardized [1] buffers can't be serialized to CSV directly.
+        processed_metrics = {}
+        import torch
+        for k, v in metrics.items():
+            if isinstance(v, torch.Tensor) and v.numel() == 1:
+                processed_metrics[k] = v.item()
+            else:
+                processed_metrics[k] = v
+        
         # Snapshot time
-        if "timestamp" not in metrics:
-            metrics["timestamp"] = time.time()
+        if "timestamp" not in processed_metrics:
+            processed_metrics["timestamp"] = time.time()
             
-        self.buffer.append(metrics)
+        self.buffer.append(processed_metrics)
         
         # Auto-Flush Logic
         if len(self.buffer) >= self.buffer_size or (time.time() - self.last_flush) > self.flush_interval:

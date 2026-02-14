@@ -163,7 +163,7 @@ class BayesianProjectedScaler(nn.Module):
                 throttle_threshold = 20.0 * fundamental_signal
                 
                 # Compute throttles: scale down if EMA > threshold, else 1.0
-                throttles = torch.where(emas_active > throttle_threshold, throttle_threshold / (emas_active + 1e-8), torch.as_tensor(1.0, device=device))
+                throttles = torch.where(emas_active > throttle_threshold, throttle_threshold / (emas_active + 1e-8), torch.as_tensor([1.0], device=device))
                 # Clamp to [0.1, 1.0] to suppress bullies without killing signals
                 # [v2026 SOTA FIX] Direct Tensor update
                 clinical_weights[indices] *= torch.clamp(throttles, min=0.1, max=1.0)

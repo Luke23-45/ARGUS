@@ -240,8 +240,8 @@ class ICUAdvantageCalculator(nn.Module):
         # Register as buffers for persistence across checkpoints
         self.register_buffer("adv_mean", torch.tensor([0.0]))
         self.register_buffer("adv_std", torch.tensor([1.0]))
-        self.register_buffer("stats_count", torch.tensor(0))
-        self.register_buffer("stats_initialized", torch.tensor(False))
+        self.register_buffer("stats_count", torch.tensor([0], dtype=torch.long))
+        self.register_buffer("stats_initialized", torch.tensor([False]))
         
         logger.info(
             f"[ADVANTAGE] Initialized: beta={beta}, gamma={gamma}, "
@@ -300,9 +300,13 @@ class ICUAdvantageCalculator(nn.Module):
         if isinstance(std, torch.Tensor):
             # [v2026 SOTA] Atomic variance check
             std_v = std.reshape(-1)[:1]
-            self.adv_std.copy_(torch.where(std_v > 1e-6, std_v, torch.ones_like(std_v)))
+            self.adv_std.copy_(torch.where(std_v > 1e-6, std_v.view_as(self.adv_std), torch.ones_like(self.adv_std)))
+            self.stats_count.copy_(torch.as_tensor([count], device=self.stats_count.device))
+            self.stats_initialized.fill_(True)
         else:
             self.adv_std.fill_(std if std > 1e-6 else 1.0)
+            self.stats_count.fill_(count)
+            self.stats_initialized.fill_(True)
         
         if beta is not None:
             if isinstance(beta, torch.Tensor):
@@ -387,9 +391,9 @@ class ICUAdvantageCalculator(nn.Module):
         self.whitening_momentum.fill_(ScalingSteward.get_decay(self.base_whitening_momentum, n_curr))
         
         logger.info(
-            f"⚡ [AWR] Scaling Results: beta_mom={self.beta_momentum:.6f}, "
-            f"ess_ema={self.ess_ema_decay:.4f}, growth={self.beta_growth_factor:.4f}, "
-            f"white_mom={self.whitening_momentum:.6f}"
+            f"⚡ [AWR] Scaling Results: beta_mom={self.beta_momentum.item():.6f}, "
+            f"ess_ema={self.ess_ema_decay.item():.4f}, growth={self.beta_growth_factor.item():.4f}, "
+            f"white_mom={self.whitening_momentum.item():.6f}"
         )
 
     # =========================================================================
@@ -506,7 +510,7 @@ class ICUAdvantageCalculator(nn.Module):
         with torch.no_grad():
             indices = torch.arange(T, device=m.device).view(1, T)
             # Find the index of the last valid timestamp in each batch
-            valid_indices = torch.where(m, indices, torch.tensor(-1, device=m.device))
+            valid_indices = torch.where(m, indices, torch.tensor([-1], device=m.device))
             last_valid_idx = valid_indices.max(dim=1).values # [B]
             
             # batch_has_terminal: Any 'done' signal in the batch window
@@ -1226,9 +1230,8 @@ class ICUAdvantageCalculator(nn.Module):
                 new_beta_emergency = torch.where(emergency_mask, torch.clamp(self.beta * growth, min=1.5), self.beta)
                 self.beta.copy_(new_beta_emergency)
                 
-                # Vectorized Cooldown reset (only if any emergency triggered)
-                # Note: emergency_mask is a 0D tensor in this context (ESS is global)
-                self.beta_growth_cooldown.copy_(torch.where(emergency_mask, torch.as_tensor(100, device=device), self.beta_growth_cooldown))
+                # [v2026] Use .fill_ or .copy_ with [1] tensors
+                self.beta_growth_cooldown.copy_(torch.where(emergency_mask, torch.as_tensor([100], device=device, dtype=torch.long), self.beta_growth_cooldown))
             # [v2026 SOTA] Vectorized Cooldown
             self.beta_growth_cooldown.copy_(torch.clamp(self.beta_growth_cooldown - 1, min=0))
 
@@ -1360,8 +1363,8 @@ if __name__ == "__main__":
         self.clip_momentum = ScalingSteward.get_decay(0.90, n_curr)
 
         logger.info(
-            f"⚡ [AWR] Dynamics Scaled: beta_mom={self.beta_momentum:.4f}, "
-            f"ess_ema={self.ess_ema_decay:.4f} | n_curr={n_curr}"
+            f"⚡ [AWR] Dynamics Scaled: beta_mom={self.beta_momentum.item():.4f}, "
+            f"ess_ema={self.ess_ema_decay.item():.4f} | n_curr={n_curr}"
         )
 
     # =========================================================================
@@ -1418,7 +1421,10 @@ if __name__ == "__main__":
     print(f"    Weight Range: [{weights.min():.4f}, {weights.max():.4f}]")
     print(f"\n    Diagnostics:")
     for k, v in diagnostics.items():
-        print(f"      {k}: {v:.4f}")
+        if isinstance(v, torch.Tensor):
+            print(f"      {k}: {v.item():.4f}")
+        else:
+            print(f"      {k}: {v:.4f}")
     
     print("\n" + "="*60)
     print("Smoke Test Complete!")

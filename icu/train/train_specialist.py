@@ -516,7 +516,7 @@ def main(cfg: DictConfig):
                 logger.info(f"[BEST MODEL] {trainer.checkpoint_callback.best_model_path}")
                 if trainer.checkpoint_callback.best_model_score is not None:
                     logger.info(
-                        f"[BEST SCORE] val/loss = {trainer.checkpoint_callback.best_model_score:.4f}"
+                        f"[BEST SCORE] val/loss = {trainer.checkpoint_callback.best_model_score.item():.4f}"
                     )
             logger.info("="*80)
 

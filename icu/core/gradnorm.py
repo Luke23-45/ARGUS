@@ -25,7 +25,7 @@ class GradNormBalancer(nn.Module):
         self.optimizer = None 
         # [PHASE 8] GradNorm Damping & Anchoring
         self.register_buffer("norm_emas", torch.zeros(num_tasks))
-        self.register_buffer("step_count", torch.tensor(0, dtype=torch.long))
+        self.register_buffer("step_count", torch.tensor([0], dtype=torch.long))
         self.ema_alpha = 0.90 # Damping factor for norm smoothing
 
     def get_weights(self):

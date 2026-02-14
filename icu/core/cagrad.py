@@ -101,7 +101,7 @@ class CAGrad(torch.optim.Optimizer):
         scaler = torch.where(
             f_norm > 1e-8,
             g_avg_norm / (f_norm + 1e-8), 
-            torch.tensor(1.0, device=f_norm.device, dtype=f_norm.dtype)
+            torch.tensor([1.0], device=f_norm.device, dtype=f_norm.dtype)
         )
         final_grad = final_grad * scaler
         final_grad = (1 - self.c) * final_grad + self.c * g_avg

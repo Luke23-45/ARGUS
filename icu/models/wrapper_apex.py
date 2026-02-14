@@ -310,6 +310,40 @@ class ICUSpecialistWrapper(pl.LightningModule):
         logger.info("Initialization Complete. Ready for Training.")
         logger.info("="*60)
 
+    def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True):
+        """
+        [SOTA v2026] Resilient State Loading (Specialist Edition).
+        
+        Features:
+        1.  Shape-Aware Bridge: Automatically reshapes scalar buffers ([]) from 
+            older checkpoints into the new 1D vector format ([1]).
+        2.  Relaxed Constraint: Uses strict=False for checkpoints to allow 
+            seamless addition of new stability buffers.
+        """
+        # 1. Detection of checkpoint loading vs manual state_dict application
+        is_checkpoint = any("model." in k for k in state_dict.keys()) or any("awr_calculator." in k for k in state_dict.keys())
+        
+        if is_checkpoint:
+            logger.info("🛡️ [PMS] Resilient Loading: Initializing restoration bridge for Specialist...")
+            
+            # 2. [v2026 SOTA] Scalar-to-Vector Normalization
+            new_state_dict = state_dict.copy()
+            for name, buffer in self.named_buffers():
+                if name in new_state_dict:
+                    checkpoint_tensor = new_state_dict[name]
+                    # Case 1: scalar ([]) in checkpoint, vector ([1]) in model
+                    if checkpoint_tensor.dim() == 0 and buffer.dim() == 1 and buffer.shape[0] == 1:
+                        new_state_dict[name] = checkpoint_tensor.view(1)
+                        logger.debug(f"  [Reshape] {name}: [] -> [1]")
+                    
+                    # Case 2: int/long cast
+                    if checkpoint_tensor.dtype != buffer.dtype:
+                        new_state_dict[name] = checkpoint_tensor.to(buffer.dtype)
+
+            return super().load_state_dict(new_state_dict, strict=False)
+            
+        return super().load_state_dict(state_dict, strict=strict)
+
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Inference Forward (Soft-Gated Sampling with PGS)."""
         return self.model.sample(batch, use_physics_guidance=True)
@@ -674,8 +708,8 @@ class ICUSpecialistWrapper(pl.LightningModule):
                 
                 logger.info(
                     f"[AWR SYNC] Statistics computed on {valid_samples} samples:\n"
-                    f"  Mean Advantage: {stats[0]:.4f}\n"
-                    f"  Std Advantage: {stats[1]:.4f}\n"
+                    f"  Mean Advantage: {stats[0].item():.4f}\n"
+                    f"  Std Advantage: {stats[1].item():.4f}\n"
                     f"  Skipped: {skipped_samples} samples"
                 )
             else:
@@ -689,7 +723,7 @@ class ICUSpecialistWrapper(pl.LightningModule):
         # Broadcast to all ranks
         if torch.distributed.is_initialized():
             torch.distributed.broadcast(stats, src=0)
-            logger.info(f"[Rank {self.global_rank}] Received AWR stats: mu={stats[0]:.4f}, sigma={stats[1]:.4f}")
+            logger.info(f"[Rank {self.global_rank}] Received AWR stats: mu={stats[0].item():.4f}, sigma={stats[1].item():.4f}")
         
         # Apply to calculator with safety clamp
         sigma = stats[1].item()

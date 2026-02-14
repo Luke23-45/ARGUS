@@ -92,7 +92,7 @@ class SepsisGhostBank(nn.Module):
             sync_buffer = torch.cat([local_sum.flatten(), local_count])
             torch.distributed.all_reduce(sync_buffer, op=torch.distributed.ReduceOp.SUM)
             global_sum = sync_buffer[:-1].view(1, -1)
-            global_count = sync_buffer[-1] # [1] 0D Tensor
+            global_count = sync_buffer[-1:] # [1] 1D Tensor for DDP consensus
             
             # Vectorized gate
             valid_gate = (global_count > 1e-6)

@@ -39,7 +39,7 @@ class VolatilityGate(nn.Module):
         # Energy Projection now sees Position-Enhanced features
         # [v167.1 SOTA FIX] Set bias=False as it is redundant with downstream Softmax (Translation Invariance)
         self.energy_proj = nn.Linear(d_model, 1, bias=False)
-        self.volatility_scale = nn.Parameter(torch.tensor(1.0))
+        self.volatility_scale = nn.Parameter(torch.tensor([1.0]))
         self.pos_encoder = SinusoidalPositionalEncoding(d_model)
         # [v166.0 SOTA FIX] Removed unused mixer. Logic uses x + pos.
         # self.mixer = nn.Linear(d_model * 2, d_model)  <-- DEAD PARAM REMOVED
