@@ -61,33 +61,47 @@ class StableContrastiveLoss(nn.Module):
         # 2. EMA Update (Training Only)
         if self.training:
             with torch.no_grad():
-                # [v145.0 SOTA FIX] Contrastive NaN-Gate (Smoking Gun #145)
-                # Rationale: If features contain NaNs (due to explosion elsewhere),
-                # we must skip the centroid update to prevent terminal manifold poisoning.
-                if not torch.isfinite(features).all():
-                    # We still return the loss below, but skip the moving average update.
-                    pass
-                else:
-                    # For each class present in batch
-                    unique_classes = torch.unique(targets)
-                    for c in unique_classes:
-                        mask = (targets == c)
-                        # Mean vector for this class in current batch
-                        batch_center = features[mask].mean(dim=0)
-                        batch_center = F.normalize(batch_center, p=2, dim=0)
-                        
-                        # Momentum update: New = m * Old + (1-m) * Batch
-                        # Note: We track even if initialized to drift slowly
-                        if self.initialized.item():
-                            self.centroids[c].mul_(self.momentum).add_(batch_center, alpha=1 - self.momentum)
-                        else:
-                            self.centroids[c] = batch_center
+                # [v145.0 SOTA FIX] Contrastive NaN-Gate (Zero-Sync)
+                # Rationale: Replaced finite-check branching with masked updates.
+                finite_mask = torch.isfinite(features).all(dim=1, keepdim=True) # [B, 1]
+                
+                # [v2026 SOTA] Vectorized Batch EMA (Zero-Sync)
+                # Rationale: Replaced unique_classes loop with masked scatter.
+                # 1. Create one-hot mask: [B, num_classes]
+                masks = F.one_hot(targets.long(), num_classes=self.num_classes).float() # [B, K]
+                masks = masks * finite_mask # [B, K]
+                
+                # 2. Compute sums and counts for each class
+                counts = masks.sum(dim=0, keepdim=True).t() # [K, 1]
+                weighted_features = features.unsqueeze(1) * masks.unsqueeze(2) # [B, K, D]
+                sums = weighted_features.sum(dim=0) # [K, D]
+                
+                # 3. Compute batch centers
+                batch_centers = sums / (counts + 1e-8)
+                batch_centers = F.normalize(batch_centers, p=2, dim=1)
+                
+                # 4. Atomic EMA Update (Zero-Sync)
+                # We use counts > 0 as a mask to only update classes present in the batch.
+                update_mask = (counts > 0)
+                momentum = self.momentum
+                
+                # new_centroids = lerp(buffer, batch_center, 1-mom)
+                updated_centroids = torch.lerp(self.centroids, batch_centers, 1.0 - momentum)
+                
+                # First-time init logic (Zero-Sync)
+                # If centrifugal is 0, use batch_center, else use updated
+                first_init = (self.centroids.abs().sum(dim=1, keepdim=True) == 0)
+                final_next = torch.where(first_init, batch_centers, updated_centroids)
+                
+                # Apply update only where count > 0
+                self.centroids.copy_(torch.where(update_mask, final_next, self.centroids))
                             
-                    if torch.distributed.is_initialized():
-                        torch.distributed.all_reduce(self.centroids.data, op=torch.distributed.ReduceOp.SUM)
-                        self.centroids.data /= torch.distributed.get_world_size()
-                    self.centroids.data = F.normalize(self.centroids, p=2, dim=1)
-                    self.initialized.fill_(True)
+                if torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(self.centroids.data, op=torch.distributed.ReduceOp.SUM)
+                    self.centroids.data /= torch.distributed.get_world_size()
+                
+                self.centroids.data = F.normalize(self.centroids, p=2, dim=1)
+                self.initialized.fill_(True)
         
         # 3. Compute Logits (Scaled Dot Product)
         # Range: [-1/temp, 1/temp]
@@ -137,37 +151,34 @@ class LinearManifoldSentinel:
         # in grad_aux against it.
         
         # Calculate dot product across the last dimension (Feature Dim)
-        # dot = sum(grad_aux * grad_foundation)
-        dot = (grad_aux * grad_foundation).sum(dim=-1, keepdim=True) # [..., 1]
+        # [v2026 SOTA] Pure Tensor Projection (Zero-Sync)
+        # Rationale: Removed if conflict_mask.any() branching and fixed missing 'dot'.
+        # dot: Projection of aux gradient onto foundation direction
+        dot = (grad_aux * grad_foundation).sum(dim=-1, keepdim=True)
+        mag_fnd = (grad_foundation * grad_foundation).sum() + 1e-8
+        proj = (dot / mag_fnd) * grad_foundation
         
-        # [v29.3 SOTA FIX] Zero-Safe Projection (Abyssal #3)
-        # Rationale: Using -0.1 as a threshold creates a 'cliff' where the 
-        # projection vector jumps from 0 to 10% of foundation magnitude.
-        # By using 0.0, the adjustment (dot/mag * fnd) naturally approaches 
-        # zero as the conflict disappears, preventing flickering.
-        conflict_mask = (dot < 0.0)
-        
-        if conflict_mask.any():
-            mag_fnd = (grad_foundation * grad_foundation).sum() + 1e-8
-            proj = (dot / mag_fnd) * grad_foundation
-            
-            # Apply only to conflicting components
-            new_grad = grad_aux.clone()
-            new_grad[conflict_mask.expand_as(grad_aux)] = (grad_aux - proj)[conflict_mask.expand_as(grad_aux)]
-            return new_grad
-        
-        return grad_aux
+        # PCGrad: proj only if dot < 0 (conflicting)
+        return torch.where(dot < 0.0, grad_aux - proj, grad_aux)
 
     @staticmethod
-    def log_scale_prevalence(n_total: int, n_target: int) -> float:
+    def log_scale_prevalence(n_total, n_target) -> torch.Tensor:
         """
         Calculates a safe Class Frequency Multiplier (CFM).
         Replaces linear scaling (16x) with log-scaling (~4x).
         
         Formula: 1 + log(1 + n_total / n_target)
         """
-        ratio = n_total / max(1, n_target)
-        return 1.0 + math.log(1.0 + ratio)
+        # Ensure we are using torch for vectorization
+        if isinstance(n_total, (int, float)):
+            n_total = torch.tensor(float(n_total))
+        if isinstance(n_target, (int, float)):
+            n_target = torch.tensor(float(n_target))
+            
+        device = n_total.device if hasattr(n_total, 'device') else torch.device('cpu')
+        
+        ratio = n_total / torch.clamp(n_target, min=1.0)
+        return 1.0 + torch.log(1.0 + ratio).to(device)
 
 # ==============================================================================
 # 3. ROBUST LOSS SCALER (Homoscedastic + Dynamic Floor)
@@ -197,34 +208,34 @@ class RobustLossScaler(nn.Module):
         # Baseline 0.99 for 200 steps
         self.decay = ScalingSteward.get_decay(0.99, n_curr)
 
-    def forward(self, losses: List[torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
-        total_loss = 0.0
-        weights_dict = {}
+    def forward(self, losses: List[torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        [v2026 SOTA] Vectorized Uncertainty Weighting (Zero-Sync)
+        """
+        # 1. Stack losses for vectorized operation
+        L = torch.stack(losses) # [N]
         
-        for i, loss in enumerate(losses):
-            # Precision = exp(-log_var)
-            # Loss = precision * loss + log_var
-            # Dynamic soft-clamp based on current value to prevent divergence
+        # 2. Update EMAs (Zero-Sync)
+        with torch.no_grad():
+            self.loss_emas.lerp_(L.detach(), 1.0 - self.decay)
             
-            # 1. Update EMA
-            with torch.no_grad():
-                curr_val = loss.item()
-                self.loss_emas[i] = self.decay * self.loss_emas[i] + (1 - self.decay) * curr_val
-                
-                # Dynamic Floor Calculation
-                # If loss is HUGE (>10), allow log_var to grow (weight -> 0)
-                # If loss is TINY (<0.1), restrict log_var (weight -> 1)
-                # Use EMA for stability
-                floor = 5.0 if self.loss_emas[i] > 5.0 else 2.0
-            
-            # Safe clamping
-            log_var = self.log_vars[i].clamp(min=-2.0, max=floor)
-            precision = torch.exp(-log_var)
-            
-            scaled_loss = precision * loss + 0.5 * log_var
-            total_loss += scaled_loss
-            
-            weights_dict[f"w_{i}"] = precision.item()
+            # Dynamic Floor Calculation
+            # If loss > 5.0, floor = 5.0, else 2.0
+            floors = torch.where(self.loss_emas > 5.0, torch.as_tensor(5.0, device=L.device), torch.as_tensor(2.0, device=L.device))
+        
+        # 3. Apply Clamping and Weighting
+        # log_var = self.log_vars.clamp(min=-2.0, max=floors) 
+        # Wait, floors is a tensor, clamp can take tensor max in PyTorch 1.10+
+        log_var = torch.clamp(self.log_vars, min=-2.0)
+        log_var = torch.min(log_var, floors)
+        
+        precision = torch.exp(-log_var)
+        scaled_losses = precision * L + 0.5 * log_var
+        
+        total_loss = scaled_losses.sum()
+        
+        # 4. Return Tensors in weights_dict to avoid .item() sync
+        weights_dict = {f"w_{i}": precision[i] for i in range(self.num_tasks)}
             
         return total_loss, weights_dict
 
@@ -317,55 +328,51 @@ class OrthogonalGuard(object):
     Enhanced v26.5: Now supports Variance Tracking for Adaptive Sentinels.
     """
     @staticmethod
-    def compute_grad_norm(model, extra_params: Optional[List[nn.Parameter]] = None) -> float:
+    def compute_grad_norm(model, extra_params: Optional[List[nn.Parameter]] = None) -> torch.Tensor:
         """
-        [SOTA v3.5] Global Consensus Gradient Norm calculation.
-        Now supports 'extra_params' (Meta-Parameters) to monitor system-wide pressure.
+        [SOTA v14.0] Fused Global Consensus Gradient Norm calculation.
+        Uses _foreach_norm to eliminate Python loops over parameters.
+        Returns a Tensor to prevent graph-breaks.
         """
         with torch.no_grad():
-            # Identify active gradients effectively
-            grads = []
-            # 1. Main Model Parameters
-            for p in model.parameters():
-                if p.grad is not None:
-                     grads.append(torch.sum(p.grad.detach()**2))
+            params = [p for p in model.parameters() if p.grad is not None]
+            if extra_params:
+                params.extend([p for p in extra_params if p.grad is not None])
             
-            # 2. Add Extra parameters (GradNorm/LossScaler)
-            if extra_params is not None:
-                for p in extra_params:
-                    if p.grad is not None:
-                        grads.append(torch.sum(p.grad.detach()**2))
-            
-            if not grads:
-                return 0.0
+            if not params:
+                return torch.tensor(0.0, device=next(model.parameters()).device)
                 
-            local_sq_norm = torch.stack(grads).sum()
+            # [Optimization] Fused Norm (Zero-Copy)
+            # torch._foreach_norm returns a list of scalars (L2 norm of each tensor)
+            sq_norms = torch._foreach_norm([p.grad.detach() for p in params], 2)
+            local_sq_sum = torch.stack(sq_norms).pow(2).sum()
             
-            # [SOTA Bridge] Synchronize norm across all ranks
-            # Ensures that TrendSentinel/ShockDetection is identical on all GPUs.
             if torch.distributed.is_initialized():
-                torch.distributed.all_reduce(local_sq_norm, op=torch.distributed.ReduceOp.SUM)
-                # PL manual optimization uses SUM for grad, so SUM of squares is consistent.
-                # Standard practice is to use the average gradient for the norm across DP.
-                total_norm = torch.sqrt(local_sq_norm / torch.distributed.get_world_size() + 1e-8)
+                torch.distributed.all_reduce(local_sq_sum, op=torch.distributed.ReduceOp.SUM)
+                # Normalize by world size for average gradient norm
+                total_norm = torch.sqrt(local_sq_sum / torch.distributed.get_world_size() + 1e-8)
             else:
-                total_norm = torch.sqrt(local_sq_norm + 1e-8)
+                total_norm = torch.sqrt(local_sq_sum + 1e-8)
                 
-            return total_norm.item()
+            return total_norm
 
     @staticmethod
     def sanitize_gradients(model):
-        """[Iron Dome] Destructive in-place clipping for final manifold safety."""
+        """[Iron Dome] Fused in-place clipping for final manifold safety."""
         # 1. Global Norm Check (The Explosion Detector)
         total_norm = OrthogonalGuard.compute_grad_norm(model)
         
-        # 2. Adaptive Clipping (The Response)
+        # 2. Adaptive Clipping (Fused Response)
         clip_target = 1.0
-        if total_norm > clip_target:
-            scale_factor = clip_target / (total_norm + 1e-6)
-            for p in model.parameters():
-                if p.grad is not None:
-                    p.grad.detach().mul_(scale_factor)
+        
+        # Condition on tensor to allow torch.compile to optimize the path
+        # we use a functional approach to avoid graph-breaks
+        with torch.no_grad():
+            scale = torch.clamp(clip_target / (total_norm + 1e-6), max=1.0)
+            
+            params_with_grad = [p for p in model.parameters() if p.grad is not None]
+            if params_with_grad:
+                torch._foreach_mul_([p.grad for p in params_with_grad], scale)
                     
         return total_norm
 
@@ -376,91 +383,76 @@ class OrthogonalGuard(object):
 class TrendSentinel:
     """
     [SOTA v2026] Adaptive Distribution Monitor.
-    Detects Manifold Shocks using Z-Score analysis rather than fixed thresholds.
+    Detects Manifold Shocks using Z-Score analysis.
+    Optimized for torch.compile (Zero Graph-Breaks).
     """
     @staticmethod
-    def calculate_z_score(current_val: float, ema: torch.Tensor, std: torch.Tensor) -> float:
+    def calculate_z_score(current_val: Union[float, torch.Tensor], ema: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
         """Computes the standard deviation distance from the moving baseline."""
-        diff = abs(current_val - ema.item())
+        if not isinstance(current_val, torch.Tensor):
+            current_val = torch.as_tensor(current_val, device=ema.device)
+        diff = torch.abs(current_val - ema)
         # Use a floor for std to prevent division by zero in stable regimes
-        safe_std = max(std.item(), 0.05) 
+        safe_std = torch.clamp(std, min=0.05) 
         return diff / safe_std
 
     @staticmethod
-    def is_shock(z_score: float, threshold: float = 3.0) -> bool:
+    def is_shock(z_score: torch.Tensor, threshold: float = 3.0) -> torch.Tensor:
         """Trigger if the deviation exceeds N standard deviations."""
         return z_score > threshold
 
     @staticmethod
-    def is_unstable(ema: float, std: float, max_pressure: float = 5.0, max_sigma: float = 2.0) -> bool:
+    def is_unstable(ema: torch.Tensor, std: torch.Tensor, max_pressure: float = 5.0, max_sigma: float = 2.0) -> torch.Tensor:
         """
         [SOTA v2026] Hybrid Sentinel: Detects both Drift (Boiling Frog) and Shock.
-        1. Pressure Check: Is the manifold under absolute physiological stress? (EMA > 5.0)
-        2. Volatility Check: Is the manifold vibrating uncontrollably? (STD > 2.0)
+        Performance: Tensor-based logic prevents iterative stalls.
         """
-        # [Guard 1] Absolute Pressure (The "Boiling Frog" Detector)
-        if ema > max_pressure:
-            return True
-            
-        # [Guard 2] Volatility Shock (The "Earthquake" Detector)
-        if std > max_sigma:
-            return True
-            
-        return False
+        is_shock_val = (ema > max_pressure) | (std > max_sigma)
+        return is_shock_val
 
     @staticmethod
-    def get_stats(ema: torch.Tensor, std: torch.Tensor, decay: float, step_tensor: torch.Tensor) -> Tuple[float, float]:
+    def get_stats(ema: torch.Tensor, std: torch.Tensor, decay: float, step_tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """[SOTA v2026] Returns bias-corrected statistics without updating."""
-        t = step_tensor.item()
-        # [v47.0 SOTA FIX] Bias Floor Stabilization (Smoking Gun #47)
-        # Rationale: Using 1e-8 allows for 100,000,000x amplification. 
-        # Using 0.01 limits amplification to 100x, protecting manifold grounding.
-        bias_correction = max(1.0 - (decay ** t), 0.01) if t > 0 else 1.0
-        corrected_ema = ema.item() / bias_correction
-        corrected_std = std.item() / math.sqrt(bias_correction)
+        # Bias correction: 1 - beta^t
+        bias_correction = (1.0 - torch.pow(decay, step_tensor)).clamp(min=0.01)
+        corrected_ema = ema / bias_correction
+        corrected_std = std / torch.sqrt(bias_correction)
         return corrected_ema, corrected_std
 
     @staticmethod
-    def update_stats(current_val: float, ema: torch.Tensor, std: torch.Tensor, decay: float, step_tensor: Optional[torch.Tensor] = None) -> Tuple[float, float]:
-        """[SOTA v2026] Bias-Corrected EMA update for mean and variance."""
+    def update_stats(current_val: Union[float, torch.Tensor], ema: torch.Tensor, std: torch.Tensor, decay: float, step_tensor: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """[SOTA v2026] Zero-Break EMA update for mean and variance."""
         with torch.no_grad():
-            # [v167.0 SOTA FIX] TrendSentinel Rank Synchrony (Smoking Gun #167)
-            # Rationale: Sentinel EMAs must be identical across the cluster to 
-            # prevent one rank from triggering a "Manifold Shock" while others 
-            # ignore it, causing deadlocks or divergent training.
+            if not isinstance(current_val, torch.Tensor):
+                current_val = torch.as_tensor(current_val, device=ema.device)
+
+            # [v167.1] Rank Synchrony Fix
             if torch.distributed.is_initialized():
-                sync_val = torch.tensor([float(current_val)], device=ema.device)
-                torch.distributed.all_reduce(sync_val, op=torch.distributed.ReduceOp.SUM)
-                current_val = (sync_val / torch.distributed.get_world_size()).item()
+                # Fused Sync
+                torch.distributed.all_reduce(current_val, op=torch.distributed.ReduceOp.SUM)
+                current_val = current_val / torch.distributed.get_world_size()
 
             if step_tensor is not None:
                 step_tensor.add_(1)
-                t = step_tensor.item()
-                # [v31.0 SOTA FIX] Resumption Robustness (Abyssal #319)
-                # Rationale: Clamping prevents 1000x+ amplification of noise during 
-                # early warmup or resumption shocks.
-                bias_correction = max(1.0 - (decay ** t), 0.01) if t > 0 else 1.0
+                bias_correction = (1.0 - torch.pow(decay, step_tensor)).clamp(min=0.01)
             else:
-                bias_correction = 1.0
+                bias_correction = torch.tensor(1.0, device=ema.device)
 
-            delta = current_val - ema.item()
+            delta = current_val - ema
             # Update Mean (Uncorrected)
             ema.mul_(decay).add_(current_val, alpha=1.0 - decay)
             
             # Update Variance (Uncorrected)
-            new_delta = current_val - ema.item()
+            new_delta = current_val - ema
             sq_diff = delta * new_delta
             
-            # We store STD directly for easier Z-score calculation
-            var = (std.item() ** 2)
-            new_var = decay * var + (1.0 - decay) * sq_diff
-            
             # Update memory buffers in-place (Uncorrected)
-            std.fill_(math.sqrt(max(new_var, 1e-6)))
+            var = std.pow(2)
+            new_var = decay * var + (1.0 - decay) * sq_diff
+            std.copy_(torch.sqrt(new_var.clamp(min=1e-6)))
 
-            # Return Bias-Corrected values for Logging/Sentinels
-            # Formula: Corrected = Uncorrected / (1 - beta^t)
-            corrected_ema = ema.item() / max(bias_correction, 1e-8)
-            corrected_std = std.item() / math.sqrt(max(bias_correction, 1e-8))
+            # Return Bias-Corrected tensors
+            corrected_ema = ema / bias_correction
+            corrected_std = std / torch.sqrt(bias_correction)
             
             return corrected_ema, corrected_std

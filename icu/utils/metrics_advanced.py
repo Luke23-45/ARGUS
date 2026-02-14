@@ -31,104 +31,121 @@ def compute_ece(
     labels: torch.Tensor, 
     n_bins: int = 10,
     adaptive: bool = True
-) -> float:
-    """Computes Expected Calibration Error (ECE/ACE)."""
-    # [PATCH] 1. Shape Safety: Flatten all inputs to prevent [N] vs [N,1] broadcasting
+) -> torch.Tensor:
+    """
+    Computes Expected Calibration Error (ECE/ACE) Vectorized.
+    Returns a Tensor (Zero-Sync).
+    """
+    # 1. Shape Safety
     if probs.dim() > 1 and probs.shape[1] == 1:
         probs = probs.view(-1)
-    labels = labels.view(-1) # CRITICAL FIX for silent broadcasting bug
+    labels = labels.view(-1)
         
     if probs.dim() > 1 and probs.shape[1] > 1:
-        # Multiclass
         confidences, predictions = torch.max(probs, dim=1)
         accuracies = predictions.eq(labels).float()
     else:
-        # Binary
         confidences = probs
         accuracies = labels.float()
 
-    ece = 0.0
     total_samples = confidences.size(0)
+    if total_samples == 0:
+        return torch.tensor(0.0, device=probs.device)
+
+    # 2. Sort for Adaptive / Binning
+    # We always sort for adaptive, and it helps for fixed too strictly speaking
+    # but for fixed bins we can use bucketize.
     
     if adaptive:
-        # ACE: Quantile-based binning
+        # ACE (Adaptive Calibration Error)
         sorted_conf, sorted_idx = torch.sort(confidences)
         sorted_acc = accuracies[sorted_idx]
         
-        # [PATCH] 2. Robust Indexing: Use linspace to handle N < n_bins cases
+        # Split into n_bins equal chunks
+        # We can use tensor_split or reshape if divisible
+        # Robust approach: use linspace indices
         indices = torch.linspace(0, total_samples, n_bins + 1, device=probs.device).long()
         
+        ece = torch.tensor(0.0, device=probs.device)
+        
+        # [optimization] We can still loop here as n_bins is small (10), 
+        # BUT we must avoid .item(). We accumulate Tensors.
         for i in range(n_bins):
             start = indices[i]
             end = indices[i+1]
             
-            if start >= end: continue # Skip empty bins (small batches)
+            if start >= end: continue
             
+            # Slicing is tensor-native
             bin_conf = sorted_conf[start:end]
             bin_acc = sorted_acc[start:end]
             
-            avg_conf = bin_conf.mean().item()
-            avg_acc = bin_acc.mean().item()
+            # Tensor operations
+            avg_conf = bin_conf.mean()
+            avg_acc = bin_acc.mean()
             
             weight = (end - start).float() / total_samples
-            ece += weight * np.abs(avg_conf - avg_acc)
+            ece += weight * torch.abs(avg_conf - avg_acc)
+            
     else:
-        # Standard ECE
+        # Standard ECE (Fixed width)
+        # Use bucketize for vectorization
         bin_boundaries = torch.linspace(0, 1, n_bins + 1, device=probs.device)
-        for i in range(n_bins):
-            bin_lower = bin_boundaries[i]
-            bin_upper = bin_boundaries[i + 1]
-            
-            # [PATCH] 3. Zero-Inclusion: Handle p=0.0 in first bin
-            if i == 0:
-                in_bin = (confidences >= bin_lower) & (confidences <= bin_upper)
-            else:
-                in_bin = (confidences > bin_lower) & (confidences <= bin_upper)
-            
-            prop_in_bin = in_bin.float().mean().item()
-            
-            if prop_in_bin > 0:
-                accuracy_in_bin = accuracies[in_bin].mean().item()
-                avg_confidence_in_bin = confidences[in_bin].mean().item()
-                ece += np.abs(avg_confidence_in_bin - accuracy_in_bin) * prop_in_bin
-            
+        
+        # Assign each sample to a bin
+        bin_indices = torch.bucketize(confidences, bin_boundaries)
+        # bucketize returns 1..N+1. We want 0..N-1. 
+        # Boundaries are 11 points for 10 bins.
+        # indices will be 1 to 10 typically.
+        # We clamp to be safe.
+        bin_indices = (bin_indices - 1).clamp(0, n_bins - 1)
+        
+        # Scatter add to get sums
+        bin_counts = torch.zeros(n_bins, device=probs.device)
+        bin_conf_sum = torch.zeros(n_bins, device=probs.device)
+        bin_acc_sum = torch.zeros(n_bins, device=probs.device)
+        
+        bin_counts.scatter_add_(0, bin_indices, torch.ones_like(confidences))
+        bin_conf_sum.scatter_add_(0, bin_indices, confidences)
+        bin_acc_sum.scatter_add_(0, bin_indices, accuracies)
+        
+        # Mask empty bins
+        mask = bin_counts > 0
+        avg_conf = torch.zeros_like(bin_conf_sum)
+        avg_acc = torch.zeros_like(bin_acc_sum)
+        
+        avg_conf[mask] = bin_conf_sum[mask] / bin_counts[mask]
+        avg_acc[mask] = bin_acc_sum[mask] / bin_counts[mask]
+        
+        # Weighted mean absolute difference
+        diffs = torch.abs(avg_conf - avg_acc)
+        weighted_diffs = (bin_counts / total_samples) * diffs
+        ece = weighted_diffs.sum()
+
     return ece
 
 
-def compute_brier_score(probs: torch.Tensor, labels: torch.Tensor) -> float:
-    """
-    Computes the Brier Score with Shape Safety.
-    [PATCH] Enforces strict mathematical definition (1/N * Sum(Error^2)) 
-    invariant to class count.
-    """
-    # [PATCH] Flatten labels to ensure [N] shape
+def compute_brier_score(probs: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Computes Brier Score (Tensor Return)."""
     labels = labels.view(-1)
 
     if probs.dim() > 1 and probs.shape[1] > 1:
-        # Multiclass: [N, C]
         target_one_hot = F.one_hot(labels.long(), num_classes=probs.shape[1]).float()
-        
-        # [PATCH] Use 'sum' reduction to calculate total squared error per sample,
-        # then mean over the batch. This prevents 1/C scaling.
-        # Brier = 1/N * Sum_nc (p_nc - y_nc)^2
-        squared_error = (probs - target_one_hot).pow(2).sum(dim=1) # [N]
+        squared_error = (probs - target_one_hot).pow(2).sum(dim=1)
         brier = squared_error.mean()
     else:
-        # Binary: [N]
-        # Brier = 1/N * Sum (p - y)^2
         probs_flat = probs.view(-1).float()
         labels_flat = labels.float()
         brier = F.mse_loss(probs_flat, labels_flat, reduction='mean')
         
-    return brier.item()
+    return brier
 
 def compute_overconfidence_error(
     probs: torch.Tensor, 
     labels: torch.Tensor, 
     n_bins: int = 10
-) -> float:
-    """Computes Overconfidence Error (OE) with Shape Safety."""
-    # [PATCH] Flatten inputs
+) -> torch.Tensor:
+    """Computes Overconfidence Error (OE) Vectorized."""
     if probs.dim() > 1 and probs.shape[1] == 1:
         probs = probs.view(-1)
     labels = labels.view(-1)
@@ -140,25 +157,35 @@ def compute_overconfidence_error(
         confidences = probs
         accuracies = labels.float()
 
+    total_samples = confidences.size(0)
+    if total_samples == 0: 
+        return torch.tensor(0.0, device=probs.device)
+
     bin_boundaries = torch.linspace(0, 1, n_bins + 1, device=probs.device)
-    oe = 0.0
+    bin_indices = torch.bucketize(confidences, bin_boundaries)
+    bin_indices = (bin_indices - 1).clamp(0, n_bins - 1)
     
-    for i in range(n_bins):
-        bin_lower = bin_boundaries[i]
-        bin_upper = bin_boundaries[i + 1]
+    bin_counts = torch.zeros(n_bins, device=probs.device)
+    bin_conf_sum = torch.zeros(n_bins, device=probs.device)
+    bin_acc_sum = torch.zeros(n_bins, device=probs.device)
+    
+    bin_counts.scatter_add_(0, bin_indices, torch.ones_like(confidences))
+    bin_conf_sum.scatter_add_(0, bin_indices, confidences)
+    bin_acc_sum.scatter_add_(0, bin_indices, accuracies)
+    
+    mask = bin_counts > 0
+    oe = torch.tensor(0.0, device=probs.device)
+    
+    # Vectorized accumulation
+    # prop * conf * max(0, conf - acc)
+    
+    if mask.any():
+        avg_conf = bin_conf_sum[mask] / bin_counts[mask]
+        avg_acc = bin_acc_sum[mask] / bin_counts[mask]
+        prop = bin_counts[mask] / total_samples
         
-        # [PATCH] Zero-Inclusion
-        if i == 0:
-            in_bin = (confidences >= bin_lower) & (confidences <= bin_upper)
-        else:
-            in_bin = (confidences > bin_lower) & (confidences <= bin_upper)
-            
-        prop_in_bin = in_bin.float().mean().item()
-        
-        if prop_in_bin > 0:
-            acc_b = accuracies[in_bin].mean().item()
-            conf_b = confidences[in_bin].mean().item()
-            oe += prop_in_bin * conf_b * max(0.0, conf_b - acc_b)
+        penalty = torch.clamp(avg_conf - avg_acc, min=0.0)
+        oe = (prop * avg_conf * penalty).sum()
             
     return oe
 

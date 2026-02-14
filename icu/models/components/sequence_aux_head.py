@@ -12,10 +12,10 @@ class AsymmetricLoss(nn.Module):
     
     [v13.0 PATCH] Tuned gamma values based on data analysis:
     - Data shows 98.24% normal, 1.76% sepsis at timestep level
-    - gamma_neg=6: Aggressively down-weight easy negatives (was 4)
+    - gamma_neg=2: Moderate down-weighting (was 6, which caused gradient starvation)
     - gamma_pos=0: Don't down-weight any positives - they're precious (was 1)
     """
-    def __init__(self, gamma_neg=6, gamma_pos=0, clip=0.05, eps=1e-8, disable_torch_grad_focal_loss=True):
+    def __init__(self, gamma_neg=2, gamma_pos=0, clip=0.05, eps=1e-8, disable_torch_grad_focal_loss=True):
         super().__init__()
         self.gamma_neg = gamma_neg
         self.gamma_pos = gamma_pos

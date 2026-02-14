@@ -89,8 +89,21 @@ class CAGrad(torch.optim.Optimizer):
             alpha = torch.ones(len(losses), device=GG.device, dtype=g.dtype) / len(losses)
 
         final_grad = (alpha @ g)
-        if torch.norm(final_grad) > 1e-8:
-            final_grad = final_grad * torch.norm(g_avg) / torch.norm(final_grad)
+        
+        # [v2026 SOTA FIX] Branchless Renormalization (Zero-Sync)
+        # Rationale: "if torch.norm(final_grad) > 1e-8" triggers a CPU sync every step.
+        f_norm = torch.norm(final_grad)
+        g_avg_norm = torch.norm(g_avg)
+        
+        # If f_norm > 1e-8, we scale by (g_avg_norm / f_norm). 
+        # Otherwise, we default to 1.0 (no scaling).
+        # We add 1e-8 divisor for safety even in the True case.
+        scaler = torch.where(
+            f_norm > 1e-8,
+            g_avg_norm / (f_norm + 1e-8), 
+            torch.tensor(1.0, device=f_norm.device, dtype=f_norm.dtype)
+        )
+        final_grad = final_grad * scaler
         final_grad = (1 - self.c) * final_grad + self.c * g_avg
 
         # 4. Apply and Restore

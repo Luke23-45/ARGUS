@@ -93,7 +93,7 @@ class DistributionalValueHead(nn.Module):
         num_alpha = max(1, int(alpha * self.num_quantiles))
         return quantiles[:, :, :num_alpha].mean(dim=-1)
 
-    def get_expectile_summary(self, quantiles: torch.Tensor, tau: float = 0.5) -> torch.Tensor:
+    def get_expectile_summary(self, quantiles: torch.Tensor, tau: Union[float, torch.Tensor] = 0.5) -> torch.Tensor:
         """
         Extracts the tau-expectile summary for scalar RL bootstrapping.
         If tau=0.5, returns the mean (risk-neutral).
@@ -102,20 +102,28 @@ class DistributionalValueHead(nn.Module):
         Note: In medical RL, pessimism means fearing the worst-case (lower quantiles).
         This forces the policy to avoid actions that could lead to catastrophic states.
         """
-        if tau == 0.5:
-            return quantiles.mean(dim=-1)
-            
-        # [v2026 Phase 12 FIX] Medical Consensus (Expectile Parity).
-        # Rationale: Standard tau=0.7 summary creates a 'Phantom Advantage' scissor 
-        # when trained with IQL 0.7-loss. We average the tau-weights and uniform 
-        # weights for a robust, consensus-driven medical estimate.
+        # [v2026 SOTA FIX] Vectorized Expectile Summary (Zero-Sync)
+        # Rationale: Replaced scalar branching (if tau == 0.5) with a unified weighted sum
+        # to prevent host-side stalls. The weights calculation naturally yields 
+        # uniform weights when tau=0.5.
+        
         N = self.num_quantiles
         taus_q = torch.linspace(1/(2*N), 1 - 1/(2*N), N, device=quantiles.device)
         
-        tau_w = torch.where(taus_q < 0.5, tau, 1 - tau)
+        # [Pessimistic Weighting]
+        # tau_w: Risk-adjusted weights. 
+        # if tau > 0.5, we emphasize lower (taus_q < 0.5) quantiles.
+        tau_w = torch.where(taus_q < 0.5, tau, 1.0 - tau)
         uni_w = torch.ones_like(taus_q)
+        
         # 50/50 Consensus (Pessimistic + Neutral)
-        weights = 0.5 * (tau_w / tau_w.sum()) + 0.5 * (uni_w / uni_w.sum())
+        # Rationale: Purely pessimistic estimates (Expectile IQL) can be too noisy 
+        # in sparse-reward clinical zones. Consensus adds a "stabilizing floor."
+        w_p = tau_w / tau_w.sum()
+        w_n = uni_w / uni_w.sum()
+        weights = 0.5 * w_p + 0.5 * w_n
+        
+        # Normalize to ensure sum=1.0 regardless of tau tensor value
         weights = weights / weights.sum()
         
         return (quantiles * weights.view(1, 1, -1)).sum(dim=-1)
@@ -183,13 +191,14 @@ class IQLQuantileLoss(nn.Module):
         return expectile_loss + qr_loss + crossing_penalty
 
     @staticmethod
-    def compute_explained_variance(pred_quantiles: torch.Tensor, target_returns: torch.Tensor) -> float:
+    def compute_explained_variance(pred_quantiles: torch.Tensor, target_returns: torch.Tensor) -> torch.Tensor:
         """
         Calculates EV using the mean of the distribution.
+        Returns a 0-dim tensor (Zero-Sync).
         """
         v_pred = pred_quantiles.mean(dim=-1).detach()
         y_true = target_returns.detach()
         
         var_y = torch.var(y_true) + 1e-8
         ev = 1.0 - torch.var(y_true - v_pred) / var_y
-        return ev.item()
+        return ev # [v2026 SOTA] Return tensor to avoid .item() sync

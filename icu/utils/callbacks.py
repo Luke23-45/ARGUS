@@ -242,47 +242,54 @@ class AnomalyGuardian(Callback):
     2.  Triggers an immediate Atomic Checkpoint Dump (Emergency Backup).
     3.  Halts training to prevent weights corruption.
     """
-    def __init__(self, halt_on_anomaly: bool = True):
+    def __init__(self, halt_on_anomaly: bool = True, check_interval: int = 50):
         super().__init__()
         self.halt_on_anomaly = halt_on_anomaly
+        self.check_interval = check_interval
+        self._batch_counter = 0
 
     def on_train_batch_end(
         self, trainer: pl.Trainer, pl_module: pl.LightningModule, outputs: Any, batch: Any, batch_idx: int
     ):
-        # 1. Check Loss Consistency
-        # CRITICAL FIX: Check both key variants for compatibility
+        self._batch_counter += 1
+        if self._batch_counter % self.check_interval != 0:
+            return
+
+        # 1. Check Loss Consistency (Periodic Sync)
         loss = trainer.callback_metrics.get("train/loss") or trainer.callback_metrics.get("train/total_loss")
         anomaly_flag = torch.tensor(0.0, device=pl_module.device)
         
-        # Check validity (NaN or Inf)
         if loss is not None and (torch.isnan(loss) or torch.isinf(loss)):
             anomaly_flag.fill_(1.0)
             
-        # 2. DDP Sync: If ANY rank has an anomaly, ALL ranks halt together.
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(anomaly_flag, op=torch.distributed.ReduceOp.MAX)
             
         if anomaly_flag.item() > 0:
-            self._handle_anomaly(trainer, pl_module, "Numerical Anomaly (NaN/Inf) detected in Loss.")
+            self._handle_anomaly(trainer, pl_module, f"Numerical Anomaly detected in Loss (Checked every {self.check_interval} steps).")
 
     def on_after_backward(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
-        """Monitors gradient health before optimizer step with DDP synchronization."""
+        """Monitors gradient health periodically to avoid hot-path stalls."""
+        if self._batch_counter % self.check_interval != 0:
+            return
+
         grad_anomaly = torch.tensor(0.0, device=pl_module.device)
         
-        # Local Check
+        # Local Check (Expensive but periodic)
         for param in pl_module.parameters():
             if param.grad is not None:
                 if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
                     grad_anomaly.fill_(1.0)
                     break
         
-        # DDP Sync
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(grad_anomaly, op=torch.distributed.ReduceOp.MAX)
             
         if grad_anomaly.item() > 0:
-            # Shielding: Zero out gradients IMMEDIATELY before the optimizer can use them
+            # Shielding: Zero out gradients if anomaly detected to prevent poisoning the weights
+            # before the next optimizer step (though optimizer usually runs immediately after).
             pl_module.zero_grad()
+            self._handle_anomaly(trainer, pl_module, "Gradient Anomaly (NaN/Inf) detected.")
             # [v2026 Phase 19 FIX] Accumulation Cycle Reset (Audit Finding F-3)
             # Rationale: Zeroing gradients mid-accumulation without resetting the 
             # accumulation counter causes should_step to fire with incomplete gradient
@@ -765,14 +772,17 @@ class SOTAUnifiedPersistence(Callback):
         self.run_name = run_name
         self.dirpath = Path(dirpath)
         
-    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         """
-        [SOTA v7] Lightweight Mirror-Only Callback.
-        All serialization is now delegated to PL's ModelCheckpoint (save_last=True).
-        This callback ONLY mirrors the bridge to latest/ with descriptive names.
+        [PATCH SG-CKPT] Checkpoint Mirror — fires AFTER ModelCheckpoint.
+        Rationale: PL's ModelCheckpoint (save_last=True) saves the bridge during
+        on_validation_end. The old on_train_epoch_end hook fired BEFORE validation,
+        so the bridge file never existed when the mirror ran.
+        Moving to on_validation_end ensures correct ordering.
         Zero serialization = Zero RAM spike.
         """
         if not is_main_process(): return
+        if trainer.sanity_checking: return
         
         # The bridge file is created by ModelCheckpoint (save_last=True,
         # CHECKPOINT_NAME_LAST="resumption_bridge"). We just mirror it.

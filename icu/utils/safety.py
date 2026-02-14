@@ -71,25 +71,35 @@ class OODGuardian:
     2.  Dynamics Violations (Impossible jumps).
     3.  Physiological Bounds (Hallucinations).
     """
-    def __init__(self, verbose: bool = True):
         self.verbose = verbose
         self.cfg = SafetyConfig()
         self._warned_normalized = False  # [FIX: v14.0] Flag for "warn once" pattern
+        self._cached_norm_state: Optional[bool] = None # [v2026 SOTA] Cache to prevent sync
 
 
     def _is_normalized(self, tensor: torch.Tensor) -> bool:
-        """[PATCHED] Robust heuristic to detect normalized data."""
+        """
+        [PATCHED] Robust heuristic to detect normalized data.
+        [v2026 SOTA] Caches result to avoid per-step synchronization.
+        """
+        # Return cached conviction if available
+        if self._cached_norm_state is not None:
+            return self._cached_norm_state
+
         # 1. Negative Check
         if tensor.shape[-1] > IDX_MAP:
              if (tensor[..., [IDX_HR, IDX_SBP, IDX_MAP]] < -0.05).any():
+                 self._cached_norm_state = True
                  return True
 
         # 2. SBP Heuristic (requires IDX_SBP to exist)
         if tensor.shape[-1] > IDX_SBP:
-            # [v14.1 PERFORMANCE FIX] Avoid .item() in hot path
-            # If ANY value is > 30, it's likely clinical.
-            return (tensor[..., IDX_SBP] < 30.0).all()
+            # Syncs ONCE (First Batch Only)
+            is_norm = (tensor[..., IDX_SBP] < 30.0).all().item()
+            self._cached_norm_state = is_norm
+            return is_norm
         
+        self._cached_norm_state = False
         return False   
 
 

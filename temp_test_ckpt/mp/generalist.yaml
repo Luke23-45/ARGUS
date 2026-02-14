@@ -1,0 +1,143 @@
+# conf/generalist.yaml
+# PHASE 1: Unified Generalist configuration.
+
+defaults:
+  - /dataset: default
+  - _self_
+
+# --- Experiment Metadata ---
+run_name: "gen_v1_${now:%Y-%m-%d_%H-%M-%S}"
+seed: 42
+compile_model: false
+save_checkpoints: true
+debug_save_epochs: []     # [DEBUG] List of epochs to save snapshots (e.g., [5, 10, 50])
+
+# --- Directory Paths ---
+output_dir: "outputs/phase1"           # Main output directory
+checkpoint_dir: "/content/icu/checkpoints/"  # [OK] Large files, infrequent writes
+log_dir: "/content/icu/logs/"         # [CRITICAL] Must be LOCAL for WandB (High freq IO)
+backup_dir: null                        # Remote/backup directory
+resume_from: "/content/drive/MyDrive/pda/icu/checkpoints/icu_model-epoch=05-val/clinical_auroc=0.805.ckpt" #"/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-29_16-52-27-latest-epoch=13.ckpt"
+# resume_from: "/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-25_12-31-59-latest-epoch=05.ckpt"     # Explicit checkpoint to resume from (optional)
+# "/content/drive/MyDrive/pda/models/checkpoints/icu_model-epoch=05-val/clinical_auroc=0.747.ckpt"          
+#"/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-16_16-21-21-latest-epoch=17.ckpt"
+# --- Model Architecture (ICUUnifiedPlanner) ---
+model:
+  input_dim: 28
+  static_dim: 6
+  history_len: 24
+  pred_len: 6
+  d_model: 768
+  n_heads: 12
+  n_layers: 8
+  encoder_layers: 4
+  ffn_dim_ratio: 4
+  dropout: 0.12   # 0.25     # [NERYVA-ALPHA] High generalization threshold from Trial 20
+  stochastic_depth_prob: 0.1  # [SOTA] Deep Stochasticity for training 8+ layers
+  use_rope: true
+  use_swiglu: true
+  use_flash_attn: true
+  gradient_checkpointing: false # [FIX] Conflict with torch.compile on T4/old drivers
+  timesteps: 100
+  beta_schedule: "cosine"
+  prediction_type: "epsilon"
+  use_ddim_sampling: true
+  use_auxiliary_head: true
+  num_phases: 6 # SOTA-Clinical: 2 sub-experts per natural phase (Stable, Pre-Shock, Shock)
+  use_teacher: false  # [SOTA] Enable Teacher-Student bootstrapping for stable value estimation
+
+
+# --- Training Hyperparameters ---
+train:
+  phase: "phase1"
+  epochs: 100
+  batch_size: 384           # [v20.6] Increased update frequency for classification signal
+  num_workers: 2
+  lr: 1.0e-4                  # [SOTA] Reduced from 1.5e-4 to prevent optimization divergence
+  min_lr: 1e-6
+  # [SOTA] Extended warmup to prevent "Shock" during initial manifold discovery
+  warmup_steps: 1500 # Increased from 500 (~1.2 epochs)
+  weight_decay: 1e-4
+  grad_clip: 1.0
+  grad_ema_decay: 0.99        # [SOTA] Smoother manifold monitoring for large epochs
+  
+  # [v2026] Telemetry
+  csv_log_interval_percent: 3.0 # Log every 5% of epoch to csv
+  balancer_beta: 0.9995       # [SOTA] Extremely slow adaptation to prevent "Sepsis Desert" drift
+
+  pos_weight: 1.0             # [NERYVA-BETA] Reset to 1.0 (Handled by DynamicClassBalancer)
+  aux_loss_scale: 1.0         # [v12.6] Restored to 1.0 (No throttling needed with balanced weights)
+  precision: "16-mixed"
+  accumulate_grad_batches: 1  
+  log_every_n_steps: 50
+  fused_optimizer: true       # [H100] Enable fused kernels 
+  
+  balancing_mode: "sota_2025" 
+  uw_lr: 0.025                # Learning rate for uncertainty weights
+  
+  # Phase 3: Longitudinal Foresight (Agentic Convergence)
+  start_gamma: 0.98        # [v25.9 SOTA] Stabilized for Unleashed Run
+  end_gamma: 0.98             # [v25.9 SOTA] Parked at 12.5h for initial phase
+  horizon_warmup: 10
+  horizon_ramp: 40
+
+  # Debug Mode (Smoke Test)
+  debug_run: false #true
+  debug_limit_batches: 200
+  debug_limit_val: 500
+
+  
+  # AWR (Advantage Weighted Regression) v2.0
+  awr_beta: 1.0               # [v38.0] Selection Smoking Gun Smoothing (Start higher)
+  awr_max_weight: 20.0        
+  awr_lambda: 0.95            # [SOTA] GAE-Lambda for credit assignment
+  awr_gamma: 0.92             # [v25.9 SOTA] Synchronized with Horizon Manifold
+  adaptive_beta: true
+  adaptive_clipping: true
+  target_ess: 0.12            # [v10.5 SOTA] Target 12% Batch Selection (Boosted for Recall)
+  awr_momentum: 0.98          # [v38.0] Selection Smoothing Momentum (was 0.95)
+  beta_min: 1.2               # [v38.0] Selection Floor (Raised to 1.2 to mimic Resumption Boost)
+  alpha_min: 0.1              # [SOTA SG-2] Prevents minority task starvation;
+  
+  # AWR Calibration Speed/Quality (v10.1 Upgrade)
+  # - "full": Scans all trajectories (~5-10 min, best for final training)
+  # - "sample": Random subset (~10-30 sec, best for testing)
+  awr_calibration_mode: "full" # full for whole population scan or sample
+  awr_max_samples: 10000      # [SOTA FIX] Increased for Batch 2048 / Full Sepsis-3 Population
+
+  
+  ema_decay: 0.999
+  ema_update_every: 10        # [SOTA] Staggered updates to fix I/O bottleneck
+  
+  # [TUNING] AUC Recovery Suite
+  acl_throttle_factor: 1.0     # [v2.2] Boosted from 0.7 to 1.0 (Full Contrastive Signal)
+  manual_ema_update: true     # [v14.1 FIX] Handled manually in wrapper to prevent double-update
+  monitor: "val/sepsis_auroc"
+  patience: 10
+
+  # Clinical Supervision (BGSL)
+  trend_coef: 1.0             # Velocity penalty
+  shock_coef: 2.0             # Acceleration/Surprise penalty
+  
+  # Contrastive Memory & Archetypes
+  tcb_capacity: 1024          # Bank size for hard negatives
+  tcb_temp: 0.07              # Cluster sharpness
+  acl_centroid_reg: 0.05      # [v12.5.1] Higher to prevent contrastive collapse
+  
+  # Risk-Aware Asymmetric Loss
+  asl_gamma_neg: 1.0          # [TUNING] Lowered from 2.0 to 1.0 (Recover AUC sensitivity)
+  asl_gamma_pos: 1.0          # Standard focusing
+  risk_multiplier: 5.0        # [TUNING] Boosted from 2.0 to 5.0 (Sepsis Clinical Priority)
+  
+  # Optimization Groups
+  backbone_lr_ratio: 1.0
+  backbone_modules:
+    - "encoder"
+    - "backbone"
+
+# --- Logging ---
+logging:
+  use_wandb: true
+  wandb_project: "icu-diffusion-phase1"
+  wandb_mode: "offline"
+  run_name: ${run_name}

@@ -47,20 +47,32 @@ class ConfidenceAwareGovernor(nn.Module):
     def apply_governance(self, x: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
         """
         [SOTA] Confidence-Aware Dynamic Thresholding.
-        x: Latent tensor [B, T, C]
-        p: Effective percentile per sample [B]
-        """
-        B = x.shape[0]
-        x_out = x.clone()
+        Vectorized implementation (No Loops, No Syncs).
         
-        for i in range(B):
-            # Flatten T, C for quantile calculation
-            s = x[i].abs().view(-1)
-            # [FIX] torch.quantile requires float32 or float64, and q must match input dtype.
-            # Cast both to float32 for compatibility with mixed precision/bfloat16.
-            # [SOTA FIX] Detach to avoid graph retention in the safety threshold.
-            thresh = torch.quantile(s.detach().float(), p[i].float())
-            # Clamp outliers to the threshold
-            x_out[i] = torch.clamp(x[i], min=-thresh, max=thresh)
+        x: Latent tensor [B, T, C]
+        p: Effective percentile per sample [B], e.g. 0.99
+        """
+        B, T, C = x.shape
+        # Flatten temporal/feature dims: [B, T*C]
+        flat_x = x.abs().reshape(B, -1)
+        
+        # [v2026 SOTA] Vectorized Quantile via Sorting
+        # Rationale: torch.quantile is slow in loops. Sorting is fast on GPU.
+        # We find the value at the index corresponding to percentile p.
+        sorted_x, _ = torch.sort(flat_x, dim=1) # Ascending
+        
+        # Calculate indices: idx = floor(p * N)
+        # p is [B], N is T*C
+        N = flat_x.shape[1]
+        indices = (p * (N - 1)).long().clamp(0, N - 1) # [B]
+        
+        # Gather thresholds: [B, 1]
+        thresh = sorted_x.gather(1, indices.unsqueeze(1))
+        
+        # Expand for broadcasting: [B, 1, 1]
+        thresh = thresh.view(B, 1, 1)
+        
+        # Clamp entire batch at once
+        x_out = torch.clamp(x, min=-thresh, max=thresh)
             
         return x_out

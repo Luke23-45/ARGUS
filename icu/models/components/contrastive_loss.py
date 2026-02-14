@@ -87,10 +87,32 @@ class AsymmetricContrastiveLoss(nn.Module):
                     global_center = local_sync[c, :self.d_model] / global_count
                     global_center = F.normalize(global_center.unsqueeze(0), dim=1).squeeze(0)
                     
-                    if self.initialized.item():
-                        self.centroids[c].mul_(self.momentum).add_(global_center, alpha=1 - self.momentum)
-                    else:
-                        self.centroids[c].copy_(global_center)
+                    # [v2026 SOTA FIX] Vectorized Momentum Gate (Zero-Sync)
+                    # Rationale: "if self.initialized.item()" triggers a host sync every batch.
+                    # We use the tensor value directly as a mixing coefficient.
+                    
+                    # If initialized=0 (False), we want alpha=1.0 (Hard Copy)
+                    # If initialized=1 (True), we want alpha=1-momentum (EMA Update)
+                    init_float = self.initialized.float().item() if not self.initialized.is_cuda else self.initialized.float()
+                    
+                    # Note: We can't use .item() here. 
+                    # But 'initialized' is a tensor. 
+                    # Dynamic mixing: 
+                    # alpha = (1 - momentum) * initialized + 1.0 * (1 - initialized)
+                    #       = 1 - momentum*initialized - initialized + 1 - initialized
+                    # Wait, simpler:
+                    # new_val = old * momentum + target * (1-momentum)  (if init)
+                    # new_val = target                                  (if not init)
+                    
+                    # target_alpha = (1 - self.momentum) * self.initialized + 1.0 * (1.0 - self.initialized)
+                    # self.centroids[c].lerp_(global_center, target_alpha)
+                    
+                    # Correction: Lerp is x + w(y-x). 
+                    # If init: w = 1-momentum. 
+                    # If not init: w = 1.0.
+                    
+                    w = torch.where(self.initialized, 1.0 - self.momentum, torch.tensor(1.0, device=device))
+                    self.centroids[c].lerp_(global_center, w)
                         
             if local_sync[:, self.d_model].sum() > 0:
                 self.initialized.fill_(True)

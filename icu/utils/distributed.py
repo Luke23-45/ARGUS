@@ -20,50 +20,118 @@ class SOTA_DistributedGatherer:
         self.device = device
         self.world_size = world_size
         
-        # [Cache] Pre-allocate handshake buffers
-        self._local_count = torch.zeros(1, dtype=torch.long, device=device)
-        self._global_counts = torch.zeros(world_size, dtype=torch.long, device=device)
+        # [Cache] Pre-allocated handshake buffers
+        self._local_handshake = torch.zeros(2, dtype=torch.long, device=device) # [N, D]
+        self._global_handshake = torch.zeros(world_size, 2, dtype=torch.long, device=device) # [WS, 2]
+        
+        # [Buffer Cache]
+        self._cached_output_buffer = None
+        self._cached_padded_local = None
+        self._cached_max_size = 0
+        self._cached_dim_total = 0
+
+    # [Static Cache] Shared across all static calls to prevent hot-path syncs
+    _STATIC_ASYM_CACHE = {} 
 
     @staticmethod
     @torch.no_grad()
     def gather_asymmetric(tensor: torch.Tensor) -> list:
         """
         [v30.5 SOTA] Asymmetric Collective Engine.
-        Safely gathers tensors of different sizes across ranks.
+        Safely gathers tensors of different sizes across ranks with zero-sync shape discovery.
         """
         if not dist.is_initialized():
             return [tensor]
             
         device = tensor.device
         world_size = dist.get_world_size()
-        local_size = torch.tensor(list(tensor.shape), device=device, dtype=torch.long)
+        ndim = tensor.ndim
+        # Use dtype as part of cache key to handle mixed precision (AMP)
+        cache_key = (ndim, tensor.dtype, device.type)
         
-        # 1. Gather all shapes
-        all_sizes = [torch.zeros_like(local_size) for _ in range(world_size)]
-        dist.all_gather(all_sizes, local_size)
+        local_shape = torch.tensor(tensor.shape, device=device, dtype=torch.long)
         
-        # 2. Determine max shape
-        max_size = torch.stack(all_sizes).max(dim=0).values
+        # 1. Atomic Shape Discovery
+        all_shapes = torch.zeros(world_size, ndim, device=device, dtype=torch.long)
+        dist.all_gather_into_tensor(all_shapes, local_shape)
         
-        # 3. Pad local tensor to max shape
-        pad_size = (max_size - local_size).tolist()
-        if any(p > 0 for p in pad_size):
-            padding = []
-            for p in reversed(pad_size):
-                padding.extend([0, p])
-            padded_tensor = torch.nn.functional.pad(tensor, padding)
+        # 2. Cache Lookup / Update
+        # Rationale: Replaced .tolist() and Python looping with a tensor-based lookup.
+        cached_hit = False
+        if cache_key in SOTA_DistributedGatherer._STATIC_ASYM_CACHE:
+             # Unpack safely (handle potential padding/cpu_shapes appended later)
+             cache_val = SOTA_DistributedGatherer._STATIC_ASYM_CACHE[cache_key]
+             c_max_s = cache_val[0]
+             c_all_s = cache_val[1]
+             # Zero-Sync equality check
+             if torch.equal(all_shapes, c_all_s):
+                  max_size_list = cache_val[2]
+                  gathered_tensors = cache_val[3]
+                  cached_hit = True
+        
+        if not cached_hit:
+             max_size = all_shapes.max(dim=0).values
+             max_size_list = [int(s) for s in max_size]
+             # Pre-allocate tensors for all_gather
+             gathered_tensors = [torch.zeros(max_size_list, device=device, dtype=tensor.dtype) for _ in range(world_size)]
+             
+             # [SOTA FIX] Cache CPU shapes to avoid 32x int() syncs in unpadding loop
+             cpu_shapes = all_shapes.cpu().tolist()
+             
+             # Init cache with None padding (populated in step 3)
+             # Structure: (max_size, all_shapes, max_size_list, gathered_tensors, padding, cpu_shapes)
+             SOTA_DistributedGatherer._STATIC_ASYM_CACHE[cache_key] = (max_size, all_shapes.clone(), max_size_list, gathered_tensors, None, cpu_shapes)
+
+        # 3. Vectorized Padding Check
+        # LS (local_shape) vs Max Shape from cache/fresh
+        if not cached_hit:
+             # Fresh calc
+             max_size_tensor = torch.tensor(max_size_list, device=device)
+             pad_size = (max_size_tensor - local_shape)
+             
+             # Pre-calculate padding list
+             padding = []
+             # Rationale: Convert to list ONCE during cache miss
+             pad_list = pad_size.tolist()
+             for p in reversed(pad_list):
+                  padding.extend([0, p])
+             
+             # Update cache with valid padding
+             # Retrieve the just-created tuple components
+             _, _, _, _, _, cpu_shapes = SOTA_DistributedGatherer._STATIC_ASYM_CACHE[cache_key]
+             SOTA_DistributedGatherer._STATIC_ASYM_CACHE[cache_key] = (max_size_tensor, all_shapes.clone(), max_size_list, gathered_tensors, padding, cpu_shapes)
         else:
-            padded_tensor = tensor
+             # Hit: Retrieve cached tensors and padding
+             # Access directly from cache_val we retrieved earlier
+             padding = cache_val[4]
+             cpu_shapes = cache_val[5]
+             
+             # If padding was None (race condition or partial init?), recalc (unlikely but safe)
+             if padding is None:
+                  max_size_tensor = cache_val[0]
+                  pad_size = (max_size_tensor - local_shape)
+                  padding = []
+                  for p in reversed(pad_size.tolist()):
+                       padding.extend([0, p])
+
+        # 3. Apply Padding (Vectorized)
+        # Rationale: If padding list is all zeros, functional.pad is a no-op view.
+        # This avoid host-side 'if' branching on tensor values.
+        padded_tensor = torch.nn.functional.pad(tensor, padding)
             
-        # 4. Gather padded tensors
-        gathered_tensors = [torch.zeros(list(max_size), device=device, dtype=tensor.dtype) for _ in range(world_size)]
+        # 4. Zero-Copy Bulk Transfer
         dist.all_gather(gathered_tensors, padded_tensor)
         
-        # 5. Un-pad to original local sizes
+        # 5. Semantic Unpacking (View-only where possible)
         final_tensors = []
-        for i, size in enumerate(all_sizes):
-            slices = [slice(0, int(s)) for s in size]
-            final_tensors.append(gathered_tensors[i][slices])
+        for i in range(world_size):
+            # [SOTA FIX] Use cached CPU shapes to avoid int(gpu_tensor) syncs
+            size_list = cpu_shapes[i] 
+            curr = gathered_tensors[i]
+            for d in range(ndim):
+                # size_list[d] is a Python int. No sync.
+                curr = curr.narrow(d, 0, size_list[d])
+            final_tensors.append(curr)
             
         return final_tensors
 
@@ -81,8 +149,8 @@ class SOTA_DistributedGatherer:
                             Contains valid data from all ranks, packed.
         """
         # --- PHASE 0: FUSION (Packetization) ---
+        n_local = 0
         if not local_tensors:
-             n_local = 0
              dim_total = 0
              # We rely on other ranks to provide Dim info if we are empty?
              # Actually, if we are empty, we can't infer Dim.
@@ -101,19 +169,32 @@ class SOTA_DistributedGatherer:
                 v = v.float()
             processed_tensors.append(v)
 
+        n_local = 0
         if len(processed_tensors) > 0:
             fused_local = torch.cat(processed_tensors, dim=1)
             n_local, dim_total = fused_local.shape
         else:
             dim_total = 0 
         
-        # [v23.0 SOTA FIX] Dim Consensus (Smoking Gun #243)
-        # Rationale: Ranks with 0 samples MUST know the packet width (D) 
-        # of ranks with samples to participate in all_gather_into_tensor.
+        # [v23.0 SOTA FIX] Unified Handshake (Smoking Gun #243)
+        # Rationale: Fusing Dim and Count into a single collective.
+        self._local_handshake[0] = n_local
+        self._local_handshake[1] = dim_total
+        
         if torch.distributed.is_initialized():
-             dim_tensor = torch.tensor([float(dim_total)], device=self.device)
-             dist.all_reduce(dim_tensor, op=dist.ReduceOp.MAX)
-             dim_total = int(dim_tensor.item())
+             dist.all_gather_into_tensor(self._global_handshake, self._local_handshake)
+             global_counts = self._global_handshake[:, 0]
+             dim_total = int(self._global_handshake[:, 1].max()) # Single Sync for all ranks
+        else:
+             global_counts = torch.tensor([n_local], device=self.device)
+             dim_total = dim_total
+        
+        # Max required for padding
+        global_max = int(global_counts.max())
+
+        # If nobody has data, return empty
+        if global_max == 0:
+            return torch.empty(0, dim_total, device=self.device)
 
         if len(processed_tensors) > 0:
             # We already computed fused_local in Phase 0
@@ -121,65 +202,38 @@ class SOTA_DistributedGatherer:
         else:
             fused_local = torch.empty(0, dim_total, device=self.device)
 
-        # --- PHASE 1: HANDSHAKE (Size Discovery) ---
-        self._local_count[0] = n_local
+        # --- PHASE 2: ZERO-COPY PADDING (With Buffer Caching) ---
+        # Rationale: Re-using buffers prevents fragmentation and redundant syncs.
+        if (self._cached_output_buffer is None) or (global_max > self._cached_max_size) or (dim_total != self._cached_dim_total):
+             # Strategy: Over-allocate by 25% or pad to multiple of 8 for TensorCore efficiency
+             self._cached_max_size = int(global_max * 1.25)
+             self._cached_dim_total = int(dim_total)
+             self._cached_padded_local = torch.zeros(self._cached_max_size, self._cached_dim_total, device=self.device)
+             self._cached_output_buffer = torch.empty(self.world_size * self._cached_max_size, self._cached_dim_total, device=self.device)
+             
+        # Reset current padded slice
+        padded_local = self._cached_padded_local[:global_max]
+        padded_local.zero_()
         
-        if torch.distributed.is_initialized():
-             dist.all_gather_into_tensor(self._global_counts, self._local_count)
-        else:
-             self._global_counts[0] = n_local
-        
-        # Max required for padding
-        global_max = self._global_counts.max().item()
-        total_global = self._global_counts.sum().item()
-
-        # If nobody has data, return empty
-        if global_max == 0:
-            # Need correct width... if we had input [0, D], we know D.
-            # If input was truly empty dict, we don't know D. Return [0, 0]
-            if dim_total == 0 and len(processed_tensors) > 0:
-                 dim_total = processed_tensors[0].shape[1] # Actually sum of dims
-                 dim_total = sum(t.shape[1] for t in processed_tensors)
-            
-            return torch.empty(0, dim_total if dim_total > 0 else 0, device=self.device)
-        
-        # If we have 0 locals, we still need dim_total for buffer allocation.
-        # We must sync Dim Total if we are empty.
-        # Handling the "Empty Local" case robustly:
-        if n_local == 0 and dim_total == 0:
-             # We must get D from a rank that has it. 
-             # For speed, let's assume ALL ranks know the schema or at least ONE rank pads correctly.
-             # Actually, if we use all_gather_into_tensor, our input padded buffer MUST match global_max * D.
-             # So we MUST know D.
-             # FIX: Callers must provide [0, D] empty tensors, not [0].
-             pass
-
-        # --- PHASE 2: ZERO-COPY PADDING ---
-        # Create padded local [Global_Max, D]
-        padded_local = torch.zeros(global_max, dim_total, device=self.device)
         if n_local > 0:
             padded_local[:n_local] = fused_local
             
         # --- PHASE 3: BULK TRANSFER ---
-        # Output: [World_Size * Global_Max, D]
-        output_buffer = torch.empty(
-            self.world_size * global_max, 
-            dim_total, 
-            device=self.device
-        )
+        output_buffer_full = self._cached_output_buffer[:self.world_size * global_max]
         
         if torch.distributed.is_initialized():
-             dist.all_gather_into_tensor(output_buffer, padded_local)
+             dist.all_gather_into_tensor(output_buffer_full, padded_local)
         else:
-             output_buffer.copy_(padded_local) # Single GPU fallback
+             output_buffer_full.copy_(padded_local) # Single GPU fallback
 
         # --- PHASE 4: VECTORIZED UNPADDING ---
         # Mask logic: [WS, Global_Max]
+        output_buffer = output_buffer_full.view(self.world_size, global_max, dim_total)
         row_indices = torch.arange(global_max, device=self.device).unsqueeze(0).expand(self.world_size, -1)
-        counts_view = self._global_counts.unsqueeze(1)
+        counts_view = global_counts.unsqueeze(1)
         valid_mask = row_indices < counts_view
         
         # Flatten and compress
-        final_gathered = output_buffer[valid_mask.flatten()]
+        final_gathered = output_buffer[valid_mask]
         
         return final_gathered
