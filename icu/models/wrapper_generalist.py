@@ -619,6 +619,24 @@ class ICUGeneralistWrapper(pl.LightningModule):
             
             if len(optimizers) == len(self.pending_optimizer_states):
                 try:
+                    # [v2026 SOTA FIX] Optimizer State Shape Bridge (Smoking Gun #ShapeCrash)
+                    # Rationale: Model load_state_dict bridges buffers/params from [] → [1],
+                    # but optimizer states (exp_avg, exp_avg_sq) are NOT bridged.
+                    # This causes a fatal shape mismatch in Adam's lerp_():
+                    #   exp_avg.lerp_(grad, 1-beta) → RuntimeError: [] vs [1]
+                    # Fix: Reshape all 0-dim optimizer state tensors to [1] before loading.
+                    bridged_count = 0
+                    for opt_state in self.pending_optimizer_states:
+                        if 'state' in opt_state:
+                            for param_id, pstate in opt_state['state'].items():
+                                for key in ['exp_avg', 'exp_avg_sq', 'max_exp_avg_sq']:
+                                    if key in pstate and isinstance(pstate[key], torch.Tensor):
+                                        if pstate[key].dim() == 0:
+                                            pstate[key] = pstate[key].unsqueeze(0)
+                                            bridged_count += 1
+                    if bridged_count > 0:
+                        logger.info(f"🛡️ [RESUME] Optimizer Shape Bridge: Reshaped {bridged_count} state tensors ([] → [1]).")
+
                     for opt, state in zip(optimizers, self.pending_optimizer_states):
                         opt.load_state_dict(state)
                     logger.info(f"✅ [RESUME] Manually restored {len(optimizers)} optimizer states (Trauma Averted).")
@@ -3569,19 +3587,23 @@ class ICUGeneralistWrapper(pl.LightningModule):
         state_dict = checkpoint.get("state_dict", {})
 
         # 1. INITIALIZE SAFETY FLAGS (For Legacy Checkpoints)
+        # [v2026 SOTA FIX] Shape-Consistent Default Injection (Smoking Gun #ShapeCrash)
+        # Rationale: All injected tensors MUST match the registered buffer shapes ([1]).
+        # Injecting scalar [] tensors causes load_state_dict shape mismatches and
+        # downstream optimizer state corruption.
         if "grad_norm_std" not in state_dict:
-            state_dict["grad_norm_std"] = torch.tensor(0.5)
+            state_dict["grad_norm_std"] = torch.tensor([0.5])
         if "grad_norm_ema" not in state_dict:
-            state_dict["grad_norm_ema"] = torch.tensor(1.0)
+            state_dict["grad_norm_ema"] = torch.tensor([1.0])
             
         if "grad_norm_step_count" not in state_dict:
-            state_dict["grad_norm_step_count"] = torch.tensor(checkpoint.get("global_step", 100))
+            state_dict["grad_norm_step_count"] = torch.tensor([checkpoint.get("global_step", 100)], dtype=torch.long)
             
         # [v12.0 SOTA FIX] Handle Missing v12 Buffers (Smoking Gun #error12)
         # Rationale: stability_factor and AWR hyperparameters are now non-persistent 
         # or were recently added. We initialize them if missing from older checkpoints.
         if "stability_factor" not in state_dict:
-            state_dict["stability_factor"] = torch.tensor(1.0)
+            state_dict["stability_factor"] = torch.tensor([1.0])
             logger.info("[RESUME] Initialized missing 'stability_factor' to 1.0.")
             
         if "awr_calculator.gamma" not in state_dict:
@@ -3600,7 +3622,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # uses a FULL aggregate of exactly 'accumulate_grad_batches' samples.
         # Restoring a mid-cycle index (e.g. 8/16) without the first 8 gradients 
         # would lead to a mathematically incorrect, "under-fueled" step.
-        state_dict["grad_accum_idx"] = torch.tensor(0)
+        state_dict["grad_accum_idx"] = torch.tensor([0], dtype=torch.long)
         # [v2026 AUDIT] Direct Buffer Fill (Belt and Suspenders)
         # Verify that buffer is reset even if PL loaded state_dict before this hook.
         if hasattr(self, "grad_accum_idx"):

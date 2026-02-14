@@ -71,10 +71,11 @@ class BayesianProjectedScaler(nn.Module):
         device = next(self.parameters()).device
         
         if has_losses:
-            # [v2026 SOTA FIX] Explicit shape squeeze
-            # Rationale: Ensures a 1D tensor even if inputs were [1].
-            # Prevents [N, 1] broadcast crash during accumulation.
-            losses_tensor = torch.stack(losses).squeeze(-1)
+            # [v2026 SOTA FIX] Belt-and-Suspenders Shape Normalization
+            # Rationale: Ensure each loss is exactly a 0D scalar before stacking.
+            # This prevents [N, 1] broadcast crashes if any loss arrives as [1].
+            losses = [l.squeeze() for l in losses]
+            losses_tensor = torch.stack(losses)
             indices = torch.tensor([idx for idx, _ in active_keys], device=losses_tensor.device)
             local_raw = losses_tensor.detach()
             
@@ -84,9 +85,9 @@ class BayesianProjectedScaler(nn.Module):
                 self.task_counters[indices] += batch_size
                 self.batch_counter += batch_size
         else:
-            # [v2026 SOTA] Standardized empty-batch rank fallback
-            # Rationale: All ranks must return 1D vectors [1] for stack compatibility.
-            losses_tensor = torch.tensor([0.0], device=device, requires_grad=True)
+            # [v2026 SOTA FIX] Standardized empty-batch rank fallback
+            # Rationale: All ranks must return a scalar for consistent pipeline shape.
+            losses_tensor = torch.tensor(0.0, device=device, requires_grad=True)
             indices = torch.tensor([], dtype=torch.long, device=device)
             local_raw = torch.tensor([], device=device)
 

@@ -152,7 +152,11 @@ class BGSLLoss(nn.Module):
         # Do not use fill_ in forward to prevent amnesia.
             
         # [v2026 SOTA FIX] Explicit Reduction to 0D Scalar
-        total_loss = l_state.mean() + (self.w_t * l_trend.mean()) + (self.w_h * l_shock.mean())
+        # Rationale: w_t and w_h are [1]-shaped buffers. Multiplying with scalar
+        # .mean() produces a [1]-shaped result, which propagates downstream and
+        # causes shape mismatches in loss_scaler's torch.stack().
+        # .squeeze() ensures the product is a true 0D scalar.
+        total_loss = l_state.mean() + (self.w_t.squeeze() * l_trend.mean()) + (self.w_h.squeeze() * l_shock.mean())
         
         return {
             "loss": total_loss,

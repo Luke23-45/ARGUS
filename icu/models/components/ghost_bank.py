@@ -98,7 +98,9 @@ class SepsisGhostBank(nn.Module):
             valid_gate = (global_count > 1e-6)
             batch_avg = torch.where(valid_gate, global_sum / (global_count + 1e-8), torch.zeros_like(global_sum))
         else:
-            valid_gate = (new_latents.shape[0] > 0)
+            # [v2026 SOTA FIX] valid_gate must be a Tensor for torch.where() 
+            # (Python bool causes TypeError: "got (bool, Tensor, Tensor)")
+            valid_gate = torch.tensor(new_latents.shape[0] > 0, device=device)
             batch_avg = new_latents.mean(dim=0, keepdim=True) if valid_gate else torch.zeros(1, self.latent_dim, device=device)
             
         # [v161.0 SOTA FIX] Atomic Update (Zero-Sync)
