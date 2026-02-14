@@ -11,7 +11,7 @@ from icu.models.components.geometric_projector import GeometricProjector
 from icu.models.components.temporal_sampler import TemporalSampler
 from icu.models.components.nth_encoder import NTHEncoderBlock
 from icu.models.components.sequence_aux_head import SequenceAuxHead
-from icu.models.components.loss_scaler import UncertaintyLossScaler
+from icu.models.components.loss_scaler import BayesianProjectedScaler
 
 # Integration Test
 from icu.models.diffusion import ICUUnifiedPlanner, ICUConfig
@@ -72,34 +72,33 @@ class TestSOTAComponents(unittest.TestCase):
         self.assertEqual(out.shape, (self.B, self.T, self.D))
         
     def test_sequence_aux_head(self):
-        print("\n--- Testing Sequence Aux Head ---")
+        print("\n--- Testing SequenceAuxHead ---")
         model = SequenceAuxHead(d_model=self.D, num_classes=1).to(self.device)
         x = torch.randn(self.B, self.T, self.D).to(self.device)
         targets = torch.randint(0, 2, (self.B, 1)).float().to(self.device)
         
-        logits, loss = model(x, targets=targets)
+        output = model(x, targets=targets)
+        logits = output['logits']
+        loss = output['loss']
         print(f"Logits: {logits.shape}, Loss: {loss}")
         self.assertEqual(logits.shape, (self.B, 1))
         self.assertIsNotNone(loss)
-        
-        # Test Asymmetric Loss Logic
-        # If target 1, logits should be pushed up.
         loss.backward()
         print("Backward pass successful")
         
-    def test_loss_scaler(self):
+    def test_uncertainty_scaler(self):
         print("\n--- Testing Loss Scaler ---")
-        model = UncertaintyLossScaler(num_tasks=2).to(self.device)
+        scaler = BayesianProjectedScaler(num_tasks=3).to(self.device)
         losses = {
             'diffusion': torch.tensor(1.5, requires_grad=True),
             'aux': torch.tensor(0.5, requires_grad=True)
         }
         
-        total_loss, logs = model(losses)
+        total_loss, logs = scaler(losses)
         print(f"Total Loss: {total_loss}, Logs: {logs}")
         
         total_loss.backward()
-        print("Backward pass successful. Gradients on scales:", model.log_vars.grad)
+        print("Backward pass successful. Gradients on scales:", scaler.log_vars.grad)
         
     def test_integrated_planner(self):
         print("\n--- Testing Integrated ICUUnifiedPlanner ---")

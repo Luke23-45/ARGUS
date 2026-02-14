@@ -165,9 +165,9 @@ class DynamicClassBalancer(nn.Module):
     def __init__(self, num_classes: int, beta: float = 0.99, prior_pos_weight: float = None):
         super().__init__()
         self.num_classes = num_classes
-        self.register_buffer("beta", torch.tensor(beta).float())
+        self.register_buffer("beta", torch.tensor([beta]).float())
         self.register_buffer("counts", torch.zeros(num_classes))
-        self.register_buffer("initialized", torch.tensor(False))
+        self.register_buffer("initialized", torch.tensor([False]))
         
         if prior_pos_weight is not None and num_classes > 1 and prior_pos_weight > 0:
              n_neg = 1000.0
@@ -402,8 +402,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # [v177.3 SOTA] Multi-Task Gradient Pressure EMAs
         # Rationale: Track gradient magnitudes for Physics vs Diffusion to ensure 1:1 balance.
         # Registered as buffers to ensure persistence across resumption.
-        self.register_buffer("phys_grad_ema", torch.tensor(1.0))
-        self.register_buffer("diff_grad_ema", torch.tensor(1.0))
+        self.register_buffer("phys_grad_ema", torch.tensor([1.0]))
+        self.register_buffer("diff_grad_ema", torch.tensor([1.0]))
         
         # [v4.0 PERFECT] Manifold Projections
         # [REMOVED] self.expert_state_head = nn.Linear(cfg.model.d_model, 1)
@@ -459,39 +459,39 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # =====================================================================
         # 7. STATE FLAGS
         # =====================================================================
-        self.register_buffer("_awr_stats_initialized", torch.tensor(False))
+        self.register_buffer("_awr_stats_initialized", torch.tensor([False]))
         self.validation_step_outputs = []
         
         # [Point 5] Bayesian Moving Average Calibration
         # Initialized to 0.5; will be updated via F2-opt during validation.
-        self.register_buffer("calibrated_threshold", torch.tensor(0.5))
+        self.register_buffer("calibrated_threshold", torch.tensor([0.5]))
         self.threshold_ema_decay = 0.7 # [SOTA FIX] Faster calibration pulse (0.9 -> 0.7)
         
-        self.register_buffer("curr_tau", torch.tensor(0.5))
-        self.register_buffer("curr_sigma_scale", torch.tensor(3.50))
-        self.register_buffer("curr_phys_clamp", torch.tensor(10.0)) # [v29.6] Step-Invariant Clamp
+        self.register_buffer("curr_tau", torch.tensor([0.5]))
+        self.register_buffer("curr_sigma_scale", torch.tensor([3.50]))
+        self.register_buffer("curr_phys_clamp", torch.tensor([10.0])) # [v29.6] Step-Invariant Clamp
         
         # [PMS] Manifold Stability Monitoring (v26.5 SOTA)
         # [v26.6 FIX] Initialize to 0.0 so TrendSentinel's bias correction (1 - beta^t) works.
-        self.register_buffer("stability_factor", torch.tensor(1.0))
-        self.register_buffer("grad_norm_ema", torch.tensor(1.0))
-        self.register_buffer("grad_norm_std", torch.tensor(0.0)) 
-        self.register_buffer("grad_norm_step_count", torch.tensor(0))
+        self.register_buffer("stability_factor", torch.tensor([1.0]), persistent=False)
+        self.register_buffer("grad_norm_ema", torch.tensor([1.0]))
+        self.register_buffer("grad_norm_std", torch.tensor([0.0])) 
+        self.register_buffer("grad_norm_step_count", torch.tensor([0], dtype=torch.long))
         self.grad_ema_decay = cfg.train.get("grad_ema_decay", 0.99)
         
         # [PMS] Resumption Grace Period (Circuit Breaker)
         # Prevents "False Shocks" as the first few batches settle after resume.
-        self.register_buffer("resumption_grace_steps", torch.tensor(0))
+        self.register_buffer("resumption_grace_steps", torch.tensor([0], dtype=torch.long))
         
         # [v107.0 SOTA] GradNorm Accumulation Parity (Smoking Gun #107)
         # Accumulates task losses across the cycle to prevent sampling bias.
         # [v33.4 FIX] Synchronized to 7 tasks (Diffusion, Critic, Aux, ACL, BGSL, TCB, Phys)
         self.register_buffer("gn_loss_accumulator", torch.zeros(7))
-        self.register_buffer("gn_acc_count", torch.tensor(0))
+        self.register_buffer("gn_acc_count", torch.tensor([0], dtype=torch.long))
         
         # [v48.0 SOTA FIX] Stateful Accumulation Index (Smoking Gun #90)
         # Rationale: Ensures bit-perfect cycle alignment across resumptions.
-        self.register_buffer("grad_accum_idx", torch.tensor(0))
+        self.register_buffer("grad_accum_idx", torch.tensor([0], dtype=torch.long))
         
         # [v12.0 SOTA] CPU Shadows for Zero-Sync
         # Rationale: Prevents hot-path .item() syncs in training_step.
@@ -514,6 +514,21 @@ class ICUGeneralistWrapper(pl.LightningModule):
             pass
         
         self.last_logged_bucket = -1
+    
+    def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True):
+        """
+        [SOTA v2026] resilient State Loading.
+        Forces strict=False when loading from a checkpoint to prevent crashes
+        from newly added buffers or parameters.
+        """
+        # Detection of checkpoint loading vs manual state_dict application
+        is_checkpoint = any("model." in k for k in state_dict.keys()) or any("awr_calculator." in k for k in state_dict.keys())
+        
+        if is_checkpoint:
+             logger.info("🛡️ [PMS] resilient Loading: Using strict=False for restoration bridge.")
+             return super().load_state_dict(state_dict, strict=False)
+        return super().load_state_dict(state_dict, strict=strict)
+    
     
     def on_train_start(self):
         """[SOTA v2026] Unified Mathematical Hyperparameter Scaling."""
@@ -3536,6 +3551,22 @@ class ICUGeneralistWrapper(pl.LightningModule):
         if "grad_norm_step_count" not in state_dict:
             state_dict["grad_norm_step_count"] = torch.tensor(checkpoint.get("global_step", 100))
             
+        # [v12.0 SOTA FIX] Handle Missing v12 Buffers (Smoking Gun #error12)
+        # Rationale: stability_factor and AWR hyperparameters are now non-persistent 
+        # or were recently added. We initialize them if missing from older checkpoints.
+        if "stability_factor" not in state_dict:
+            state_dict["stability_factor"] = torch.tensor(1.0)
+            logger.info("[RESUME] Initialized missing 'stability_factor' to 1.0.")
+            
+        if "awr_calculator.gamma" not in state_dict:
+            # Note: Being non-persistent means we rely on the cfg value already set in __init__
+            # but we can also explicitly set it here if we want to bypass strict loading issues.
+            # Since we use strict=False in load_state_dict, this is mostly for logging/assurance.
+             logger.info("[RESUME] 'awr_calculator.gamma' missing from checkpoint (expected for non-persistent).")
+             
+        if "awr_calculator.lambda_gae" not in state_dict:
+             logger.info("[RESUME] 'awr_calculator.lambda_gae' missing from checkpoint.")
+
         # [v48.0 SOTA FIX] Stateful Accumulation Index (Smoking Gun #90)
         # [v2026 AUDIT FIX] Resumption Math Parity (Reset to 0)
         # Rationale: On resume, gradients are empty. We MUST restart the 

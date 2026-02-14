@@ -48,9 +48,9 @@ class SepsisGhostBank(nn.Module):
         self.feature_dim = feature_dim
         self.latent_dim = latent_dim
         self.similarity_threshold = similarity_threshold
-        self.register_buffer("prototype_ema_decay", torch.tensor(prototype_ema_decay).float())
+        self.register_buffer("prototype_ema_decay", torch.tensor([prototype_ema_decay]).float())
         self.base_latent_adapter_strength = latent_adapter_strength 
-        self.register_buffer("latent_adapter_strength", torch.tensor(latent_adapter_strength).float())
+        self.register_buffer("latent_adapter_strength", torch.tensor([latent_adapter_strength]).float())
 
         # [v17.3 Hardened] Replay-Aware Buffers
         # Storing raw trajectories forces the model to perform a full forward pass
@@ -67,9 +67,9 @@ class SepsisGhostBank(nn.Module):
         self.register_buffer("prototype_ema", torch.zeros(1, latent_dim))
         
         # Metadata / Tracking
-        self.register_buffer("ptr", torch.tensor(0, dtype=torch.long))
-        self.register_buffer("size", torch.tensor(0, dtype=torch.long))
-        self.register_buffer("is_full", torch.tensor(False, dtype=torch.bool))
+        self.register_buffer("ptr", torch.tensor([0], dtype=torch.long))
+        self.register_buffer("size", torch.tensor([0], dtype=torch.long))
+        self.register_buffer("is_full", torch.tensor([False], dtype=torch.bool))
         
         # [v12.0 SOTA] CPU Shadows for Zero-Sync
         # Rationale: Prevents hot-path .item() syncs in update() and sample().

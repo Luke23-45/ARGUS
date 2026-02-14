@@ -38,15 +38,15 @@ class BayesianProjectedScaler(nn.Module):
         
         # EMA tracking for UW-SO stability
         self.register_buffer("loss_emas", torch.ones(num_tasks))
-        self.register_buffer("decay", torch.tensor(decay))
+        self.register_buffer("decay", torch.tensor([decay]))
         
         # [v177.1 SOTA] Accumulation Buffers
         # Rationale: Accumulate raw losses across sub-batches to provide 
         # uncertainty EMAs with the true cycle average (Fixes Smoking Gun #177/214).
         self.register_buffer("loss_accumulator", torch.zeros(num_tasks))
         self.register_buffer("task_counters", torch.zeros(num_tasks))
-        self.register_buffer("batch_counter", torch.zeros(1))
-        self.register_buffer("step_count", torch.tensor(0, dtype=torch.long))
+        self.register_buffer("batch_counter", torch.zeros([1]))
+        self.register_buffer("step_count", torch.tensor([0], dtype=torch.long))
 
     def scale_dynamics(self, n_curr: int):
         """[SOTA v2026] Unifies uncertainty decay across step densities."""
@@ -110,7 +110,7 @@ class BayesianProjectedScaler(nn.Module):
             # [v2026 SOTA] Vectorized Warmup Gate (Zero-Sync)
             self.step_count.add_(1)
             is_warmup = (self.step_count < 200)
-            curr_decay_t = torch.where(is_warmup, torch.as_tensor(0.95, device=device), self.decay)
+            curr_decay_t = torch.where(is_warmup, torch.as_tensor([0.95], device=device), self.decay)
             
             # [v2026 SOTA FIX] Atomic EMA Update (lerp_)
             # Rationale: Previous logic performed a double-update (mul_ + copy_).
@@ -129,7 +129,7 @@ class BayesianProjectedScaler(nn.Module):
                 avg_losses_all = self.loss_accumulator / (self.task_counters + 1e-8)
                 avg_losses = avg_losses_all[indices] if has_losses else torch.tensor([], device=device)
                 # [SOTA v4.0] Conservative Warmup (matches DDP case)
-                curr_decay = torch.where(self.step_count < 200, torch.as_tensor(0.95, device=device), self.decay)
+                curr_decay = torch.where(self.step_count < 200, torch.as_tensor([0.95], device=device), self.decay)
                 self.loss_emas.lerp_(avg_losses_all, 1.0 - curr_decay)
                 self.loss_accumulator.zero_()
                 self.task_counters.zero_()

@@ -185,32 +185,32 @@ class ICUAdvantageCalculator(nn.Module):
             target_ess: Target Effective Sample Size (default 20.0)
         """
         super().__init__()
-        self.register_buffer("beta", torch.tensor(1.0).float()) # Fresh Start: Default to 1.0
-        self.register_buffer("gamma", torch.tensor(gamma).float())
-        self.register_buffer("lambda_gae", torch.tensor(lambda_gae).float())
-        self.register_buffer("max_weight", torch.tensor(max_weight).float())
+        self.register_buffer("beta", torch.tensor([1.0]).float()) # Fresh Start: Default to 1.0 (Standardized to [1])
+        self.register_buffer("gamma", torch.tensor([gamma]).float())
+        self.register_buffer("lambda_gae", torch.tensor([lambda_gae]).float())
+        self.register_buffer("max_weight", torch.tensor([max_weight]).float())
         self.sparse_scale = sparse_reward_scale
         self.shaping_coef = reward_shaping_coef
         self.focal_alpha = focal_alpha
         self.target_ess = target_ess
         
         # [v2025 SOTA] State Buffers for DDP Synchronization
-        self.register_buffer("ess_buffer", torch.zeros(1))
-        self.register_buffer("ess_momentum_buffer", torch.tensor(0.15)) # Improved Target: 15%
-        self.register_buffer("clip_rate_buffer", torch.zeros(1))
+        self.register_buffer("ess_buffer", torch.zeros([1]))
+        self.register_buffer("ess_momentum_buffer", torch.tensor([0.15])) # Improved Target: 15%
+        self.register_buffer("clip_rate_buffer", torch.zeros([1]))
         
         # [SOTA 2025] Adaptive Hyperparameters
         self.adaptive_beta = adaptive_beta
         self.adaptive_clipping = adaptive_clipping
-        self.register_buffer("beta_momentum", torch.tensor(beta_momentum).float())
+        self.register_buffer("beta_momentum", torch.tensor([beta_momentum]).float())
         self.beta_gain = beta_gain              
-        self.register_buffer("clip_momentum", torch.tensor(0.90).float())
+        self.register_buffer("clip_momentum", torch.tensor([0.90]).float())
         
         # [SOTA v2026] Internal Scaled Constants
         self.base_beta_momentum = float(beta_momentum) 
-        self.register_buffer("ess_ema_decay", torch.tensor(0.95).float())
-        self.register_buffer("beta_growth_factor", torch.tensor(2.0).float())
-        self.register_buffer("beta_growth_cooldown", torch.tensor(0, dtype=torch.long))
+        self.register_buffer("ess_ema_decay", torch.tensor([0.95]).float())
+        self.register_buffer("beta_growth_factor", torch.tensor([2.0]).float())
+        self.register_buffer("beta_growth_cooldown", torch.tensor([0], dtype=torch.long))
         
         # [SOTA v38.0] Selection Recovery Floor (Configurable)
         # Rationale: Higher floor (0.8) prevents AUROC collapse by ensuring 
@@ -219,7 +219,7 @@ class ICUAdvantageCalculator(nn.Module):
         self.max_beta = 20.0
         
         # [v29.1 SOTA FIX] Whitening Momentum Stability (Abyssal #1)
-        self.register_buffer("whitening_momentum", torch.tensor(0.99).float()) 
+        self.register_buffer("whitening_momentum", torch.tensor([0.99]).float()) 
         self.base_whitening_momentum = 0.99
         
         # qSOFA thresholds
@@ -1083,11 +1083,11 @@ class ICUAdvantageCalculator(nn.Module):
             # [SOTA BUG FIX] Return ESS as Count (1..N), not Ratio (1/N..1).
             # Consumers (Probes/Logs) expect Count.
             ess = (g_sum_w ** 2) / (g_sum_w_sq + 1e-8)
-            self.ess_buffer.copy_(ess) 
+            self.ess_buffer.copy_(ess.view_as(self.ess_buffer)) 
             
             # Global Clipping Rate
             clipped_rate = g_clip_count / (g_numel + 1e-8)
-            self.clip_rate_buffer.copy_(clipped_rate)
+            self.clip_rate_buffer.copy_(clipped_rate.view_as(self.clip_rate_buffer))
             
             # [SOTA 2025] Adaptive Dynamics Update (Uses Global Statistics)
             beta_raw = self.beta.detach()
@@ -1149,6 +1149,7 @@ class ICUAdvantageCalculator(nn.Module):
         Args:
             turbo_mode: If True, uses aggressive momentum decay (0.50) for rapid adaptation.
         """
+        device = self.beta.device
         if turbo_mode:
              # [SHARP AXE] Turbo Adaptation
              # Momentum=0.0 means "Instant Update" (No history). 
@@ -1235,7 +1236,7 @@ class ICUAdvantageCalculator(nn.Module):
             # Stabilizes telemetry across jittery batches.
             # [v2026] Uses Scaled Decay
             ema_d = self.ess_ema_decay
-            self.ess_momentum_buffer.copy_(ema_d * self.ess_momentum_buffer + (1.0 - ema_d) * current_ess)
+            self.ess_momentum_buffer.copy_((ema_d * self.ess_momentum_buffer + (1.0 - ema_d) * current_ess).view_as(self.ess_momentum_buffer))
             
             # [v7.2 SOTA FIX] IronFloor: Strict runtime clamp
             # Rationale: Persistence and config overrides were bypassing the Phase 6

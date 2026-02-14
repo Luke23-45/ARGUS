@@ -155,4 +155,9 @@ scripts/dump_git_diffs.py
 pending_changes.diff
 verification_report.md
 l3.md
+# error12.md
 error12.md
+diag_gamma.py
+repro_error12.py
+tests/test_sota_components.py
+

@@ -41,7 +41,7 @@ class StableContrastiveLoss(nn.Module):
         
         # Buffer, not Parameter -> No Gradients on Centroids directly
         self.register_buffer('centroids', F.normalize(torch.randn(num_classes, d_model), dim=1))
-        self.register_buffer('initialized', torch.zeros(1, dtype=torch.bool))
+        self.register_buffer('initialized', torch.zeros([1], dtype=torch.bool))
 
     def scale_dynamics(self, n_curr: int):
         """[SOTA v2026] Unifies contrastive momentum across step densities."""
@@ -200,13 +200,15 @@ class RobustLossScaler(nn.Module):
         self.log_vars = nn.Parameter(torch.zeros(num_tasks))
         
         self.register_buffer("loss_emas", torch.zeros(num_tasks))
-        self.decay = decay
+        self.register_buffer("decay_buffer", torch.tensor([decay]).float())
+        self.decay = decay # Keep for non-buffer access if needed
 
     def scale_dynamics(self, n_curr: int):
         """[SOTA v2026] Unifies uncertainty decay across step densities."""
         if n_curr <= 0: return
         # Baseline 0.99 for 200 steps
-        self.decay = ScalingSteward.get_decay(0.99, n_curr)
+        self.decay_buffer.fill_(ScalingSteward.get_decay(0.99, n_curr))
+        self.decay = float(self.decay_buffer.item())
 
     def forward(self, losses: List[torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
@@ -217,7 +219,7 @@ class RobustLossScaler(nn.Module):
         
         # 2. Update EMAs (Zero-Sync)
         with torch.no_grad():
-            self.loss_emas.lerp_(L.detach(), 1.0 - self.decay)
+            self.loss_emas.lerp_(L.detach(), 1.0 - self.decay_buffer)
             
             # Dynamic Floor Calculation
             # If loss > 5.0, floor = 5.0, else 2.0
