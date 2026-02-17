@@ -185,7 +185,7 @@ class ICUAdvantageCalculator(nn.Module):
             target_ess: Target Effective Sample Size (default 20.0)
         """
         super().__init__()
-        self.register_buffer("beta", torch.tensor([1.0]).float()) # Fresh Start: Default to 1.0 (Standardized to [1])
+        self.register_buffer("beta", torch.tensor([beta]).float()) # [v2026 FIX] Apply constructor arg to buffer
         self.register_buffer("gamma", torch.tensor([gamma]).float())
         self.register_buffer("lambda_gae", torch.tensor([lambda_gae]).float())
         self.register_buffer("max_weight", torch.tensor([max_weight]).float())
@@ -305,7 +305,8 @@ class ICUAdvantageCalculator(nn.Module):
             self.stats_initialized.fill_(True)
         else:
             self.adv_std.fill_(std if std > 1e-6 else 1.0)
-            self.stats_count.fill_(count)
+            if count is not None:
+                self.stats_count.fill_(count)
             self.stats_initialized.fill_(True)
         
         if beta is not None:
@@ -829,17 +830,15 @@ class ICUAdvantageCalculator(nn.Module):
         else:
             adv_flat = advantages.reshape(-1)
 
-        # [Operation: SHARP AXE] Forced Recalibration (Heartbeat)
-        # [CRITICAL FIX v2026-02-10] ALWAYS force recalibrate in turbo_mode
-        # The previous code required stats_initialized=False, but during resumption
-        # we restore AWR state which sets stats_initialized=True, so recalibration
-        # never triggered! Now we ALWAYS recalibrate on first turbo step.
-        if turbo_mode and adv_flat.numel() > 0:
-             # Instant Global Sync
+        # [Operation: SHARP AXE] Forced Recalibration (Heartbeat) - Global Participation Fix
+        if turbo_mode:
              if dist.is_initialized():
-                  l_sum = adv_flat.sum()
-                  l_sq_sum = (adv_flat ** 2).sum()
-                  l_count = torch.tensor(float(adv_flat.numel()), device=adv_flat.device)
+                  # EVERY rank MUST participate in the all_reduce regardless of local batch size
+                  # to prevent deadlocks. Empty ranks send [0, 0, 0].
+                  l_sum = adv_flat.sum() if adv_flat.numel() > 0 else torch.tensor(0.0, device=advantages.device)
+                  l_sq_sum = (adv_flat ** 2).sum() if adv_flat.numel() > 0 else torch.tensor(0.0, device=advantages.device)
+                  l_count = torch.tensor(float(adv_flat.numel()), device=advantages.device)
+                  
                   stats = torch.stack([l_sum, l_sq_sum, l_count])
                   dist.all_reduce(stats, op=dist.ReduceOp.SUM)
                   g_sum, g_sq, g_count = stats[0], stats[1], stats[2]
@@ -849,7 +848,7 @@ class ICUAdvantageCalculator(nn.Module):
                        var = (g_sq / g_count) - (mu ** 2)
                        sigma = torch.sqrt(var.clamp(min=1e-5))
                        self.set_stats(mu, sigma, count=500)
-             else:
+             elif adv_flat.numel() > 1:
                   mu = adv_flat.mean()
                   sigma = adv_flat.std().clamp(min=1e-5)
                   self.set_stats(mu, sigma, count=500)
@@ -978,9 +977,11 @@ class ICUAdvantageCalculator(nn.Module):
         else:
             z_batch = z_global
             
-        # 3. Hybrid Mixing (80% Global / 20% Batch)
-        # Keeps alignment with global value scale while ensuring >0 gradients for best local samples.
-        alpha_bln = 0.8
+        # 3. Hybrid Mixing (100% Global / 0% Batch)
+        # [v2026 SOTA] Globalized Selection Pressure (Smoking Gun #Divergence)
+        # Rationale: Local Z-scoring adds variance across ranks. 100% Global 
+        # ensures all GPUs agree on which clinical samples have high advantage.
+        alpha_bln = 1.0 
         norm_adv = (alpha_bln * z_global) + ((1 - alpha_bln) * z_batch)
         
         # 4. FP16 Safety Clamp (prevent exp explosion)

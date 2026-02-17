@@ -55,15 +55,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import pytorch_lightning as pl
-import torchmetrics.functional as tm_func # [SOTA FIX] Stateless Metrics
+import torchmetrics.functional as tm_func
 from tqdm.auto import tqdm
 from typing import Any, Dict, Optional, Tuple, List, Union
-from omegaconf import DictConfig
+import contextlib # [v2026] Required for DDP Iron Dome
 import logging
+from omegaconf import DictConfig
 import math
 import numpy as np
 import random
-import contextlib
 import traceback
 
 # [v2025 SOTA] Implementation Imports
@@ -177,20 +177,20 @@ class DynamicClassBalancer(nn.Module):
              self.initialized.fill_(True)
 
     def update(self, y: torch.Tensor):
+        """Standardizes class statistics across all DDP ranks."""
+        y = y.long()
+        b_counts = torch.bincount(y, minlength=self.num_classes).float()
+        
+        # [v2026 SOTA FIX] Unified Initial Consensus (Smoking Gun #DDP-Init-Bias)
+        # Rationale: Ranks must share the same 'Ground Zero' statistics.
+        if dist.is_initialized():
+            dist.all_reduce(b_counts, op=dist.ReduceOp.SUM)
+            b_counts /= dist.get_world_size()
+
         if not self.initialized:
-            y = y.long()
-            b_counts = torch.bincount(y, minlength=self.num_classes).float()
             self.counts.copy_(b_counts + 1.0)
             self.initialized.fill_(True)
         else:
-            y = y.long()
-            b_counts = torch.bincount(y, minlength=self.num_classes).float()
-            
-            # [SOTA 2025] DDP Global Sync
-            if dist.is_initialized():
-                dist.all_reduce(b_counts, op=dist.ReduceOp.SUM)
-                b_counts /= dist.get_world_size()
-            
             new_counts = self.beta * self.counts + (1 - self.beta) * b_counts
             self.counts.copy_(new_counts)
 
@@ -555,6 +555,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
         return super().load_state_dict(state_dict, strict=strict)
     
     
+    def _get_scaler(self):
+        """[v2026 SOTA] Safe GradScaler accessor (Smoking Gun #FP32-Crash).
+        Returns None if no scaler exists (FP32 mode or incompatible Lightning version).
+        """
+        return getattr(getattr(self.trainer, 'precision_plugin', None), 'scaler', None)
+    
     def on_train_start(self):
         """[SOTA v2026] Unified Mathematical Hyperparameter Scaling."""
         # Detect the actual number of iterations per epoch (e.g., 1176 vs 200)
@@ -580,6 +586,40 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # for TrendSentinel buffers (grad_norm_ema) to align with current dynamics.
         # This prevents "False Shock" detection from freezing the curriculum.
         self.resumption_grace_steps.fill_(50)
+
+        # [v48.1 SOTA FIX] Resumption Accumulation Reset (Smoking Gun #90)
+        # Rationale: PyTorch/Lightning does NOT restore .grad buffers or 
+        # unregistered accumulation state. If we resume with a non-zero 
+        # grad_accum_idx, the first update will be under-estimated.
+        if self.trainer.ckpt_path is not None:
+             logger.info("🛡️ [RESUME] Resetting accumulation buffers to ensure mathematical parity.")
+             self.grad_accum_idx.fill_(0)
+             self.gn_acc_count.fill_(0)
+             self.gn_loss_accumulator.zero_()
+             
+             # [v2026 SOTA FIX] Loss Scaler Accumulation Reset (Smoking Gun #Resume-Pollution)
+             # Rationale: If resuming mid-epoch, scaler buffers might contain partial sums.
+             # Since we reset grad_accum_idx to 0, we must also clear the scaler to match.
+             if hasattr(self, "loss_scaler") and hasattr(self.loss_scaler, "loss_accumulator"):
+                  self.loss_scaler.loss_accumulator.zero_()
+                  self.loss_scaler.task_counters.zero_()
+                  self.loss_scaler.batch_counter.zero_()
+                  
+             if hasattr(self, "grad_ref_buffer") and self.grad_ref_buffer is not None:
+                  self.grad_ref_buffer.zero_()
+                  
+             # [v2026 SOTA FIX] Ghost Bank Shadow Sync (Smoking Gun #Desync)
+             if hasattr(self, "ghost_bank") and hasattr(self.ghost_bank, "_shadow_size"):
+                  self.ghost_bank._shadow_size = int(self.ghost_bank.size)
+                  self.ghost_bank._shadow_ptr = int(self.ghost_bank.ptr)
+                  self.ghost_bank._shadow_is_full = bool(self.ghost_bank.is_full)
+                  logger.info("🛡️ [RESUME] Ghost Bank Shadows Synchronized.")
+                  
+             # [v2026 SOTA FIX] TCB Shadow Sync (Smoking Gun #Desync)
+             if hasattr(self, "tcb_buffer") and hasattr(self.tcb_buffer, "_shadow_ptr"):
+                  self.tcb_buffer._shadow_ptr = int(self.tcb_buffer.queue_ptr)
+                  self.tcb_buffer._shadow_filled = int(self.tcb_buffer.queue_filled)
+                  logger.info("🛡️ [RESUME] TCB Shadows Synchronized.")
         
         # [v12.0 SOTA] Initialize CPU Shadows
         self._shadow_grad_accum_idx = int(self.grad_accum_idx)
@@ -756,17 +796,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 self.ghost_bank.refresh_anchors(ghost_encoder_fn, decay=0.3)
                 logger.info("👻 [RESUME] Ghost Bank anchors refreshed (Manifold Aligned).")
 
-        # 2.3 GradNorm Optimizer (Fix #340)
-        if hasattr(self, "pending_gn_opt_state") and self.gradnorm is not None:
-             if self.gradnorm.optimizer is None:
-                  # Force initialization so we can load the state
-                  self.gradnorm.optimizer = torch.optim.Adam([self.gradnorm.weights], lr=0.005)
+        # 2.3 GradNorm Optimizer (The Amnesia Fix #v2026)
+        # Rationale: Direct state restoration ensures bit-perfect parity 
+        # for task weighting momentums and loss anchors.
+        if hasattr(self, "pending_gn_state") and self.gradnorm is not None:
              try:
-                 self.gradnorm.optimizer.load_state_dict(self.pending_gn_opt_state)
-                 logger.info("✅ [RESUME] GradNorm optimizer state restored.")
+                 self.gradnorm.load_gradnorm_state(self.pending_gn_state)
+                 logger.info("✅ [RESUME] GradNorm Engine internal state restored.")
              except Exception as e:
                  logger.warning(f"⚠️ [RESUME] GradNorm restoration failed: {e}")
-             del self.pending_gn_opt_state
+             del self.pending_gn_state
 
         # [v52.0 SOTA FIX] Grand Unified Consensus (Smoking Gun #MasterAudit)
         # Rationale: Bit-perfect parity across all meta-parameters and historical buffers.
@@ -958,7 +997,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # [v29.5 SOTA FIX] Resumption-Invariant Curriculum (Smoking Gun #4)
         # Rationale: Anchor progress to self.global_step to prevent time-jumps 
         # when resuming mid-epoch (batch_idx resets, but global_step is persistent).
-        accum = getattr(self.trainer, "accumulate_grad_batches", 1)
+        accum = self.cfg.train.get("accumulate_grad_batches", 1)
         total_steps = self.global_step * accum
         ref_progress = total_steps / ScalingSteward.REF_STEPS
         
@@ -967,13 +1006,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
         ema_bc, std_bc = TrendSentinel.get_stats(self.grad_norm_ema, self.grad_norm_std, self.grad_ema_decay, self.grad_norm_step_count)
         
         # [v2026 SOTA] Zero-Sync Shock Check
-        # we check on rank 0 and use result, or just trust global step
         is_shock_t = TrendSentinel.is_unstable(ema_bc, std_bc, max_pressure=5.0, max_sigma=2.0)
+        skip_update = 1.0 if (is_shock_t and self._shadow_resumption_grace_steps == 0) else 0.0
         
-        if is_shock_t and self._shadow_resumption_grace_steps == 0:
-            # Manifold Shock: Hold current curriculum to prevent further destabilization
-            return
-
         # 2. Gamma: Step-Invariant Horizon Ramp (Abyssal #5)
         new_gamma = self.horizon_scheduler.get_gamma_step(total_steps)
         # Note: We'll update the buffer after the potential DDP sync below
@@ -1013,11 +1048,20 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
         # 7. Update and Synchronize (Broadcast Rank 0 to others)
         if dist.is_initialized():
-             vars_tensor = torch.tensor([tau_val, sigma_val, curr_beta, float(new_gamma), phys_clamp_val], device=self.device)
+             # [v2026 SOTA FIX] Unified Synchronous Handshake (Deadlock Prevention)
+             # Rationale: All ranks MUST participate in the broadcast. If Rank 0 
+             # skips due to shock, it must tell others to skip too.
+             vars_tensor = torch.tensor([tau_val, sigma_val, curr_beta, float(new_gamma), phys_clamp_val, skip_update], device=self.device)
              dist.broadcast(vars_tensor, src=0)
              # Unpack synced values
-             tau_val, sigma_val, curr_beta, new_gamma, phys_clamp_val = vars_tensor.tolist()
+             tau_val, sigma_val, curr_beta, new_gamma, phys_clamp_val, skip_update = vars_tensor.tolist()
         
+        # [v2026 SOTA] Atomic Skip (Post-Sync)
+        if skip_update > 0.5:
+             # Manifold Shock: Hold current curriculum to prevent further destabilization
+             return
+
+        # 8. Update Buffers
         # [v2026 SOTA] Atomic Buffer Registration (Atomic #1)
         # Rationale: Using .fill_() is safe for both floats and tensors.
         self.curr_tau.fill_(tau_val)
@@ -1053,13 +1097,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
         total_loss = 0.0 # Default for telemetry
         loss_dict = {} # Default for telemetry
+        logs = {}      # [Patch 2] Default for telemetry
+        gn_loss = torch.tensor(0.0, device=self.device) # [Patch 2] Default for telemetry
         opt = self.optimizers()
         B = batch["observed_data"].size(0)
         
         # [v48.0 SOTA FIX] Stateful Accumulation Index (Smoking Gun #90)
-        # Rationale: Replaces volatile batch_idx to ensure cycle parity on resume.
         self._shadow_grad_accum_idx += 1
-        acc_batches = self.trainer.accumulate_grad_batches
+        acc_batches = self.cfg.train.get("accumulate_grad_batches", 1)
         is_last_batch = (batch_idx + 1) == self.trainer.num_training_batches
         should_step = (self._shadow_grad_accum_idx >= acc_batches) or is_last_batch
         
@@ -1141,10 +1186,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             else:
                 stability_factor = torch.as_tensor(stability_factor, device=self.device)
             
-            # [v2026 SOTA] Zero-Sync Logging
-            # Only log to prog_bar every 50 steps to avoid host-device stalls.
-            use_pb = (batch_idx % 50 == 0)
-            self.log("train/manifold_stability", stability_factor, on_step=True, prog_bar=use_pb)
+            self.log("train/manifold_stability", stability_factor, on_step=True, prog_bar=True)
             self.log("gov/stability_factor_p", stab_p, on_step=True)
 
         # [PHASE 1] Dynamic Risk Scoring
@@ -1327,7 +1369,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 ctx_aux.register_hook(lambda grad: grad * trust_factor)
             
             # [v2026 SOTA] Periodic Progress Bar
-            self.log("train/pms_trust_factor", trust_factor, on_step=True, prog_bar=(batch_idx % 50 == 0))
+            self.log("train/pms_trust_factor", trust_factor, on_step=True, prog_bar=True)
             
             self.class_balancer.update(targets)
             class_weights = self.class_balancer.get_weights().to(self.device)
@@ -1696,6 +1738,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # Legacy manual hooks removed in v3.1.5 in favor of Unified Pass + 
         # Asymmetric Throttling via ctx_aux path.
         
+        # [v2026 SOTA] Unified Task Initialization (Smoking Gun #NameError)
+        # Rationale: Ensures all variables are defined regardless of branching path.
+        l_bgsl = torch.tensor(0.0, device=self.device, requires_grad=True)
+        l_tcb = torch.tensor(0.0, device=self.device, requires_grad=True)
+        phys_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        
         # --- 4. Multi-Task Balancing Logic ---
         if self.balancing_mode == "sota_2025":
             # [SOTA 2025] Single-Pass Uncertainty Weighting
@@ -1746,15 +1794,19 @@ class ICUGeneralistWrapper(pl.LightningModule):
             
             # [v5.2] Manifold Sync: Use the SOTA SequenceAuxHead for BGSL supervision
             # We call the aux_head with return_sequence=True to get [B, T, C]
-            aux_seq_out = self.model.aux_head(ctx_expert, return_sequence=True)
-            logits_seq = aux_seq_out["logits"]
-            
-            if logits_seq.shape[-1] > 1:
-                # [SOTA Alignment] Convert multi-class logits to a single "Sepsis Risk" logit
-                # Formula: logit(p_sepsis) = logsumexp(sepsis_channels) - logit(stable_channel)
-                pred_state = logits_seq[..., 1:].logsumexp(dim=-1, keepdim=True) - logits_seq[..., 0:1]
+            if hasattr(self.model, "aux_head"):
+                aux_seq_out = self.model.aux_head(ctx_expert, return_sequence=True)
+                logits_seq = aux_seq_out["logits"]
+                
+                if logits_seq.shape[-1] > 1:
+                    # [SOTA Alignment] Convert multi-class logits to a single "Sepsis Risk" logit
+                    pred_state = logits_seq[..., 1:].logsumexp(dim=-1, keepdim=True) - logits_seq[..., 0:1]
+                else:
+                    pred_state = logits_seq
             else:
-                pred_state = logits_seq
+                # [v2026 SOTA] Robust Fallback
+                # If aux_head is disabled (e.g. for simple diffusion tests), use dummy state.
+                pred_state = torch.zeros(B, ctx_expert.size(1), 1, device=self.device)
             
             # [v5.1 SOTA] Surgical Signal Preservation
             # 0.1 Smoothing: 1.0 -> 0.95, 0.0 -> 0.05
@@ -1905,9 +1957,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
             
             loss_dict['phys'] = phys_loss_raw * phys_scale
 
-            # [v177.0 SOTA FIX] Accumulation-Aware Scaling (Smoking Gun #177)
             # Rationale: EMA updates must only occur on the stepping batch.
-            acc_batches = self.trainer.accumulate_grad_batches
+            acc_batches = self.cfg.train.get("accumulate_grad_batches", 1)
+            
+            # [SOTA FIX v33.3] Epoch Boundary Alignment (Deep Forensic Fix)
             
             # [SOTA FIX v33.3] Epoch Boundary Alignment (Deep Forensic Fix)
             # Rationale: 'is_accumulating' must be exactly 'not should_step'.
@@ -2133,8 +2186,6 @@ class ICUGeneralistWrapper(pl.LightningModule):
             
 
             
-            gn_loss = torch.tensor(0.0, device=self.device)
-            
             # Weights for logging (Sigmas)
             task_weights = [
                 logs.get('weight/diffusion', torch.tensor(1.0, device=self.device)), 
@@ -2167,20 +2218,22 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 self.gn_acc_count.add_(1)
             # [v30.5 SOTA] Step-Level GradNorm Update
             # Meta-weights now only react to clean, finished gradients.
-            gn_loss = torch.tensor(0.0, device=self.device)
             # Use cached weights for projection; update happens in step block.
             task_weights = self.gradnorm.get_weights().detach()
             
             # 2. Weighted losses for CAGrad surgery
-            # [v33.4 FIX] Full Task Synchronization (Forensic #33.4)
+            # [v2026 SOTA FIX] Unified Connectivity Guard (Deadlock Prevention)
+            # Rationale: manual_backward on a tensor without grad_fn skips DDP sync.
+            # We add 0.0 * first_param to every task to ENSURE all ranks sync together.
+            first_p = next(self.parameters())
             weighted_tasks = [
-                diff_loss_unweighted * task_weights[0], 
-                critic_loss * task_weights[1], 
-                aux_loss * task_weights[2], 
-                acl_loss * task_weights[3],
-                l_bgsl * task_weights[4],
-                l_tcb * task_weights[5],
-                phys_loss * task_weights[6]
+                (diff_loss_unweighted * task_weights[0]) + 0.0 * first_p, 
+                (critic_loss * task_weights[1]) + 0.0 * first_p, 
+                (aux_loss * task_weights[2]) + 0.0 * first_p, 
+                (acl_loss * task_weights[3]) + 0.0 * first_p,
+                (l_bgsl * task_weights[4]) + 0.0 * first_p,
+                (l_tcb * task_weights[5]) + 0.0 * first_p,
+                (phys_loss * task_weights[6]) + 0.0 * first_p
             ]
             total_loss = torch.stack([t.detach() for t in weighted_tasks]).sum()
             loss_dict = {
@@ -2196,15 +2249,32 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # the weight updates, ensuring valid gradient graphs.
             self._gn_loss_step = None
             if should_step:
-                 self._gn_loss_step, _ = self.gradnorm.update(primary_losses)
+                 # [v2026 SOTA FIX] AMP-Safe Meta-Update (Forensic #358)
+                 # Rationale: Pass the trainer's scaler to GradNorm to ensure 
+                 # task gradients don't underflow in mixed-precision.
+                 scaler = self._get_scaler()
+                 self._gn_loss_step, _ = self.gradnorm.update(primary_losses, scaler=scaler)
+                 if self._gn_loss_step is not None:
+                      gn_loss = self._gn_loss_step.detach()
 
             # 4. Conflict-Averse Surgery (Backward Pass)
-            is_start_of_accum = (batch_idx % self.trainer.accumulate_grad_batches == 0)
-            opt.pc_backward(
-                weighted_tasks, 
-                backward_fn=self.manual_backward, 
-                accumulate=not is_start_of_accum
-            )
+            # [v2026 SOTA] DDP Iron Dome (Smoking Gun #SyncLatency)
+            # Rationale: no_sync prevents redundant DDP grad-reductions during accumulation.
+            # We only sync on the final 'should_step' batch.
+            is_start_of_accum = (batch_idx % acc_batches == 0)
+            
+            context = contextlib.nullcontext()
+            if dist.is_initialized() and not should_step:
+                # [ROBUSTNESS] Check if strategy supports no_sync (DDP/DeepSpeed usually do)
+                if hasattr(self.trainer.strategy, "model") and hasattr(self.trainer.strategy.model, "no_sync"):
+                    context = self.trainer.strategy.model.no_sync()
+            
+            with context:
+                opt.pc_backward(
+                    weighted_tasks, 
+                    backward_fn=self.manual_backward, 
+                    accumulate=not is_start_of_accum
+                )
             
             # [v26.1 Unified Fix] 
             # physics_loss is now part of the scaled_total within loss_dict.
@@ -2225,7 +2295,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             if self.gradnorm is not None and hasattr(self.gradnorm, 'weights'):
                 meta_params.append(self.gradnorm.weights)
 
-            acc_norm = getattr(self.trainer, 'accumulate_grad_batches', 1)
+            acc_norm = self.cfg.train.get("accumulate_grad_batches", 1)
             raw_pressure = OrthogonalGuard.compute_grad_norm(self.model, extra_params=meta_params)
             current_grad_pressure = raw_pressure / float(acc_norm)
             
@@ -2277,10 +2347,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
                              self.last_logged_bucket = pct
             self.log("train/manifold_norm_std", self.grad_norm_std, on_step=True)
 
-        # [v48.0 SOTA FIX] Stateful Accumulation Index (Smoking Gun #90)
         # Rationale: Manually manage accumulation for precise DDP synchronization
         # and bit-perfect resumption.
-        acc_batches = self.trainer.accumulate_grad_batches
+        acc_batches = self.cfg.train.get("accumulate_grad_batches", 1)
         
         # is_last_batch was calculated at the start of training_step
         if should_step:
@@ -2301,8 +2370,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
                     torch._foreach_mul_( [p.grad for p in params_with_grad], scale )
 
             # [SOTA FIX] Manual unscaling required for AdamW (Standard Protocol)
-            if self.trainer.precision_plugin.scaler is not None:
-                self.trainer.precision_plugin.scaler.unscale_(opt)
+            scaler = self._get_scaler()
+            if scaler is not None:
+                scaler.unscale_(opt)
 
             # [v26.0] SOTA Gradient Safety Block
             grad_norm_val = 0.0
@@ -2313,7 +2383,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # [v27.1 FIX] Scale clip threshold with accumulation steps
             # Rationale: Accumulated gradients scale as √(accum_steps)
             # Without scaling, accum=16 retains only 38.6% of gradient info vs 100% for accum=1
-            accum_steps = getattr(self.trainer, 'accumulate_grad_batches', 1)
+            accum_steps = self.cfg.train.get("accumulate_grad_batches", 1)
             if accum_steps > 1:
                 clip_val = clip_val * (accum_steps ** 0.5)
             
@@ -2358,18 +2428,31 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 should_apply = (clip_val <= 0) or torch.isfinite(grad_norm_val)
 
             if should_apply:
+                # [v2026 SOTA FIX] Unified Scalar Consensus (Smoking Gun #ScalarDrift)
+                # Rationale: Different ranks may have different local scale factors.
+                # We enforce global consensus and unscale before reduction to ensure parity.
+                scaler = self._get_scaler()
+                if dist.is_initialized() and scaler is not None:
+                    scale_t = torch.tensor([scaler.get_scale()], device=self.device)
+                    dist.all_reduce(scale_t, op=dist.ReduceOp.MIN)
+                    scaler._scale = scale_t # Force bit-perfect consensus
+                
                 # [v118.3 SOTA FIX] Meta-Gradient Sync (Smoking Gun #118.3)
                 # Rationale: loss_scaler parameters are not wrapped in DDP.
-                # Explicitly sync their gradients to prevent priority drift.
                 if dist.is_initialized() and hasattr(self, "loss_scaler"):
+                    inv_scale = 1.0 / (scaler.get_scale() + 1e-8) if scaler is not None else 1.0
                     for p in self.loss_scaler.parameters():
                         if p.requires_grad and p.grad is not None:
+                            # [v2026 SOTA] Pre-Reduction Unscaling
+                            # Rationale: Must be unscaled BEFORE all_reduce for rank parity.
+                            p.grad.mul_(inv_scale)
                             dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
                             p.grad /= dist.get_world_size()
 
                 # [SOTA FIX] Scalar-aware step for FP16 Stability
-                if self.trainer.precision_plugin.scaler is not None:
-                    self.trainer.precision_plugin.scaler.step(opt)
+                scaler_local = self._get_scaler()
+                if scaler_local is not None:
+                    scaler_local.step(opt)
                 else:
                     opt.step()
                 
@@ -2399,17 +2482,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
                     ema_bc, std_bc = current_grad_pressure, 0.5
                 
                 # [v30.1 SOTA FIX] Safe Sentinel Initialization (Smoking Gun #2)
-                # Rationale: Handle conclusion outside the grace block to ensure reachability.
-                if grace_val == 0:
-                    if self.global_step < 100:
-                        self.grad_norm_ema.fill_(current_grad_pressure)
-                        self.grad_norm_std.fill_(0.5) 
-                        logger.info(f"🛡️ [PMS] Initialization Complete. GN Baseline: {current_grad_pressure.item():.4f}")
-                    else:
-                        # Log conclusion once (Note: logic for 'once' is handled by grace decrement)
-                        # but we only log if we were actually IN grace (checked via step count or flag).
-                        # For simplicity, we preserve the original log logic.
-                        logger.info("🛡️ [PMS] Resumption Grace Period Concluded (Stats Preserved).")
+                # Rationale: Only log conclusion ONCE when transitioning from 1 to 0.
+                if grace_val == 0 and self.global_step < 100:
+                    self.grad_norm_ema.fill_(current_grad_pressure)
+                    self.grad_norm_std.fill_(0.5) 
+                    logger.info(f"🛡️ [PMS] Initialization Complete. GN Baseline: {current_grad_pressure.item():.4f}")
+                elif self._shadow_resumption_grace_steps == 1 and should_step:
+                    # Rationale: We are about to decrement to 0 on a stepping batch.
+                    logger.info("🛡️ [PMS] Resumption Grace Period Concluded (Stats Preserved).")
                 
                 if grace_val <= 0:
                     ema_bc, std_bc = TrendSentinel.update_stats(
@@ -2427,46 +2507,20 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 # [v48.0] Cycle Reset
                 self._shadow_grad_accum_idx = 0
                 
-                # [v12.0 SOTA] Grace Period Step
-                if self._shadow_resumption_grace_steps > 0:
-                    self._shadow_resumption_grace_steps -= 1
+                # [v2026 CLEANUP] Grace Period decrement MOVED to batch-level (line ~2637)
+                # to avoid double-decrement on stepping batches.
 
                 # [v30.5 SOTA] Legacy GradNorm Step
                 # Protected from spikes and scaled correctly.
-                if self.balancing_mode == "legacy_surgical":
-                     # [v107.0 SOTA FIX] GradNorm Accumulation Parity (Smoking Gun #107)
-                     # [v31.0 SOTA FIX] DDP Consensus (Abyssal #320)
-                     # Rationale: All ranks must update Meta-Weights using the global data.
-                     # [v33.5 SOTA FIX] Pre-Captured GradNorm Update (Abyssal #358)
-                     # Use the gn_loss_step captured before the graph was freed.
-                     gn_loss_step = self._gn_loss_step
-                     
-                     if gn_loss_step is not None:
-                          # Reset Accumulator
-                          self.gn_loss_accumulator.zero_()
-                          self.gn_acc_count.fill_(0)
-                          
-                          self.gradnorm.optimizer.zero_grad()
-                          if self.trainer.precision_plugin.scaler is not None:
-                               self.manual_backward(self.trainer.precision_plugin.scaler.scale(gn_loss_step))
-                               self.trainer.precision_plugin.scaler.unscale_(self.gradnorm.optimizer)
-                          else:
-                               self.manual_backward(gn_loss_step)
-                          
-                          # [v33.3 SOTA FIX] Meta-Weight Gradient Sync (Forensic Fix #358)
-                          # Rationale: DDP drift proven in test_z1_gradnorm_ddp_drift.py.
-                          # Explicitly sync weight gradients before the step.
-                          if dist.is_initialized():
-                               for p in self.gradnorm.parameters():
-                                   if p.requires_grad and p.grad is not None:
-                                       dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-                                       p.grad /= dist.get_world_size()
-
-                          # Step
-                          if self.trainer.precision_plugin.scaler is not None:
-                               self.trainer.precision_plugin.scaler.step(self.gradnorm.optimizer)
-                          else:
-                               self.gradnorm.optimizer.step()
+                # [v2026 CLEANUP] GradNorm Legacy Step Block REMOVED (Smoking Gun #DoubleStep)
+                # Rationale: gradnorm.update() (gradnorm.py L146-152) now performs 
+                # backward() + clip + step() internally. The old legacy code here was 
+                # attempting the same on a .detach()ed loss (producing zero gradients)
+                # but the spurious scaler.step() call corrupted _growth_tracker counts.
+                # The accumulator reset is still needed:
+                if self.balancing_mode == "legacy_surgical" and self._gn_loss_step is not None:
+                     self.gn_loss_accumulator.zero_()
+                     self.gn_acc_count.fill_(0)
             else:
                 logger.warning(f"⚠️ Gradient Spike Detected (Norm={grad_norm_val.item():.2f}). Skipping optimization step for batch {batch_idx}.")
             
@@ -2476,8 +2530,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
             opt.zero_grad()
 
             # [SOTA FIX] Update scaler factor after step or skip
-            if self.trainer.precision_plugin.scaler is not None:
-                self.trainer.precision_plugin.scaler.update()
+            scaler = self._get_scaler()
+            if scaler is not None:
+                scaler.update()
 
             sch = self.lr_schedulers()
             if sch is not None:
@@ -2535,8 +2590,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 "uncertainty": flat_unc
             }
 
-            # 2. Perform Gather (Unconditionally)
-            gathered_flat = self.ddp_gatherer.gather_fused_batch(local_dict)
+            # 2. Perform Gather (DDP-aware with single-GPU fallback)
+            if self.ddp_gatherer is not None:
+                gathered_flat = self.ddp_gatherer.gather_fused_batch(local_dict)
+            else:
+                # Single-GPU fallback: concatenate local tensors into the same flat format
+                if flat_vitals.size(0) > 0:
+                    gathered_flat = torch.cat([flat_vitals, flat_masks, flat_labels, flat_latents, flat_unc], dim=1)
+                else:
+                    gathered_flat = flat_vitals.new_empty(0, T*F_feat + T*F_feat + 1 + D + 1)
 
             # 3. Unpack and Update
             if gathered_flat.size(0) > 0:
@@ -2574,10 +2636,6 @@ class ICUGeneralistWrapper(pl.LightningModule):
             if self._shadow_resumption_grace_steps > 0:
                 self._shadow_resumption_grace_steps -= 1
 
-            # [v2026 SOTA] Periodic Progress Bar (Zero-Sync)
-            # Rationale: Logging to prog_bar every step triggers a host-device sync.
-            # We restrict this to every 50 batches to achieve 250+ iteration speed.
-            show_pb = (batch_idx % 50 == 0)
             self.log_dict({
                 "total_loss": total_loss,
                 "diff_loss": diff_loss,
@@ -2591,10 +2649,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 "explained_var": ev,
                 "ood_score": uncertainty[:B].mean(), # [FIX] Map to local variable, slice to main batch
                 "bank_size": self.ghost_bank.size.float(),
+                "clinical_snr": (aux_loss * (logs.get('weight/aux', 1.0) if 'logs' in locals() else 1.0)) / (diff_loss * (logs.get('weight/diffusion', 1.0) if 'logs' in locals() else 1.0) + 1e-8),
                 "curr_phys_weight": torch.as_tensor(curr_phys_weight, device=self.device).detach().clone(),
                 "w_aux": torch.as_tensor(task_weights[2], device=self.device).detach().clone(),
                 "lr": torch.as_tensor(self.optimizers().param_groups[0]["lr"], device=self.device).detach().clone()
-            }, on_step=True, on_epoch=False, prog_bar=show_pb)
+            }, on_step=True, on_epoch=False, prog_bar=True)
 
             # [TELEMETRY] Detailed Diagnostics (WandB Only)
             with torch.no_grad():
@@ -3027,10 +3086,6 @@ class ICUGeneralistWrapper(pl.LightningModule):
              # 'decay=0.3' is the Goldilocks zone (70% alignment gain, 3x history retention).
              self.ghost_bank.refresh_anchors(ghost_encoder_fn, decay=0.3)
 
-             # [SOTA SAFETY FIX] Verify Loss Scaler Hygiene (Deep Forensic Guard)
-             # Rationale: Prevent "Epoch Bleed" where accumulator logic fails at boundaries.
-             if hasattr(self, "loss_scaler") and hasattr(self.loss_scaler, "assert_clean"):
-                 self.loss_scaler.assert_clean()
 
              # [v2026 RAM SPIKE FIX] Memory Clearing (Smoking Gun #RAM-01)
              # Rationale: Ghost Refresh creates ~500MB of activations that must be freed
@@ -3040,6 +3095,20 @@ class ICUGeneralistWrapper(pl.LightningModule):
                  torch.cuda.empty_cache()
              if self.trainer.is_global_zero:
                  logger.info("🧹 [MEMORY] Ghost Refresh activations cleared.")
+
+        # [SOTA SAFETY FIX] Verify Loss Scaler Hygiene (Deep Forensic Guard)
+        # Rationale: Prevent "Epoch Bleed" where accumulator logic fails at boundaries.
+        if hasattr(self, "loss_scaler") and hasattr(self.loss_scaler, "assert_clean"):
+            self.loss_scaler.assert_clean()
+
+    def on_validation_epoch_start(self):
+        """[v2026 SOTA] Robustness Guard: Ensures validation buffers are fresh."""
+        self.validation_step_outputs.clear()
+
+    def on_test_epoch_start(self):
+        """[v2026 SOTA] Robustness Guard: Ensures test buffers are fresh."""
+        if hasattr(self, "validation_step_outputs"):
+            self.validation_step_outputs.clear()
 
     def on_validation_epoch_end(self):
         """
@@ -3053,19 +3122,23 @@ class ICUGeneralistWrapper(pl.LightningModule):
              # [v4.2.1 SOTA] Synchronized Tensor Gathering (Smoking Gun #RAM-03)
              # Rationale: Gathering a list of 10,000 dicts via all_gather_object
              # causes massive pickling overhead and transient RAM spikes.
-             # Fix: Concatenate locally first, then gather the single large tensors.
-             world_size = dist.get_world_size()
-             gathered_probs = [None] * world_size
-             gathered_labels = [None] * world_size
-             dist.all_gather_object(gathered_probs, local_probs)
-             dist.all_gather_object(gathered_labels, local_labels)
-             all_probs = torch.cat([p for p in gathered_probs if p.numel() > 0])
-             all_labels = torch.cat([l for l in gathered_labels if l.numel() > 0])
+             # Fix: Use the zero-copy optimized gatherer for raw tensors.
+             all_probs = torch.cat(SOTA_DistributedGatherer.gather_asymmetric(local_probs), dim=0).cpu()
+             all_labels = torch.cat(SOTA_DistributedGatherer.gather_asymmetric(local_labels), dim=0).cpu()
         else:
              all_probs = local_probs.cpu()
              all_labels = local_labels.cpu()
         
+        # [v2026 SOTA] Explicit Memory Release
+        # Rationale: local_probs/local_labels are already in the all_* tensors.
+        # Clearing the list early prevents keeping dual copies in VRAM.
+        self.validation_step_outputs.clear()
+        import gc
+        gc.collect()
+        
         opt_f2, opt_thresh = 0.0, 0.5
+        pos_probs = all_probs.view(-1)
+        pos_labels = all_labels.view(-1).long()
         if all_probs.numel() > 0:
             thresholds = torch.linspace(0.01, 0.99, 50)
             best_f2 = -1.0
@@ -3109,15 +3182,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # Use the CALIBRATED (EMA) threshold for metrics
         final_thresh = self.calibrated_threshold.item()
             
-        # Log calibrated Metrics using the Bayesian-stabilized threshold
-        # [SOTA FIX v15.0] Truthful Reporting (Metric Alignment Patch)
-        # We use functional metrics on the gathered tensors with the JUST OPTIMIZED threshold.
-        # This prevents the "Metric Paradox" where the metric object holds state from the OLD threshold.
-        
-        # Calculate precise metrics using the synchronized final_thresh
-        s_prec = tm_func.precision(all_probs, all_labels.long(), task="binary", threshold=final_thresh).item()
-        s_rec = tm_func.recall(all_probs, all_labels.long(), task="binary", threshold=final_thresh).item()
-        s_f1 = tm_func.f1_score(all_probs, all_labels.long(), task="binary", threshold=final_thresh).item()
+        # [v2026 SOTA] Unbiased Clinical Evaluation (Smoking Gun #Bias)
+        # Rationale: Averaging AUROCs across ranks is mathematically incorrect.
+        # We compute all metrics on the pooled global dataset for exact parity.
+        s_auroc, s_prec, s_rec, s_f1 = 0.0, 0.0, 0.0, 0.0
+        if pos_probs.numel() > 0:
+            # Use the synchronized final_thresh for categorical metrics
+            s_auroc = tm_func.auroc(pos_probs, pos_labels, task="binary").item()
+            s_prec = tm_func.precision(pos_probs, pos_labels, task="binary", threshold=final_thresh).item()
+            s_rec = tm_func.recall(pos_probs, pos_labels, task="binary", threshold=final_thresh).item()
+            s_f1 = tm_func.f1_score(pos_probs, pos_labels, task="binary", threshold=final_thresh).item()
 
         self.log_dict({
             "val/mse_global": self.val_mse_global.compute(),
@@ -3125,10 +3199,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
             "val/mse_labs": self.val_mse_labs.compute(),
             "val/mse_electrolytes": self.val_mse_electrolytes.compute(),
             "val/sepsis_acc": self.val_acc_sepsis.compute(),
-            "val/sepsis_auroc": self.val_auroc_sepsis.compute(),
-            "val/sepsis_precision": s_prec, # [FIXED]
-            "val/sepsis_recall": s_rec,     # [FIXED]
-            "val/sepsis_f1": s_f1,          # [FIXED]
+            "val/sepsis_auroc": s_auroc,  # [UNBIASED]
+            "val/sepsis_precision": s_prec, # [UNBIASED]
+            "val/sepsis_recall": s_rec,     # [UNBIASED]
+            "val/sepsis_f1": s_f1,          # [UNBIASED]
             "val/clinical_f2_opt": opt_f2,
             "val/clinical_threshold_opt": final_thresh,
             "val/raw_threshold_epoch": opt_thresh,
@@ -3539,10 +3613,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # Removing this redundant serialization saves ~100ms per checkpoint.
         # The EMACallback is the single authoritative save source for EMA state.
 
-        # GradNorm Persistence
-        if self.gradnorm is not None and self.gradnorm.optimizer is not None:
-            checkpoint["gradnorm_optimizer_state"] = self.gradnorm.optimizer.state_dict()
-            logger.info("[SAVE] GradNorm optimizer state captured.")
+        # [v2026 SOTA] GradNorm Persistence Bridge
+        # Rationale: Captures meta-optimizer state, EMAs, and loss anchors.
+        if self.gradnorm is not None:
+            checkpoint["gradnorm_state"] = self.gradnorm.get_gradnorm_state()
+            logger.info("[SAVE] GradNorm internal state captured.")
 
         # [v48.0] Save Accumulation Progress
         checkpoint["grad_accum_idx"] = self.grad_accum_idx
@@ -3627,6 +3702,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # Verify that buffer is reset even if PL loaded state_dict before this hook.
         if hasattr(self, "grad_accum_idx"):
              self.grad_accum_idx.fill_(0)
+        self._shadow_grad_accum_idx = 0
         logger.info("⚖️ [RESUME] Accumulation Index reset to 0 (Mathematical Parity).")
 
         # [v118.0] Restore GradNorm Accumulators
@@ -3713,9 +3789,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
              self.pending_scheduler_states = checkpoint["lr_schedulers"]
              logger.info(f"[RESUME] Captured scheduler states.")
 
-        if "gradnorm_optimizer_state" in checkpoint:
-             self.pending_gn_opt_state = checkpoint["gradnorm_optimizer_state"]
-             logger.info("[RESUME] Captured GradNorm optimizer state.")
+        if "gradnorm_state" in checkpoint:
+             self.pending_gn_state = checkpoint["gradnorm_state"]
+             logger.info("[RESUME] GradNorm state captured for manual restoration bridge.")
 
         if "ema_state_dict" in checkpoint:
              self.pending_ema_state = checkpoint["ema_state_dict"]

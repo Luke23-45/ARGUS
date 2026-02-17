@@ -30,6 +30,7 @@ import lmdb
 import logging
 import functools
 import numpy as np
+import time
 import torch
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple, Union
@@ -584,8 +585,9 @@ class StatefulWeightedSampler(Sampler):
             # 1. Deterministic reconstruction after crash
             # 2. Unique data stream per GPU rank
             g = torch.Generator()
-            # Large multiplier for rank to prevent seed overlap between epochs
-            g.manual_seed(self.seed + self.epoch + self.rank * 10000)
+            # [v2026 SOTA FIX] Seed Domain Isolation (Smoking Gun #SeedOverlap)
+            # Rationale: Prevents seed collisions between high epoch counts and higher rank indices.
+            g.manual_seed(self.seed + self.epoch + self.rank * 1000000)
             
             # Reconstruction is fast (vectorized on CPU)
             self.indices = torch.multinomial(
@@ -652,21 +654,40 @@ def create_sepsis_aware_sampler(
     # Initialize weights (default = 1.0 for normal samples)
     weights = torch.ones(n_samples)
     
-    # [v129.0 SOTA FIX] Global Sepsis Index (Smoking Gun #129)
-    # Rationale: Regional scanning (100k limit) ignores 98% of sepsis cases.
-    # Fix: Build a persistent global index for 100% coverage.
+    # [v2026 SOTA FIX] Sampler I/O Race Protection (Smoking Gun #RaceCondition)
+    # Rationale: Prevents parallel DDP workers from thumping I/O or corrupting indices.
+    rank = get_rank()
     index_name = f"{dataset.split}_sepsis_index.npy"
     index_path = dataset.root_path / index_name
     
+    # 1. Wait-to-Load Logic for non-zero ranks
+    if not index_path.exists() and rank != 0:
+        logger.info(f"[Sampler] Rank {rank} waiting for Rank 0 to build index...")
+        for _ in range(120): # 10 minute timeout
+            if index_path.exists(): break
+            time.sleep(5)
+            
     if index_path.exists():
-        logger.info(f"[Sampler] Loading cached Sepsis Index: {index_path}")
-        is_sepsis = np.load(index_path)
-        if len(is_sepsis) != n_samples:
-            logger.warning("[Sampler] Index size mismatch! Rebuilding...")
-            index_path.unlink()
-            return create_sepsis_aware_sampler(dataset, sepsis_boost_factor)
+        try:
+            logger.info(f"[Sampler] Loading cached Sepsis Index: {index_path}")
+            is_sepsis = np.load(index_path)
+            if len(is_sepsis) != n_samples:
+                if rank == 0:
+                    logger.warning("[Sampler] Index size mismatch! Rebuilding...")
+                    index_path.unlink()
+                else:
+                    time.sleep(10) # Give rank 0 time to unlink
+                return create_sepsis_aware_sampler(dataset, sepsis_boost_factor, max_samples, seed)
+        except Exception as e:
+            if rank == 0:
+                logger.warning(f"[Sampler] Corrupt index detected, rebuilding: {e}")
+                if index_path.exists(): index_path.unlink()
+            else:
+                time.sleep(10) # Wait for reconstruction
+            return create_sepsis_aware_sampler(dataset, sepsis_boost_factor, max_samples, seed)
     else:
-        logger.info(f"[Sampler] Building Global Sepsis Index (100% Coverage, N={n_samples:,})...")
+        # 2. Build Block (Rank 0 or Lead Worker reaches here)
+        logger.info(f"[Sampler] Rank {rank} building Global Sepsis Index (100% Coverage, N={n_samples:,})...")
         is_sepsis = np.zeros(n_samples, dtype=bool)
         
         # Ensure LMDB is initialized for the main process
@@ -703,12 +724,15 @@ def create_sepsis_aware_sampler(
             
             global_ptr += n_chunks
             
-        # Save for future runs
-        try:
-            np.save(index_path, is_sepsis)
-            logger.info(f"[Sampler] Sepsis Index saved to {index_path}")
-        except Exception as e:
-            logger.warning(f"[Sampler] Could not save Sepsis Index: {e}")
+        # [v2026 SOTA] Atomic Save via Temp Move
+        if rank == 0:
+            try:
+                temp_path = index_path.with_suffix(".tmp.npy")
+                np.save(temp_path, is_sepsis)
+                temp_path.replace(index_path)
+                logger.info(f"[Sampler] Sepsis Index saved atomically to {index_path}")
+            except Exception as e:
+                logger.warning(f"[Sampler] Could not save Sepsis Index: {e}")
             
     # Apply weights
     weights[is_sepsis] = sepsis_boost_factor

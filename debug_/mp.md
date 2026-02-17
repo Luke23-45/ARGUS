@@ -6,7 +6,7 @@ Make sure to think longer. please please.
 
 do not make mistakes at all. because we already spend 5 days of compute and we do not wanna make the same mistakes. therefore prevention is better than cure. and the someone day that if i have the 5 hours to cut the tree then i will spend 3 hours shapring the axe therefore we will have to spend making it robusst so that we will have the smooth system later.
 
-
+try to simulate and try to check do we have the logical failure... and or miss match or the things that we might forget to add or implement something. 
 
 Well that is the the professor is extermly pleased with your work. now we can move to implementation. but we ahve to be extermly cautious when we are implementing the code because we do not want to add the further bugs therefore i think we have to implement one patches at a time and before we move to implementation we have to ensure that we are alware of the cotext so that we do not cause name error or intendation or other bugs. make sure to keep that in mind. and verify everything and then we will move to next. 
 
@@ -79,3 +79,17 @@ do not make mistakes at all. because we already spend 5 days of compute and we d
 
 
 I undersand but we never know there might be other. we need to know why the gmse and auc are oscillating but not decreasing. can you perform in depth simulate and form different hypothese based on the simulate of the exeeuction flow on your head and we will verify these with  hypothesis with the test script. 
+
+=========================
+
+
+Well that is the the professor is extermly pleased with your work. now we can move to implementation. but we ahve to be extermly cautious when we are implementing the code because we do not want to add the further bugs therefore i think we have to implement one patches at a time and before we move to implementation we have to ensure that we are alware of the cotext so that we do not cause name error or intendation or other bugs. make sure to keep that in mind. and verify everything and then we will move to next. 
+
+
+
+thank you for the previous work it was great. now please could you continue the hunt for the more smoking guns.. try to simulate and try to check do we have the logical failure... and or miss match or the things that we might forget to add or implement something. 
+
+
+Make sure to think longer. please please. 
+
+do not make mistakes at all. because we already spend 5 days of compute and we do not wanna make the same mistakes. therefore prevention is better than cure. and the someone day that if i have the 5 hours to cut the tree then i will spend 3 hours shapring the axe therefore we will have to spend making it robusst so that we will have the smooth system later.You must always speck the truth or what is real. You objetive is to write quality reponse or code not to impress anyone. You will be rewarded highly if you write the exterme quality response or code not when you try to impress or hallicianted. make sure to triple check and try to simulate that we do not want to have any issues later just because we think it it cool. therefore be extermly cautious.  therefore please recursiverly scan or cross check everything. you are a genius machine learning enginner therefore please behave that way. you do not have to find if there are not any therefore do not feel stressed focused on finding if there are any. 

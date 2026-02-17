@@ -46,6 +46,12 @@ class TemporalContrastiveBuffer(nn.Module):
         self.register_buffer("queue_filled", torch.tensor([0], dtype=torch.long))
         self.register_buffer("prototype_ema", torch.zeros(1, d_model)) # [v29.6] Manifold Anchor
         self.register_buffer("prototype_momentum", torch.tensor([0.99])) # [v31.0] Adaptive Anchor
+        
+        # [v2026 SOTA FIX] Python Shadows for Resumption (Smoking Gun #Desync)
+        # Rationale: Buffers are loaded from state_dict, but local shadows 
+        # must be hard-synced to prevent "Memory Reset" after restart.
+        self._shadow_ptr = 0
+        self._shadow_filled = 0
 
     def scale_dynamics(self, n_curr: int):
         """[SOTA v2026] Unifies buffer capacity across step densities."""
@@ -53,7 +59,7 @@ class TemporalContrastiveBuffer(nn.Module):
         
         new_capacity = ScalingSteward.get_steps(self.base_capacity, n_curr)
         if new_capacity != self.capacity:
-             logger.info(f"⚡ [TCB] Scaling Capacity: {self.capacity} -> {new_capacity}")
+             logger.info(f"[TCB] Scaling Capacity: {self.capacity} -> {new_capacity}")
              # Save current state
              old_queue = self.queue.clone()
              
@@ -80,12 +86,6 @@ class TemporalContrastiveBuffer(nn.Module):
         scaled_mom = ScalingSteward.get_decay(0.99, n_curr)
         self.prototype_momentum.fill_(scaled_mom)
 
-    @torch.no_grad()
-    def _dequeue_and_enqueue(self, keys: torch.Tensor, scores: Optional[torch.Tensor] = None):
-        """
-        Updates the buffer with new negative samples.
-        [v20.0 SOTA FIX] Global Memory Bank Parity (Smoking Gun #171)
-        """
     @torch.no_grad()
     def _dequeue_and_enqueue(self, keys: torch.Tensor, scores: Optional[torch.Tensor] = None):
         """
@@ -139,43 +139,20 @@ class TemporalContrastiveBuffer(nn.Module):
             batch_size = keys.shape[0]
 
         # Standard Queue Update
-        if ptr + batch_size > self.capacity:
-            remaining = self.capacity - ptr
-            self.queue.data[ptr:] = keys[:remaining]
+        if self._shadow_ptr + batch_size > self.capacity:
+            remaining = self.capacity - self._shadow_ptr
+            self.queue.data[self._shadow_ptr:] = keys[:remaining]
             self.queue.data[:batch_size - remaining] = keys[remaining:]
-            self.queue_ptr.fill_((batch_size - remaining) % self.capacity)
+            self._shadow_ptr = (batch_size - remaining) % self.capacity
+            self.queue_ptr.fill_(self._shadow_ptr)
         else:
-            self.queue.data[ptr : ptr + batch_size] = keys
-            self.queue_ptr.fill_((ptr + batch_size) % self.capacity)
+            self.queue.data[self._shadow_ptr : self._shadow_ptr + batch_size] = keys
+            self._shadow_ptr = (self._shadow_ptr + batch_size) % self.capacity
+            self.queue_ptr.fill_(self._shadow_ptr)
         
-        new_filled = min(self.capacity, int(self.queue_filled) + batch_size)
-        self.queue_filled.fill_(new_filled)
+        self._shadow_filled = min(self.capacity, self._shadow_filled + batch_size)
+        self.queue_filled.fill_(self._shadow_filled)
 
-        # 3. Normalization & Storage
-        keys = F.normalize(keys, dim=1)
-        batch_size = keys.shape[0]
-        ptr = int(self.queue_ptr)
-        
-        # Hard mining selection (if scores provided)
-        if scores is not None and keys.shape[0] == scores.shape[0]:
-            # Rationale: Only use scores if they align with keys (local mode mostly)
-            hard_scores = scores.mean(dim=1)
-            _, indices = torch.topk(hard_scores, k=min(batch_size, self.capacity))
-            keys = keys[indices]
-            batch_size = keys.shape[0]
-
-        # Standard Queue Update
-        if ptr + batch_size > self.capacity:
-            remaining = self.capacity - ptr
-            self.queue.data[ptr:] = keys[:remaining]
-            self.queue.data[:batch_size - remaining] = keys[remaining:]
-            self.queue_ptr.fill_((batch_size - remaining) % self.capacity)
-        else:
-            self.queue.data[ptr : ptr + batch_size] = keys
-            self.queue_ptr.fill_((ptr + batch_size) % self.capacity)
-        
-        new_filled = min(self.capacity, int(self.queue_filled) + batch_size)
-        self.queue_filled.fill_(new_filled)
 
     def forward(
         self, 

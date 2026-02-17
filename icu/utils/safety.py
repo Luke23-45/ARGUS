@@ -95,8 +95,18 @@ class OODGuardian:
 
         # 2. SBP Heuristic (requires IDX_SBP to exist)
         if tensor.shape[-1] > IDX_SBP:
-            # Syncs ONCE (First Batch Only)
-            is_norm = (tensor[..., IDX_SBP] < 30.0).all().item()
+            # [v2026 SOTA] DDP Consensus Guard (Smoking Gun #Consensus)
+            # Rationale: Local heuristics can diverge on edge-case batches. 
+            # We force a global vote to ensure 'Iron Dome' parity across the cluster.
+            local_is_norm = (tensor[..., IDX_SBP] < 30.0).all()
+            
+            if torch.distributed.is_initialized():
+                sync_t = torch.tensor([float(local_is_norm)], device=tensor.device)
+                torch.distributed.all_reduce(sync_t, op=torch.distributed.ReduceOp.MAX) # Any rank convinces others
+                is_norm = (sync_t.item() > 0.5)
+            else:
+                is_norm = local_is_norm.item()
+                
             self._cached_norm_state = is_norm
             return is_norm
         

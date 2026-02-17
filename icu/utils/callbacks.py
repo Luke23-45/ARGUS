@@ -550,6 +550,15 @@ class EMACallback(Callback):
         if self.ema:
             self.ema.restore(pl_module.model) # Restore student weights for next training epoch
 
+    def on_validation_epoch_end(self, trainer, pl_module):
+        """
+        [v110.0 SOTA] Teacher Consensus Protocol.
+        Rationale: Synchronizes EMA shadow weights across all ranks at the 
+        end of the epoch to prevent teacher divergence in DDP.
+        """
+        if self.ema:
+            self.ema.synchronize()
+
     def on_test_start(self, trainer, pl_module):
         self._init_ema(pl_module)
         if self.ema:

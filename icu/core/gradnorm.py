@@ -20,116 +20,136 @@ class GradNormBalancer(nn.Module):
         self.weights = nn.Parameter(torch.ones(num_tasks) * initial_weight)
         self.alpha = alpha
         self.shared_params = list(shared_params)
-        self.register_buffer("initial_losses", torch.zeros(num_tasks)) # SOTA: Non-None for state_dict
+        self.register_buffer("initial_losses", torch.zeros(num_tasks)) 
 
-        self.optimizer = None 
+        # [v2026 SOTA FIX] Eager Optimizer Initialization (Smoking Gun #Amnesia)
+        # Rationale: Initializing in __init__ allows the wrapper to discover 
+        # the optimizer and save its state_dict in the main checkpoint.
+        self.optimizer = torch.optim.Adam([self.weights], lr=0.005)
+        
         # [PHASE 8] GradNorm Damping & Anchoring
         self.register_buffer("norm_emas", torch.zeros(num_tasks))
         self.register_buffer("step_count", torch.tensor([0], dtype=torch.long))
         self.ema_alpha = 0.90 # Damping factor for norm smoothing
 
     def get_weights(self):
-        # [SOTA] Softmax weighting ensures task preservation (no task gets 0 weight)
-        # We scale by num_tasks so the average weight is 1.0 (prevents gradient vanishing)
+        # [SOTA] Softmax weighting ensures task preservation
         return torch.softmax(self.weights, dim=0) * len(self.weights)
 
-    def update(self, losses):
-        # [SOTA 2026] Universal DDP Bridge
-        # Rationale: Ranks must agree on relative task rates (L/L0) for weights.
-        # [v23.0 FIX] We compute synchronized values for meta-logic BUT 
-        # ensure they retain their rank-specific gradient connections where needed.
+    def get_gradnorm_state(self) -> dict:
+        """[v2026] Export meta-optimizer state for persistence."""
+        return {
+            "optimizer_state": self.optimizer.state_dict(),
+            "initial_losses": self.initial_losses.clone(),
+            "norm_emas": self.norm_emas.clone(),
+            "step_count": self.step_count.clone()
+        }
+
+    def load_gradnorm_state(self, state: dict):
+        """[v2026] Restore meta-optimizer state (Amnesia Guard)."""
+        if not state: return
+        self.optimizer.load_state_dict(state["optimizer_state"])
+        self.initial_losses.copy_(state["initial_losses"])
+        self.norm_emas.copy_(state["norm_emas"])
+        self.step_count.copy_(state["step_count"])
+
+    def update(self, losses, scaler=None):
+        """
+        [SOTA 2026] Universal DDP Bridge with Meta-Optimizer Step.
+        
+        Args:
+            losses: List or Tensor of task losses (requires_grad=True).
+            scaler: Optional PyTorch GradScaler for AMP-safe meta-gradients.
+        """
         if torch.distributed.is_initialized():
             losses_sync_val = losses.detach().clone()
             torch.distributed.all_reduce(losses_sync_val, op=torch.distributed.ReduceOp.SUM)
             losses_sync_val /= torch.distributed.get_world_size()
-            # For Task Weight evolution (L/L0), we use the global average scalar.
-            # Rationale: All ranks must move meta-weights in the same direction.
-            # But the 'losses' tensor used for autograd must NOT be the detached one.
             meta_losses_val = losses_sync_val
         else:
             meta_losses_val = losses.detach()
 
-        if self.optimizer is None:
-            # [PHASE 8] Reduced LR (0.005) for smoother adaptation (Smoking Gun #19)
-            self.optimizer = torch.optim.Adam([self.weights], lr=0.005)
-
-
-        # [PATCH 8.2] Dynamic Initial Loss Anchoring (Smoking Gun #117 FIX)
-        # Rationale: A fixed anchor (v30.5) causes extreme imbalance as tasks are solved.
-        # Fix: Transition to a continuous slow-EMA anchor to maintain relative parity.
-        curr_loss_detached = meta_losses_val.flatten() # [v35.1] Ensure 1D for broadcast safety
+        # 2. Dynamic Initial Loss Anchoring
+        curr_loss_detached = meta_losses_val.flatten() 
         if self.initial_losses.sum() == 0:
             self.initial_losses.data.copy_(curr_loss_detached)
         else:
-            # [v117.0 SOTA FIX] Multi-Stage Anchoring
-            # 1. Warmup Phase (First 100 steps): Fast adaptation to initial scale.
-            # 2. Tracking Phase (Continuous): Slow adaptation (0.001) to follow manifold drift.
             alpha_init = 0.05 if self.step_count < 100 else 0.001
             self.initial_losses.data.mul_(1.0 - alpha_init).add_(curr_loss_detached, alpha=alpha_init)
         
         self.step_count += 1
 
+        # 3. Compute Gradient Norms per Task
         weights = self.get_weights()
         norms = []
         for i, loss in enumerate(losses):
-            # 1. Get gradient of the RAW loss (retain_graph for multi-task)
-            is_last = (i == len(losses) - 1)
+            # [v2026 SOTA FIX] AMP-Safe Task Gradients (Smoking Gun #Ghosting)
+            # Rationale: In FP16, unscaled loss gradients often underflow to zero.
+            # We use the provided scaler (if any) to ensure the meta-gradients survive.
+            scaled_loss = scaler.scale(loss) if scaler is not None else loss
+            
             grad = torch.autograd.grad(
-                loss, 
+                scaled_loss, 
                 self.shared_params, 
                 retain_graph=True, 
                 allow_unused=True
             )
             
-            # 2. Compute norm of the gradient (detached from theta)
-            # This follows the GradNorm paper: theta is fixed when updating weights.
+            if scaler is not None and grad is not None:
+                # Unscale the gradients back to the original range for norm calculation
+                inv_scale = 1.0 / (scaler.get_scale() + 1e-8)
+                grad = [g * inv_scale if g is not None else None for g in grad]
+
             valid_grads = [torch.norm(g.detach()) for g in grad if g is not None]
             if not valid_grads:
                 raw_grad_norm = torch.tensor(1e-6, device=loss.device)
             else:
                 raw_grad_norm = torch.stack(valid_grads).norm()
-            
 
             if torch.distributed.is_initialized():
                 dist_norm = raw_grad_norm ** 2
                 torch.distributed.all_reduce(dist_norm, op=torch.distributed.ReduceOp.SUM)
-                # SOTA 2025 FIX: Add 1e-8 inside sqrt to prevent NaN on zero-gradient batches
                 raw_grad_norm = torch.sqrt((dist_norm / torch.distributed.get_world_size()) + 1e-8)
                 
-            
-            # [PATCH 8.1] GradNorm Damping (Smoking Gun #19)
-            # Rationale: Prevents batch-level noise from causing weight jitter.
+            # Damping for stability
             if self.norm_emas[i] == 0:
                 self.norm_emas[i] = raw_grad_norm.detach()
             else:
                 self.norm_emas[i] = (self.ema_alpha * self.norm_emas[i]) + ((1.0 - self.ema_alpha) * raw_grad_norm.detach())
+            
+            # [v2026 SOTA] Bias Correction (Smoking Gun #ColdStart)
+            # Rationale: EMA is weighted by (1 - alpha^t) to prevent zero-bias in early steps.
+            bc_factor = 1.0 - (self.ema_alpha ** self.step_count.float())
+            norm_bc = self.norm_emas[i] / (bc_factor + 1e-8)
                 
-            # [PHASE 35 SOTA FIX] GradNorm Damping (Smoking Gun #19)
-            # Rationale: Using the EMA-smoothed norm instead of the raw batch norm 
-            # prevents 'Meta-Weight Jitter' and ensures stable convergence.
-            norms.append(weights[i] * self.norm_emas[i])
+            norms.append(weights[i] * norm_bc)
 
         norms = torch.stack(norms)
 
-        # 2. Relative inverse rates
-        # Slower tasks (loss ratio higher) get more weight
-        # [PHASE 35 SOTA FIX] Epsilon Hardening (Smoking Gun #36)
-        # Rationale: 1e-8 can be too small for FP16, leading to 1.6e10+ weights.
-        # 1e-4 provides a robust numeric floor for stable divisions.
-        safe_init = torch.where(self.initial_losses > 1e-4, self.initial_losses, torch.ones_like(self.initial_losses) * 1e-4)
-        # Use synchronized meta_losses_val for global parity
-        rel_rates = meta_losses_val / (safe_init + 1e-4)
+        # 4. Relative Inverse Rates (Loss Balancing)
+        # [v2026 SOTA] Hardened epsilon for FP16 stability
+        safe_init = torch.where(self.initial_losses > 1e-6, self.initial_losses, torch.ones_like(self.initial_losses) * 1e-6)
+        rel_rates = meta_losses_val / (safe_init + 1e-6)
         avg_rate = rel_rates.mean()
-        rel_rates = rel_rates / (avg_rate + 1e-4)
+        rel_rates = rel_rates / (avg_rate + 1e-6)
 
-        # 3. Target norms (The balance point)
+        # 5. Target Norms & Meta-Loss
         target = norms.mean() * (rel_rates ** self.alpha)
-
-        # 4. GradNorm loss (Drives weights toward target balance)
         gradnorm_loss = torch.abs(norms - target).mean()
+        
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(gradnorm_loss, op=torch.distributed.ReduceOp.SUM)
             gradnorm_loss = gradnorm_loss / torch.distributed.get_world_size()
 
-        return gradnorm_loss, weights.detach()
+        # [v2026 SOTA FIX] The Meta-Optimizer "Heartbeat" (Smoking Gun #Frozen)
+        # Rationale: If we don't call backward/step, weights NEVER change.
+        self.optimizer.zero_grad()
+        gradnorm_loss.backward()
+        
+        # [ROBUSTNESS] Hard clip task-weight gradients to prevent explosion
+        torch.nn.utils.clip_grad_norm_([self.weights], 1.0)
+        
+        self.optimizer.step()
+
+        return gradnorm_loss.detach(), weights.detach()
 

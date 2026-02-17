@@ -55,49 +55,70 @@ class CAGrad(torch.optim.Optimizer):
         return torch.cat(views, 0)
 
     def pc_backward(self, losses, backward_fn=None, accumulate=False):
-        # 1. Save current accumulated gradients if we are in an accumulation window
+        """
+        Conflict-Averse Surgery with DDP Logic.
+        [v2026 SOTA FIX] Unified Surgical Consensus (Smoking Gun #Divergence)
+        """
+        # 1. Save current accumulated gradients
+        # Rationale: Captures background accumulation (Diffusion, AGEM) to prevent surgery wipe.
         current_grads = None
         if accumulate:
-            current_grads = self._get_flat_grad() # [FIX] cat() already clones
+            current_grads = self._get_flat_grad()
 
         # 2. Capture Task Gradients
         task_grads = []
+        is_dist = torch.distributed.is_initialized()
+        world_size = torch.distributed.get_world_size() if is_dist else 1
+        
         for loss in losses:
-            self.optimizer.zero_grad() # Safe now because we saved 'current_grads'
+            self.optimizer.zero_grad() 
             if backward_fn:
                 backward_fn(loss, retain_graph=True)
             else:
                 loss.backward(retain_graph=True)
-            task_grads.append(self._get_flat_grad()) # [FIX] cat() already clones
+                
+            # [v2026 SOTA FIX] Finite Guard (Smoking Gun #NaN)
+            # Rationale: Poisoned tasks must be zeroed to satisfy collective surgery.
+            g_i = self._get_flat_grad()
+            if not torch.isfinite(g_i).all():
+                g_i.zero_()
+            
+            # [v2026 SOTA FIX] Global Task Consensus (Smoking Gun #DDP-Surgery)
+            # Rationale: In DDP, surgery MUST be performed on the GLOBAL task gradients.
+            # Otherwise, each rank performs 'local' surgery, breaking parity.
+            if is_dist:
+                torch.distributed.all_reduce(g_i, op=torch.distributed.ReduceOp.SUM)
+                g_i.div_(world_size)
+                
+            task_grads.append(g_i)
 
-        # 3. Perform Surgery (Math remains same)
+        # 3. Perform Surgery
         g = torch.stack(task_grads)
         g_avg = g.mean(dim=0)
+        
+        # [v2026 SOTA] Deterministic Surgery
+        # Rationale: Since g_i are now global, GG is naturally global. 
         GG = g @ g.t()
+
         try:
-            # [FIX] torch.linalg.solve requires float32 for stability and compatibility
-            # Especially critical for mixed-precision/bfloat16 training.
+            # [FIX] torch.linalg.solve requires float32 for stability
             alpha = torch.linalg.solve(
                 (GG + 1e-6 * torch.eye(len(losses), device=GG.device)).float(), 
                 torch.ones(len(losses), device=GG.device, dtype=torch.float32)
             )
             alpha = torch.clamp(alpha, min=0) 
             alpha = alpha / (alpha.sum() + 1e-8)
-            # Cast back to input dtype for consistent gradient surgery
             alpha = alpha.to(g.dtype) 
         except:
             alpha = torch.ones(len(losses), device=GG.device, dtype=g.dtype) / len(losses)
 
+        # Calculate surgical direction
         final_grad = (alpha @ g)
         
         # [v2026 SOTA FIX] Branchless Renormalization (Zero-Sync)
-        # Rationale: "if torch.norm(final_grad) > 1e-8" triggers a CPU sync every step.
         f_norm = torch.norm(final_grad)
         g_avg_norm = torch.norm(g_avg)
         
-        # If f_norm > 1e-8, we scale by (g_avg_norm / f_norm). 
-        # Otherwise, we default to 1.0 (no scaling).
-        # We add 1e-8 divisor for safety even in the True case.
         scaler = torch.where(
             f_norm > 1e-8,
             g_avg_norm / (f_norm + 1e-8), 
@@ -108,7 +129,7 @@ class CAGrad(torch.optim.Optimizer):
 
         # 4. Apply and Restore
         if accumulate and current_grads is not None:
-            # Add new surgical grad to existing accumulated grad
+            # [v2026 SOTA FIX] Additive Surgery (The Accumulation Recovery)
             self._set_flat_grad(current_grads + final_grad)
         else:
             self._set_flat_grad(final_grad)

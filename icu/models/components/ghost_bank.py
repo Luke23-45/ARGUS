@@ -174,6 +174,13 @@ class SepsisGhostBank(nn.Module):
             self._shadow_size = new_size
             self._shadow_ptr = new_size % new_capacity
             self._shadow_is_full = (new_size == new_capacity)
+            
+        # [v2026 SOTA FIX] Unconditional Shadow Sync (Smoking Gun #Desync)
+        # Rationale: On resumption, registered buffers are loaded but local Python 
+        # shadow variables are 0. We must sync them even if capacity didn't change.
+        self._shadow_size = int(self.size)
+        self._shadow_ptr = int(self.ptr)
+        self._shadow_is_full = bool(self.is_full)
 
 
     @torch.no_grad()
