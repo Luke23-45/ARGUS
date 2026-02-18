@@ -65,6 +65,7 @@ import math
 import numpy as np
 import random
 import traceback
+import gc
 
 # [v2025 SOTA] Implementation Imports
 from icu.core.cagrad import CAGrad

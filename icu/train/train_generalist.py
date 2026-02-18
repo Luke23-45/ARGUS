@@ -510,15 +510,7 @@ def main(cfg: DictConfig):
         # If it's any other callback, we keep it.
         callbacks.append(cb)
 
-    # Ensure ModelCheckpoint callback uses the correct dirpath if present
-    for cb in callbacks:
-        if isinstance(cb, ModelCheckpoint):
-            # If checkpoint_dir is set in config, override likely defaults from get_sota_callbacks
-            if cfg.get("checkpoint_dir"):
-                cb.dirpath = cfg.checkpoint_dir
-                logger.info(f"[CONFIG] Checkpoint Dir overridden to: {cb.dirpath}")
-
-    # [SOTA FIX] Unified EMA restoration is now handled by EMACallback in callbacks.py.
+    # [v2026 SOTA] Unified EMA restoration is now handled by EMACallback in callbacks.py.
     # The redundant EMARestoration class was removed to prevent "Double-Load" race conditions.
             
     trainer = pl.Trainer(
@@ -566,8 +558,15 @@ def main(cfg: DictConfig):
         # [v2026 AXE-SHARPENED] Auto-Discovery Safety
         # Rationale: If the user doesn't specify a path, we check for last.ckpt 
         # to prevent accidental 'Fresh Starts' that waste 5 days of compute.
+        # [v2026 AXE-SHARPENED v5] Unified Auto-Discovery logic
+        # Rationale: Must use the SAME resolved path logic as get_sota_callbacks
+        # to ensure we look in the correct isolated subfolder.
         if not ckpt_path:
-            save_dir = f"{cfg.output_dir}/{cfg.run_name}/checkpoints"
+            if cfg.get("checkpoint_dir"):
+                save_dir = os.path.join(os.path.abspath(cfg.checkpoint_dir), cfg.run_name, "checkpoints")
+            else:
+                save_dir = os.path.join(cfg.output_dir, cfg.run_name, "checkpoints")
+                
             auto_bridge = Path(save_dir) / "resumption_bridge.ckpt"
             if auto_bridge.exists():
                 logger.info(f"🔍 [AUTO-RESUME] Found existing root-bridge: {auto_bridge}")

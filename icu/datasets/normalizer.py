@@ -211,7 +211,7 @@ class ClinicalNormalizer(nn.Module):
         self.register_buffer('static_max', torch.ones(static_channels))
         
         # 5. System Status
-        self.register_buffer('is_calibrated', torch.tensor([False], dtype=torch.bool))
+        self.register_buffer('is_calibrated', torch.tensor(False, dtype=torch.bool))
         
         # 6. RevIN Instance Statistics Cache (for denormalization)
         # These are runtime buffers, not saved

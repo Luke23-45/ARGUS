@@ -894,8 +894,18 @@ def get_sota_callbacks(cfg: DictConfig) -> List[Callback]:
 
     # 1. Core Engines (Saver, EMA) - Keep as is
     # 1. Core Engines (Saver, EMA)
-    save_dir = f"{cfg.output_dir}/{cfg.run_name}/checkpoints"
-    
+    # [v2026 AXE-SHARPENED v5] Unified Path Resolution
+    # Rationale: If checkpoint_dir is provided, we MUST use it as the root base
+    # AND append run_name to ensure experiment isolation. 
+    if cfg.get("checkpoint_dir"):
+        # Use absolute path to prevent ambiguity
+        base_root = os.path.abspath(cfg.checkpoint_dir)
+        save_dir = os.path.join(base_root, cfg.run_name, "checkpoints")
+        logger.info(f"[PATH] Unified Performance Boot: {save_dir}")
+    else:
+        save_dir = os.path.join(cfg.output_dir, cfg.run_name, "checkpoints")
+        logger.info(f"[PATH] Unified Project Boot: {save_dir}")
+
     # [v2026] OOM Guardian (PROMOTED TO INDEX 0)
     # Rationale: Must harvest RAM BEFORE ModelCheckpoint triggers.
     callbacks.append(HighMemoryGuardian())
@@ -922,6 +932,7 @@ def get_sota_callbacks(cfg: DictConfig) -> List[Callback]:
     # [v2026 AXE-SHARPENED v2] Unified Persistence Manager
     # Rationale: Replaced the simple mirror with a smart saver that eliminates
     # redundant 3GB writes by checking if ModelCheckpoint already saved the best model.
+    # Pass the SAME save_dir to ensure synchronization.
     callbacks.append(SOTAUnifiedPersistence(run_name=cfg.run_name, dirpath=save_dir))
     
     # [BACKUP] Optional Remote Mirroring (Simple Copy)
