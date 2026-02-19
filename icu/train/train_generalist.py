@@ -315,7 +315,7 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
         from icu.utils.samplers import WeightedEpisodeSampler
         self.sampler = WeightedEpisodeSampler(
             self.train_ds, 
-            target_prevalence=0.15,
+            target_prevalence=0.10,
             shuffle=True, 
             seed=self.cfg.seed,
             drop_last=True

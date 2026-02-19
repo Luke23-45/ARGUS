@@ -96,7 +96,7 @@ class ScalingSteward:
     1. Exponential Invariance: Scales decays/momentum for epoch-level parity.
     2. Linear Volume: Scales capacities/steps for data-coverage parity.
     """
-    REF_STEPS = 200 # Stable baseline from M_short run
+    REF_STEPS = 1176 # [SOTA FIX v1.4] Aligned with Phase 1 Training Density
 
     @staticmethod
     def get_decay(ref_decay: float, n_curr: int) -> float:

@@ -1112,7 +1112,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # [v49.0 SOTA FIX] Seed Continuity (Smoking Gun #65)
         # Rationale: Align sampling with the stateful accumulation cycle.
         ghost_seed = (self.current_epoch * 12345 + self.global_step + (self._shadow_grad_accum_idx - 1)) % (2**31)
-        num_ghosts = self.cfg.train.get("num_ghosts", 4)
+        num_ghosts = self.cfg.train.get("num_ghosts", 2)
         mixup_alpha = self.cfg.train.get("ghost_mixup_alpha", 0.0)
         ghost_batch = self.ghost_bank.sample(
             num_ghosts=num_ghosts, 
@@ -1362,8 +1362,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
             else:
                  u_avg = uncertainty.detach().mean()
             
-            # [SOTA FIX] Evidential Trust Recovery (Zero-Sync Vectorized)
-            trust_factor = torch.exp(-u_avg * 0.5).clamp(min=0.4, max=1.0)
+            # [v1.5 SOTA] Drowning Foundation Repair (Smoking Gun #D-05)
+            # Rationale: min=0.4 allowed 40% noise into encoder even when head was 100% wrong.
+            # Lowering to 0.05 to enable near-total suppression during discovery shocks.
+            trust_factor = torch.exp(-u_avg * 0.5).clamp(min=0.05, max=1.0)
             
             # Surgical Hook: Scopes gradients only for the shared connection
             if ctx_aux.requires_grad:
@@ -1373,7 +1375,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             self.log("train/pms_trust_factor", trust_factor, on_step=True, prog_bar=True)
             
             self.class_balancer.update(targets)
-            class_weights = self.class_balancer.get_weights().to(self.device)
+            class_weights = self.class_balancer.get_weights().to(self.device).clamp(max=10.0)
             
             # [SOTA 2025] Shape Alignment
             # Classification (Aux Head) is Window-Level [B] via CLS Token
@@ -1448,7 +1450,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 ctx_seq.register_hook(update_fnd_ema)
             
             if ctx_aux.requires_grad:
-                ctx_aux.register_hook(throttle_aux_gradient)
+                # [SOTA FIX] Liberation: Disable suppression to allow Sepsis learning
+                # ctx_aux.register_hook(throttle_aux_gradient)
+                pass
             
             # [v17.3] Omega Summoning: Constant Clinical Pressure
             # Every batch now has sepsis signal via the Summoned Ghosts.
@@ -1939,18 +1943,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 d_ema_sync = self.loss_scaler.loss_emas[0]
                 p_ema_sync = self.loss_scaler.loss_emas[6]
                 
-            # [SOTA v4.0] Adaptive Physics Scaling with Dynamic Range
-            # Rationale: Fixed [0.1, 10] clamp can permanently mute physics if early spikes
-            # poison the EMA ratio. We use step-based clamp relaxation.
-            phys_scale_raw = (d_ema_sync + 1e-8) / (p_ema_sync + 1e-8)
-            
-            # Dynamic Clamp: Starts tight [0.2, 5.0], relaxes to [0.1, 10.0] after 1000 steps
-            warmup_steps = 1000
-            warmup_progress = min(1.0, self.global_step / warmup_steps)
-            clamp_min = 0.2 - (0.1 * warmup_progress)  # 0.2 -> 0.1
-            clamp_max = 5.0 + (5.0 * warmup_progress)  # 5.0 -> 10.0
-            
-            phys_scale = torch.clamp(phys_scale_raw, min=clamp_min, max=clamp_max)
+            # [SOTA v5.0 LOGICAL FIX] Bayesian-Only Physics Scaling
+            # Rationale: Ratio Scaling (d_ema/p_ema) causes gradient explosion when p_ema -> 0 (Mastery).
+            # We trust the Bayesian Loss Scaler to handle magnitude balancing via precision (1/sigma^2).
+            # Fixed Scale = 1.0 (Unit Alignment) allows "Reward for Mastery" instead of punishment.
+            phys_scale = torch.tensor(1.0, device=self.device)
             # [SOTA v4.0] Critical Telemetry: Physics Visibility
             # Rationale: Removed .item() to stay in the graph.
             self.log("train/phys_scale", phys_scale, on_step=True, prog_bar=True)
@@ -3014,7 +3011,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # Hard sync every 3 epochs copies student weights to teacher, resetting drift to zero.
         if self.ema is not None:
             # [FIX #H2] Check if this is a hard sync epoch
-            hard_sync_interval = 3  # Reset teacher every 3 epochs
+            hard_sync_interval = 20  # [v1.5 SOTA] Reset teacher every 20 epochs (Fix Sync Shock)
             if (self.current_epoch + 1) % hard_sync_interval == 0:
                 # Hard Sync: Copy student weights to teacher shadow
                 # This resets the value manifold drift to zero
@@ -3079,13 +3076,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
                  return out_alb["global_expert"]
 
              if self.trainer.is_global_zero:
-                 logger.info(f"👻 [GHOST REFRESH] Re-encoding {self.ghost_bank.size} anchors (Decay=0.3/Momentum=0.7)...")
+                 logger.info(f"👻 [GHOST REFRESH] Re-encoding {self.ghost_bank.size} anchors (Decay=0.9/Momentum=0.1)...")
                  
              # [v36.1 SOTA FIX] Balanced Ghost Refresh (Fix #H3-Revised)
-             # Rationale: 'decay=0.1' was too aggressive (GMSE U-Shape Regression), losing 
-             # temporal regularization. 'decay=0.5' caused Manifold Shock (GN Spike).
-             # 'decay=0.3' is the Goldilocks zone (70% alignment gain, 3x history retention).
-             self.ghost_bank.refresh_anchors(ghost_encoder_fn, decay=0.3)
+             # Rationale: 'decay=0.3' was too aggressive (95% erasure over 14 epochs).
+             # Increasing to 0.9 to preserve long-term clinical anchors.
+             self.ghost_bank.refresh_anchors(ghost_encoder_fn, decay=0.9)
 
 
              # [v2026 RAM SPIKE FIX] Memory Clearing (Smoking Gun #RAM-01)
@@ -3105,6 +3101,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
     def on_validation_epoch_start(self):
         """[v2026 SOTA] Robustness Guard: Ensures validation buffers are fresh."""
         self.validation_step_outputs.clear()
+        # [SOTA FIX] Forensic Patch 1: Reset OOD cache to prevent amnesia
+        if hasattr(self, "safety_guardian"):
+            self.safety_guardian.reset_cache()
+
 
     def on_test_epoch_start(self):
         """[v2026 SOTA] Robustness Guard: Ensures test buffers are fresh."""
@@ -3145,10 +3145,20 @@ class ICUGeneralistWrapper(pl.LightningModule):
             best_f2 = -1.0
             
             # [SOTA FIX] Handle multi-class probabilities for binary-style F2 calibration
-            # We treat class 1 and 2 as "Sepsis" (Positive)
             if all_probs.dim() == 2 and all_probs.shape[1] >= 2:
-                # Sum probabilities of Pre-Shock (1) and Shock (2)
-                pos_probs = all_probs[:, 1:].sum(dim=1).clamp(0, 1)
+                # [SOTA FIX v1.4] Forensic Index Alignment
+                # Rationale: all_probs[:, 1:] sums non-sepsis "Recovery" (Index 3) in 6-phase MoE.
+                num_p = getattr(self.model.cfg, "num_phases", 6)
+                if num_p == 6:
+                    sepsis_idx = [1, 2, 4, 5]
+                elif num_p == 3:
+                    sepsis_idx = [1, 2]
+                else:
+                    sepsis_idx = list(range(1, num_p))
+                
+                # Clamp indices to current prob tensor width
+                sepsis_idx = [i for i in sepsis_idx if i < all_probs.shape[1]]
+                pos_probs = all_probs[:, sepsis_idx].sum(dim=1).clamp(0, 1)
                 pos_labels = (all_labels > 0).long()
             else:
                 pos_probs = all_probs.view(-1)

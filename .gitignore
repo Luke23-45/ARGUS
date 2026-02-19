@@ -163,3 +163,11 @@ tests/test_sota_components.py
 
 scripts/inspect_full_wrapper.py
 logs23.md
+PERFORMANCE_OPTIMIZATION_REPORT.md
+easdfas.md
+FINAL_VERIFICATION_REPORT.md
+FINAL_ALL_CLEAR_REPORT.md
+FORENSIC_REPORT_Smoking_Guns.md
+FORENSIC_REPORT_v3_COMPREHENSIVE.md
+VERIFICATION_REPORT_v2.md
+test_apex_robustness.py

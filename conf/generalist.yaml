@@ -17,7 +17,7 @@ output_dir: "outputs/phase1"           # Main output directory
 checkpoint_dir: "/content/icu/checkpoints/"  # [OK] Large files, infrequent writes
 log_dir: "/content/icu/logs/"         # [CRITICAL] Must be LOCAL for WandB (High freq IO)
 backup_dir: null                        # Remote/backup directory
-resume_from: null #"/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-29_16-52-27-latest-epoch=13.ckpt"
+resume_from: "/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-02-18_23-05-51/checkpoints/icu_model-epoch=11-val/clinical_auroc=0.790.ckpt" #"/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-29_16-52-27-latest-epoch=13.ckpt"
 # resume_from: "/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-25_12-31-59-latest-epoch=05.ckpt"     # Explicit checkpoint to resume from (optional)
 # "/content/drive/MyDrive/pda/models/checkpoints/icu_model-epoch=05-val/clinical_auroc=0.747.ckpt"          
 #"/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-16_16-21-21-latest-epoch=17.ckpt"
@@ -38,7 +38,7 @@ model:
   use_swiglu: true
   use_flash_attn: true
   gradient_checkpointing: false # [FIX] Conflict with torch.compile on T4/old drivers
-  timesteps: 100
+  timesteps: 500
   beta_schedule: "cosine"
   prediction_type: "epsilon"
   use_ddim_sampling: true
@@ -58,7 +58,7 @@ train:
   # [SOTA] Extended warmup to prevent "Shock" during initial manifold discovery
   warmup_steps: 1500 # Increased from 500 (~1.2 epochs)
   weight_decay: 1e-4
-  grad_clip: 1.0
+  grad_clip: 2.0
   grad_ema_decay: 0.99        # [SOTA] Smoother manifold monitoring for large epochs
   
   # [v2026] Telemetry
@@ -66,7 +66,7 @@ train:
   balancer_beta: 0.9995       # [SOTA] Extremely slow adaptation to prevent "Sepsis Desert" drift
 
   pos_weight: 1.0             # [NERYVA-BETA] Reset to 1.0 (Handled by DynamicClassBalancer)
-  aux_loss_scale: 1.0         # [v12.6] Restored to 1.0 (No throttling needed with balanced weights)
+  aux_loss_scale: 0.5         # [v12.6] Restored to 1.0 (No throttling needed with balanced weights)
   precision: "16-mixed"
   accumulate_grad_batches: 1  
   log_every_n_steps: 50
@@ -82,7 +82,7 @@ train:
   horizon_ramp: 40
 
   # Debug Mode (Smoke Test)
-  debug_run: true #true
+  debug_run: false #true
   debug_limit_batches: 200
   debug_limit_val: 500
 
@@ -91,10 +91,10 @@ train:
   awr_beta: 1.0               # [v38.0] Selection Smoking Gun Smoothing (Start higher)
   awr_max_weight: 20.0        
   awr_lambda: 0.95            # [SOTA] GAE-Lambda for credit assignment
-  awr_gamma: 0.92             # [v25.9 SOTA] Synchronized with Horizon Manifold
+  awr_gamma: 0.99             # [v25.9 SOTA] Standardized for clinical horizons
   adaptive_beta: true
   adaptive_clipping: true
-  target_ess: 0.12            # [v10.5 SOTA] Target 12% Batch Selection (Boosted for Recall)
+  target_ess: 0.30            # [v1.5 SOTA] Target 30% Batch Selection (Relaxed from 12%)
   awr_momentum: 0.98          # [v38.0] Selection Smoothing Momentum (was 0.95)
   beta_min: 1.2               # [v38.0] Selection Floor (Raised to 1.2 to mimic Resumption Boost)
   alpha_min: 0.1              # [SOTA SG-2] Prevents minority task starvation;
@@ -102,19 +102,21 @@ train:
   # AWR Calibration Speed/Quality (v10.1 Upgrade)
   # - "full": Scans all trajectories (~5-10 min, best for final training)
   # - "sample": Random subset (~10-30 sec, best for testing)
-  awr_calibration_mode: "sample" # full for whole population scan or sample
+  awr_calibration_mode: "full" # full for whole population scan or sample
   awr_max_samples: 10000      # [SOTA FIX] Increased for Batch 2048 / Full Sepsis-3 Population
-
   
-  ema_decay: 0.999
-  ema_update_every: 10        # [SOTA] Staggered updates to fix I/O bottleneck
+  # [SOTA REMOVED] Redundant batch_size (Defined in train.batch_size)
+  # batch_size: 2048
+  
+  ema_decay: 0.995            # [SOTA FIX] Faster tracking to prevent "Dead Critic"
+  ema_update_every: 1         # [SOTA FIX] Continuous updates (Standard Polyak Averaging)
   
   # [TUNING] AUC Recovery Suite
   acl_throttle_factor: 1.0     # [v2.2] Boosted from 0.7 to 1.0 (Full Contrastive Signal)
   manual_ema_update: true     # [v14.1 FIX] Handled manually in wrapper to prevent double-update
   monitor: "val/sepsis_auroc"
   patience: 10
-
+ 
   # Clinical Supervision (BGSL)
   trend_coef: 1.0             # Velocity penalty
   shock_coef: 2.0             # Acceleration/Surprise penalty
@@ -125,9 +127,9 @@ train:
   acl_centroid_reg: 0.05      # [v12.5.1] Higher to prevent contrastive collapse
   
   # Risk-Aware Asymmetric Loss
-  asl_gamma_neg: 1.0          # [TUNING] Lowered from 2.0 to 1.0 (Recover AUC sensitivity)
+  asl_gamma_neg: 4.0          # [v1.5 SOTA] Boosted from 1.0 to 4.0 (Fix gradient flooding)
   asl_gamma_pos: 1.0          # Standard focusing
-  risk_multiplier: 5.0        # [TUNING] Boosted from 2.0 to 5.0 (Sepsis Clinical Priority)
+  risk_multiplier: 2.0        # [TUNING] Boosted from 2.0 to 5.0 (Sepsis Clinical Priority)
   
   # Optimization Groups
   backbone_lr_ratio: 1.0

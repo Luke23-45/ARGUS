@@ -46,8 +46,8 @@ class SafetyConfig:
     Derived from PhysioNet 2019 Challenge & Sepsis-3 Guidelines.
     """
     # Max absolute jump between time steps (1h)
-    MAX_DELTA_SBP = 40.0   # mmHg (Sudden hypotension/hypertension)
-    MAX_DELTA_HR = 50.0    # bpm (Sudden tachycardia/bradycardia)
+    MAX_DELTA_SBP = 60.0   # mmHg (Relaxed from 40.0 for early training stability)
+    MAX_DELTA_HR = 60.0    # bpm (Relaxed from 50.0 for early training stability)
     MAX_DELTA_MAP = 30.0   # mmHg
     
     # Absolute Physiological Bounds (Life-Critical)
@@ -77,6 +77,13 @@ class OODGuardian:
         self._warned_normalized = False  # [FIX: v14.0] Flag for "warn once" pattern
         self._cached_norm_state: Optional[bool] = None # [v2026 SOTA] Cache to prevent sync
 
+
+    def reset_cache(self):
+        """[SOTA FIX] Resets the normalization conviction cache."""
+        self._cached_norm_state = None
+        self._warned_normalized = False
+        if self.verbose:
+            logger.info("[OODGuardian] Normalization cache reset.")
 
     def _is_normalized(self, tensor: torch.Tensor) -> bool:
         """

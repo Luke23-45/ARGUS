@@ -1295,8 +1295,12 @@ class ICUUnifiedPlanner(nn.Module):
                 aux_loss = torch.zeros(B, device=past.device)
         else:
             # [v4.2 SOTA] Importance Weighted MSE
-            diff_sq = (pred_noise - noise_eps) ** 2
-            weighted_diff = diff_sq * self.importance_weights.view(1, 1, -1)
+            # [v1.5 SOTA] Channel Mismatch Repair (Smoking Gun #3)
+            # Rationale: Static channels (22-27) are not generative. Training on them
+            # creates an irreducible noise floor. Slicing to Dynamic Subspace.
+            DYNAMIC_CHANNELS = 22
+            diff_sq = (pred_noise[..., :DYNAMIC_CHANNELS] - noise_eps[..., :DYNAMIC_CHANNELS]) ** 2
+            weighted_diff = diff_sq * self.importance_weights[:DYNAMIC_CHANNELS].view(1, 1, -1)
             diff_loss = weighted_diff.mean()
             if self.cfg.use_auxiliary_head and "phase_label" in batch:
                 aux_out = self.aux_head(

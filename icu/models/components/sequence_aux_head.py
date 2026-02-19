@@ -254,7 +254,7 @@ class SequenceAuxHead(nn.Module):
         self, 
         d_model: int, 
         num_classes: int = 1, 
-        num_layers: int = 2, 
+        num_layers: int = 4, 
         n_heads: int = 4, 
         drop_path_prob: float = 0.1,
         # [v14.1 PATCH] Configurable ASL hyperparameters

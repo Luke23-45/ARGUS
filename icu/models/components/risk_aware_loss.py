@@ -22,7 +22,7 @@ class RiskAwareAsymmetricLoss(nn.Module):
     def __init__(self, 
                  gamma_neg: float = 4, 
                  gamma_pos: float = 1, 
-                 clip: float = 0.05, 
+                 clip: float = 0.0, # [SOTA FIX] Disabled by default to prevent False Positive Gradient Death
                  eps: float = 1e-8,
                  critical_multiplier: float = 5.0): # [SOTA FIX] 5x pressure for Red Zones (2.0 -> 5.0)
         super().__init__()

@@ -456,7 +456,14 @@ class APEX_MoE_Planner(nn.Module):
             full_pred_noise[indices] = pred_noise.detach()
 
             # Loss Computation (Per-sample for AWR weighting)
-            loss_raw = F.mse_loss(pred_noise, noise_eps[indices], reduction='none').mean(dim=[1, 2])
+            # [v1.5 SOTA] Channel Mismatch Repair (Smoking Gun #3)
+            # Rationale: All diffusion experts must strictly solve the dynamic subspace.
+            DYNAMIC_CHANNELS = 22
+            loss_raw = F.mse_loss(
+                pred_noise[..., :DYNAMIC_CHANNELS], 
+                noise_eps[indices][..., :DYNAMIC_CHANNELS], 
+                reduction='none'
+            ).mean(dim=[1, 2])
             
             # Apply AWR weights if provided
             if awr_weights is not None:
