@@ -42,6 +42,7 @@ class TemporalContrastiveBuffer(nn.Module):
         # [v27.0 FIX] Zero-initialize queue instead of random
         # This prevents meaningless InfoNCE contrasts during warmup
         self.register_buffer("queue", torch.zeros(capacity, d_model))
+        self.register_buffer("ids_queue", torch.zeros(capacity, dtype=torch.long))
         self.register_buffer("queue_ptr", torch.tensor([0], dtype=torch.long))
         self.register_buffer("queue_filled", torch.tensor([0], dtype=torch.long))
         self.register_buffer("prototype_ema", torch.zeros(1, d_model)) # [v29.6] Manifold Anchor
@@ -69,10 +70,13 @@ class TemporalContrastiveBuffer(nn.Module):
              device = self.queue.device
              # [v27.0 FIX] Zero-initialize new queue slots
              new_queue = torch.zeros(new_capacity, self.d_model, device=device)
+             new_ids_queue = torch.zeros(new_capacity, dtype=torch.long, device=device)
              
              # Copy old data
              new_queue[:num_to_keep] = old_queue[:num_to_keep]
+             new_ids_queue[:num_to_keep] = self.ids_queue[:num_to_keep]
              self.register_buffer("queue", new_queue)
+             self.register_buffer("ids_queue", new_ids_queue)
              # Update pointers
              new_filled = min(int(self.queue_filled), new_capacity)
              self.queue_filled.fill_(new_filled)
@@ -98,7 +102,7 @@ class TemporalContrastiveBuffer(nn.Module):
         self._shadow_ptr = int(self.queue_ptr)
 
     @torch.no_grad()
-    def _dequeue_and_enqueue(self, keys: torch.Tensor, scores: Optional[torch.Tensor] = None):
+    def _dequeue_and_enqueue(self, keys: torch.Tensor, ids: Optional[torch.Tensor] = None, scores: Optional[torch.Tensor] = None):
         """
         Updates the buffer with new negative samples.
         [v2026 SOTA FIX] Zero-Sync / Zero-Gather Implementation
@@ -113,50 +117,35 @@ class TemporalContrastiveBuffer(nn.Module):
         is_valid = torch.isfinite(keys).all(dim=1)
         if not is_valid.all():
             keys = keys[is_valid]
-            if scores is not None:
-                scores = scores[is_valid]
+            if ids is not None: ids = ids[is_valid]
+            if scores is not None: scores = scores[is_valid]
                 
-        # If everything was poisoned (empty), we return. 
-        # But checking 'keys.shape[0] == 0' might arguably be a sync if dynamic?
-        # Actually in PyTorch, if keys is empty, subsequent ops handles it 
-        # (e.g. data[ptr:] assignment of empty tensor is no-op).
-        # But we need to update 'queue_filled'.
-        # We can just proceed.
-        
         # [v2026 SOTA FIX] Batch Size Hard-Cap (Smoking Gun #Overflow)
-        # Rationale: If steps/epoch is low (debug or small dataset), scaled capacity 
-        # might be smaller than the batch size (rank_batch * world_size). 
-        # We cap intake to the bank's total capacity.
         batch_size = keys.shape[0]
         if batch_size > self.capacity:
             keys = keys[-self.capacity:]
-            if scores is not None:
-                scores = scores[-self.capacity:]
+            if ids is not None: ids = ids[-self.capacity:]
+            if scores is not None: scores = scores[-self.capacity:]
             batch_size = self.capacity
 
         if batch_size == 0:
             return
 
-        # 2. Synchronized Shuffle (Preserved for order-invariance)
-        # Only needed if we are effectively subsampling or if inputs are ordered.
-        # Since wrapper handles gathering, we assume inputs are identical across ranks.
-        # We shuffle to prevent "latest-batch bias" if we overflow.
+        # 2. Synchronized Shuffle
         indices = torch.randperm(batch_size, device=keys.device)
         keys = keys[indices]
-        if scores is not None:
-            scores = scores[indices]
+        if ids is not None: ids = ids[indices]
+        if scores is not None: scores = scores[indices]
 
         # 3. Normalization & Storage
         keys = F.normalize(keys, dim=1)
-        ptr = int(self.queue_ptr) # Checking ptr is safe (it's a scalar state)
+        ptr = int(self.queue_ptr)
         
         # Hard mining selection (if scores provided)
         if scores is not None and keys.shape[0] == scores.shape[0]:
-            # Rationale: Only use scores if they align with keys (local mode mostly)
-            hard_scores = scores.mean(dim=1)
-            # topk might sync if we use the result for indexing? No, returns tensors.
-            _, indices = torch.topk(hard_scores, k=min(batch_size, self.capacity))
+            _, indices = torch.topk(scores.mean(dim=1), k=min(batch_size, self.capacity)) # [FIX] Mean across bank keys
             keys = keys[indices]
+            if ids is not None: ids = ids[indices]
             batch_size = keys.shape[0]
 
         # Standard Queue Update
@@ -164,10 +153,15 @@ class TemporalContrastiveBuffer(nn.Module):
             remaining = self.capacity - self._shadow_ptr
             self.queue.data[self._shadow_ptr:] = keys[:remaining]
             self.queue.data[:batch_size - remaining] = keys[remaining:]
+            if ids is not None:
+                self.ids_queue.data[self._shadow_ptr:] = ids[:remaining]
+                self.ids_queue.data[:batch_size - remaining] = ids[remaining:]
             self._shadow_ptr = (batch_size - remaining) % self.capacity
             self.queue_ptr.fill_(self._shadow_ptr)
         else:
             self.queue.data[self._shadow_ptr : self._shadow_ptr + batch_size] = keys
+            if ids is not None:
+                self.ids_queue.data[self._shadow_ptr : self._shadow_ptr + batch_size] = ids
             self._shadow_ptr = (self._shadow_ptr + batch_size) % self.capacity
             self.queue_ptr.fill_(self._shadow_ptr)
         
@@ -179,6 +173,8 @@ class TemporalContrastiveBuffer(nn.Module):
         self, 
         q_expert: torch.Tensor, 
         k_positive: torch.Tensor, 
+        ids_q: Optional[torch.Tensor] = None,
+        ids_k: Optional[torch.Tensor] = None,
         enqueue_mask: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
@@ -200,9 +196,10 @@ class TemporalContrastiveBuffer(nn.Module):
             zero_loss = torch.tensor(0.0, device=q.device, requires_grad=True)
             if enqueue_mask is not None:
                 k_to_store = k[enqueue_mask]
-                self._dequeue_and_enqueue(k_to_store)
+                ids_to_store = ids_k[enqueue_mask] if ids_k is not None else None
+                self._dequeue_and_enqueue(k_to_store, ids=ids_to_store)
             else:
-                self._dequeue_and_enqueue(k)
+                self._dequeue_and_enqueue(k, ids=ids_k)
             return {"loss": zero_loss, "nce_loss": zero_loss, "uniformity": zero_loss}
         
         # InfoNCE path
@@ -211,12 +208,23 @@ class TemporalContrastiveBuffer(nn.Module):
         effective_queue = self.queue[:filled].detach()
         if float(self.latent_adapter_strength) > 0 and self.prototype_ema.abs().sum() > 0:
              effective_queue = (1.0 - float(self.latent_adapter_strength)) * effective_queue + \
-                               float(self.latent_adapter_strength) * self.prototype_ema
+                                float(self.latent_adapter_strength) * self.prototype_ema
              effective_queue = F.normalize(effective_queue, dim=1)
 
         l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1) # [B, 1]
         l_neg = torch.einsum('nc,kc->nk', [q, effective_queue]) # [B, filled]
         
+        # [SOTA P14] Relational Negative Gating (PANG)
+        # Rationale: Prevents contrasting overlapping windows from the same patient.
+        # This resolves the 2.9 loss spike by effectively ignoring self-contrast.
+        if ids_q is not None and filled > 0:
+            # ids_q: [B], ids_keys: [filled]
+            ids_keys = self.ids_queue[:filled]
+            # mask_self[i, j] is True if sample i and negative j share the same patient_id
+            mask_self = (ids_q.unsqueeze(1) == ids_keys.unsqueeze(0))
+            # Surgical exclusion in log-space (pre-softmax)
+            l_neg.masked_fill_(mask_self, -1e9) 
+
         logits = torch.cat([l_pos, l_neg], dim=1) / self.temperature
         labels = torch.zeros(logits.shape[0], dtype=torch.long, device=q.device)
         nce_loss = F.cross_entropy(logits, labels)
@@ -236,9 +244,10 @@ class TemporalContrastiveBuffer(nn.Module):
         # Buffer update
         if enqueue_mask is not None:
              k_to_store = k[enqueue_mask]
-             self._dequeue_and_enqueue(k_to_store)
+             ids_to_store = ids_k[enqueue_mask] if ids_k is not None else None
+             self._dequeue_and_enqueue(k_to_store, ids=ids_to_store)
         else:
-             self._dequeue_and_enqueue(k, scores=l_neg.detach())
+             self._dequeue_and_enqueue(k, ids=ids_k, scores=l_neg.detach())
         
         # [v29.6] Update TCB Prototype
         with torch.no_grad():

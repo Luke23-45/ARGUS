@@ -1830,10 +1830,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # (which correctly handles f_mask division from L613).
             loss_dict = {
                 'diffusion': diff_loss.mean(),       # [v2026 SOTA] Enforce 0D scalar
-                # [PHASE 35 SOTA FIX] Critic Regime Normalization (Smoking Gun #22)
-                # Evidence: V=5.6 while D=0.16. Scaling to 0.1 achieves ~0.56, 
-                # ensuring head gradients provide selection pressure to the manifold.
-                'critic': (critic_loss * 0.1).mean(),
+                # [SOTA P13 FIX] Critic Unshackling (Expert Phase 5)
+                # Removed manual 0.1 suppression. Scaler now manages balance via ALI.
+                'critic': critic_loss.mean(),
                 'aux': aux_loss.mean(),              # Clinical Anchor (0.5)
                 'acl': acl_loss.mean()               # (1.5)
             }
@@ -1893,11 +1892,20 @@ class ICUGeneralistWrapper(pl.LightningModule):
             tcb_q = torch.cat([global_ctx[:B], global_ctx_expert[B:]], dim=0)
             tcb_k = torch.cat([teacher_global, ghost_batch["anchors"]], dim=0)
 
+            # [SOTA P14] Patient-Aware Negative Gating (PANG)
+            # Rationale: Enables relational masking to prevent sliding-window self-contrast.
+            # Adler32 provides deterministic bits for DDP consensus without host-sync.
+            p_ids_raw = batch["patient_id"]
+            p_ids_h = torch.tensor([zlib.adler32(str(s).encode()) for s in p_ids_raw], device=self.device)
+            ghost_ids_h = torch.zeros(num_ghosts, dtype=torch.long, device=self.device)
+            tcb_ids_local = torch.cat([p_ids_h, ghost_ids_h], dim=0)
+
             if dist.is_initialized():
                 # [v30.5 SOTA FIX] Asymmetric Gather Protection for Contrastive Memory
                 # 1. Gather queries and keys for global contrastive loss
                 tcb_q_global = torch.cat(SOTA_DistributedGatherer.gather_asymmetric(tcb_q), dim=0)
                 tcb_k_global = torch.cat(SOTA_DistributedGatherer.gather_asymmetric(tcb_k), dim=0)
+                tcb_ids_global = torch.cat(SOTA_DistributedGatherer.gather_asymmetric(tcb_ids_local), dim=0)
                 
                 # 2. Gather negative mask
                 is_negative = (batch["phase_label"] == 0)
@@ -1909,6 +1917,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 tcb_out = self.tcb_buffer(
                     tcb_q_global, 
                     tcb_k_global, 
+                    ids_q=tcb_ids_global,
+                    ids_k=tcb_ids_global,
                     enqueue_mask=tcb_enqueue_mask_global
                 )
             else:
@@ -1919,6 +1929,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 tcb_out = self.tcb_buffer(
                     tcb_q, 
                     tcb_k, 
+                    ids_q=tcb_ids_local,
+                    ids_k=tcb_ids_local,
                     enqueue_mask=tcb_enqueue_mask
                 )
             l_tcb = tcb_out["loss"]
@@ -2035,6 +2047,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
                    if any(x in k.lower() for x in ["critic", "phys"]):
                        loss_dict[k] = loss_dict.get(k, 0.0) * smooth_penalty
             
+            # [SOTA P13] ALI Trigger: Architectural Manifold Auto-Calibration
+            # Rationale: Ensures Critic and Clinical tasks start with gradient parity 
+            # relative to the Diffusion anchor, escaping the "Dead Critic" initialization.
+            if not self.loss_scaler.is_calibrated:
+                self.loss_scaler.calibrate_log_vars(loss_dict, anchor_key='diffusion')
+
             # [SOTA 2025] Exclusive Uncertainty Scaling
             # phys_loss is now a managed task in the conflict loop.
             # [v26.5 FIX] Pass curriculum-based physics multiplier to the scaler.

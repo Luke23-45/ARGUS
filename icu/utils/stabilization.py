@@ -390,12 +390,23 @@ class TrendSentinel:
     """
     @staticmethod
     def calculate_z_score(current_val: Union[float, torch.Tensor], ema: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-        """Computes the standard deviation distance from the moving baseline."""
+        """
+        [SOTA 2026] Computes the scale-invariant directional standard deviation distance.
+        Directional (Clamp min=0): Downward drops (convergence) do not trigger anomalies.
+        Relative Floor (EMA * 0.1): Prevents hypersensitivity when gradients stabilize at large magnitudes.
+        """
         if not isinstance(current_val, torch.Tensor):
             current_val = torch.as_tensor(current_val, device=ema.device)
-        diff = torch.abs(current_val - ema)
-        # Use a floor for std to prevent division by zero in stable regimes
-        safe_std = torch.clamp(std, min=0.05) 
+            
+        # 1. Directional Numerator: Only penalize upward spikes (Exploding Gradients)
+        # Drops below EMA are healthy convergence, so deviation is 0.0.
+        diff = torch.clamp(current_val - ema, min=0.0)
+        
+        # 2. Dynamic Scale-Invariant Floor:
+        # Guarantees at least a 10% relative tolerance margin for mini-batch stochasticity.
+        dynamic_floor = (ema * 0.1) + 0.05
+        safe_std = torch.clamp(std, min=dynamic_floor) 
+        
         return diff / safe_std
 
     @staticmethod

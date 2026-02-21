@@ -41,6 +41,7 @@ class BayesianProjectedScaler(nn.Module):
         self.register_buffer("task_counters", torch.zeros(num_tasks))
         self.register_buffer("batch_counter", torch.zeros([1]))
         self.register_buffer("step_count", torch.tensor([0], dtype=torch.long))
+        self.register_buffer("is_calibrated", torch.tensor([False]))
         
         # [v2026 SOTA] Dynamic Scaling Invariant
         # Initialized to -1 to force explicit configuration via scale_dynamics()
@@ -189,6 +190,59 @@ class BayesianProjectedScaler(nn.Module):
         self.log_vars[3].clamp_(max=2.5)
         # 4. Physics Guard
         self.log_vars[6].clamp_(max=3.0)
+
+    @torch.no_grad()
+    def calibrate_log_vars(self, loss_dict: Dict[str, torch.Tensor], anchor_key: str = 'diffusion'):
+        """
+        [SOTA v2026] Architectural ALI (Automatic Log-Var Initialization).
+        Sets log_vars such that all tasks contribute approximately equal gradient magnitudes 
+        relative to the anchor task at Step 0.
+        """
+        device = self.log_vars.device
+        raw_losses = torch.zeros(self.num_tasks, device=device)
+        active_mask = torch.zeros(self.num_tasks, device=device)
+        
+        # 1. Capture local magnitudes
+        for i, key in enumerate(self.keys):
+            if key in loss_dict:
+                # Use .mean() to handle potential sequence/batch dims
+                raw_losses[i] = loss_dict[key].detach().mean()
+                active_mask[i] = 1.0
+
+        # 2. DDP Consensus (Zero-Sync protocol)
+        if torch.distributed.is_initialized():
+            dist_stats = torch.stack([raw_losses, active_mask])
+            torch.distributed.all_reduce(dist_stats, op=torch.distributed.ReduceOp.SUM)
+            # Average across ranks that actually contributed to this task
+            raw_losses = dist_stats[0] / dist_stats[1].clamp(min=1)
+
+        # 3. Derive Balances
+        if anchor_key not in self.keys:
+            logger.error(f"[ALI] anchor_key {anchor_key} not in {self.keys}. Aborting.")
+            return
+            
+        anchor_idx = self.keys.index(anchor_key)
+        target_magnitude = raw_losses[anchor_idx].clamp(min=0.01)
+        
+        # log_var = ln(loss / target) => Weight = target / loss
+        # This equalizes the weighted loss magnitudes to EXACTLY match the anchor.
+        new_log_vars = torch.log(raw_losses.clamp(min=1e-8) / target_magnitude)
+        
+        # 4. Expert Clinical Priors
+        # Physics and TCB start with lower priority to allow the generative manifold to settle.
+        if self.num_tasks > 6:
+            new_log_vars[6] = torch.max(new_log_vars[6], torch.tensor(1.0, device=device)) # phys: Cautious
+        if self.num_tasks > 5:
+            new_log_vars[5] = torch.max(new_log_vars[5], torch.tensor(2.0, device=device)) # tcb: Suppressed
+
+        # 5. Persistent Update
+        # Bound within the PGD projection zone [-1.5, 3.0]
+        new_log_vars = torch.clamp(new_log_vars, min=-1.5, max=3.0)
+        self.log_vars.data.copy_(new_log_vars)
+        self.loss_emas.data.copy_(raw_losses)
+        self.is_calibrated.fill_(True)
+        
+        logger.info(f"[ALI] Manifold Harmonized: log_vars={self.log_vars.data.tolist()}")
 
     def assert_clean(self):
         """Epoch boundary guard."""
