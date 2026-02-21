@@ -91,34 +91,59 @@ class ScalingSteward:
     
     Ensures that training dynamics (effective memory windows, adaptation rates, 
     and capacity) are invariant to the number of training steps per epoch.
-    
-    Laws:
-    1. Exponential Invariance: Scales decays/momentum for epoch-level parity.
-    2. Linear Volume: Scales capacities/steps for data-coverage parity.
     """
-    REF_STEPS = 1176 # [SOTA FIX v1.4] Aligned with Phase 1 Training Density
+    # [SOTA REFERENCE ANCHORS]
+    # Rationale: These represent the experimental 'Golden State' density 
+    # where the original hyperparameters (Decay=0.99, etc.) were tuned.
+    # DO NOT CHANGE THESE unless you are re-tuning the entire hyperparameter suite.
+    SOTA_REF_STEPS = 1176    # The "Sea Level" density (Benchmark)
+    SOTA_REF_WARMUP = 1000   # The "Sea Level" warmup (Benchmark)
+    SOTA_REF_SAFE_BUDGET = 10000 # The "Sea Level" total steps (Benchmark)
 
     @staticmethod
-    def get_decay(ref_decay: float, n_curr: int) -> float:
-        """
-        Scales an EMA decay factor to maintain identical half-life in epoch terms.
-        Formula: v_curr = v_ref^(N_ref / N_curr)
-        """
-        if n_curr <= 0: return ref_decay
-        # v1.0: Use log-space/power laws for numerical stability on extreme densities
-        return float(ref_decay ** (ScalingSteward.REF_STEPS / n_curr))
-
-    @staticmethod
-    def get_steps(ref_steps: int, n_curr: int) -> int:
+    def get_steps(target_steps: int, n_curr: int, ref_steps: int = SOTA_REF_STEPS) -> int:
         """
         Scales a step count or capacity linearly with batch density.
         Formula: v_curr = v_ref * (N_curr / N_ref)
         """
-        if n_curr <= 0: return ref_steps
-        return int(ref_steps * (n_curr / ScalingSteward.REF_STEPS))
+        if n_curr <= 0: return target_steps
+        return int(target_steps * (n_curr / max(1, ref_steps)))
 
     @staticmethod
-    def get_decay(base_decay: float, num_steps: int) -> float:
+    def get_unified_scaling(lr_ref: float, wd_ref: float, n_curr: int, ref_steps: int = SOTA_REF_STEPS, alpha: float = 0.5) -> Tuple[float, float]:
+        """
+        [v2026 SOTA] Invariant Kinetic Energy Law for AdamW.
+        
+        Rationale: To preserve total regularization energy per epoch (N * LR * WD),
+        if steps (N) increase by k, then (LR * WD) must decrease by 1/k.
+        
+        Laws (Conservation of Manifold Speed):
+        1. LR_new = LR_ref * (n_curr / n_ref) ^ -alpha
+        2. WD_new = WD_ref * (n_curr / n_ref) ^ -(1 - alpha)
+        
+        This ensures: N_curr * LR_new * WD_new = N_ref * LR_ref * WD_ref
+        (i.e., The physics of the model manifold remains invariant).
+        
+        Args:
+            lr_ref: Reference Learning Rate.
+            wd_ref: Reference Weight Decay.
+            n_curr: Current steps per epoch.
+            ref_steps: Reference steps per epoch (1176).
+            alpha: Scaling aggressiveness (0.5 = Sqrt, 1.0 = Linear).
+                   SOTA preference for AdamW-Transformers is 0.5 (Sqrt).
+        """
+        if n_curr <= 0: return lr_ref, wd_ref
+        import math
+        k = float(n_curr) / float(ref_steps)
+        
+        # We use negative exponents to counter-balance the increase in N
+        lr_new = lr_ref * math.pow(k, -alpha)
+        wd_new = wd_ref * math.pow(k, -(1.0 - alpha))
+        
+        return lr_new, wd_new
+
+    @staticmethod
+    def get_decay(base_decay: float, num_steps: int, ref_steps: int = SOTA_REF_STEPS) -> float:
         """
         [SOTA 2026] Scales decay rates to preserve effective memory window.
         
@@ -132,12 +157,13 @@ class ScalingSteward:
         if num_steps < 10: return base_decay
         
         # Calculate scaling exponent
-        exponent = ScalingSteward.REF_STEPS / float(num_steps)
+        exponent = float(ref_steps) / float(num_steps)
         
         # Apply scaling
         # Note: We clamp the exponent to avoid numerical instability
         exponent = max(0.1, min(10.0, exponent))
         
+        import math
         return math.pow(base_decay, exponent)
 
     @staticmethod

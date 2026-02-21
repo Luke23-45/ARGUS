@@ -137,7 +137,7 @@ def ensure_data_ready(
     try:
         # Dynamic import to avoid circular dependencies at module level
         # This assumes `build_dataset.py` exists in the same package or is accessible.
-        from .build_dataset import run_build_pipeline, main as build_main
+        from .build_dataset import run_build_pipeline
         
         # Ensure directory exists
         dataset_path.mkdir(parents=True, exist_ok=True)

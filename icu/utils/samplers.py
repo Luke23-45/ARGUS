@@ -41,7 +41,8 @@ class EpisodeAwareSampler(Sampler[int]):
                  shuffle: bool = True, 
                  seed: int = 42, 
                  drop_last: bool = False):
-        super().__init__(dataset)
+        # [FIX] PyTorch 2.x Sampler is abstract base - don't pass dataset to super().__init__()
+        super().__init__()
         
         self.dataset = dataset
         self.shuffle = shuffle

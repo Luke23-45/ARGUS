@@ -140,9 +140,10 @@ class ICUConfig:
     idx_elec_end: int = 22
     idx_static_start: int = 22
 
-    # [v4.2.1 SOTA] Clinical Importance Mapping
+    # [PATCH #7] Expanded Clinical Importance Mapping
     importance_weights: Dict[str, float] = field(default_factory=lambda: {
-        "4": 2.0, "2": 2.0, "1": 2.0, "7": 1.5, "0": 1.2
+        "map": 2.0, "sbp": 2.0, "o2sat": 2.0, "lactate": 1.5, "hr": 1.2,
+        "creatinine": 1.5, "bilirubin": 1.5, "platelets": 1.3, "ph": 1.3
     })
 
 # =============================================================================
@@ -526,7 +527,7 @@ class TemporalFusionEncoder(nn.Module):
         self.temporal_sampler = TemporalSampler(cfg.d_model)
 
         # RoPE for history sequence (Legacy: NTHEncoder handles its own RoPE now, but kept for compatibility if mixed)
-        self.rope = RotaryEmbedding(cfg.d_model // cfg.n_heads, max_seq_len=cfg.history_len + 24)
+        self.rope = RotaryEmbedding(cfg.d_model // cfg.n_heads, max_seq_len=cfg.history_len + cfg.pred_len)
         
         # Encoder Layers (NTH Architecture)
         self.layers = nn.ModuleList([
@@ -1148,17 +1149,28 @@ class ICUUnifiedPlanner(nn.Module):
             base_p=cfg.base_safety_percentile,
             min_p=cfg.min_safety_percentile
         )
-        self.clinical_feat_idx = {'hr': 0, 'o2sat': 1, 'sbp': 2, 'map': cfg.idx_map, 'lactate': cfg.idx_lactate, 'resp': 5}
+        # [PATCH #7] Expanded Clinical Feature Registry
+        self.clinical_feat_idx = {
+            'hr': 0, 'o2sat': 1, 'sbp': 2, 'map': 4, 'lactate': 7, 'resp': 5,
+            'creatinine': 8, 'bilirubin': 9, 'platelets': 10, 'ph': 12
+        }
         
         # [v4.2 SOTA Pillar 3] Life-Critical MSE Weighting
-        # Indices: MAP=4, O2Sat=1, Lactate=7, HR=0, SBP=2, Resp=5
         # Standard weights are 1.0. We boost high-stakes channels.
-        weights_dict = getattr(cfg, "importance_weights", {
-            "4": 2.0, "2": 2.0, "1": 2.0, "7": 1.5, "0": 1.2
-        })
+        # Resolves names from ICUConfig.importance_weights (e.g., 'map' -> 4)
         weights = torch.ones(cfg.input_dim)
-        for idx, w in weights_dict.items():
-            weights[int(idx)] = w
+        importance_dict = getattr(cfg, "importance_weights", {})
+        
+        for feat_name, weight in importance_dict.items():
+            if feat_name in self.clinical_feat_idx:
+                idx = self.clinical_feat_idx[feat_name]
+                weights[idx] = weight
+            elif feat_name.isdigit():
+                # Backward compatibility for index-based strings
+                weights[int(feat_name)] = weight
+            else:
+                logger.warning(f"[APEX] Unknown importance weight feature: {feat_name}")
+                
         self.register_buffer("importance_weights", weights)
 
         # [v4.2 SOTA Pillar 4] Adaptive Safety Envelope Sigma
@@ -1240,8 +1252,11 @@ class ICUUnifiedPlanner(nn.Module):
         if self.cfg.use_self_conditioning:
             self_cond_tensor = torch.zeros_like(noisy_fut)
             
-            # 50% probability of using a preliminary x0 estimate
-            if self.training and (random.random() < 0.5):
+            # [v2026 SOTA FIX] DDP-Safe Stochastic Branching (Abyssal #3.3)
+            # Rationale: random.random() is unsafe in DDP as CPU seeds may diverge.
+            # We use torch.rand(1) which respects the synchronized global seed.
+            roll = torch.rand(1, device=past.device)
+            if self.training and (roll < 0.5):
                 with torch.no_grad():
                     # Pass 1: "Guess" noisy epsilon
                     guess_eps = self.backbone(

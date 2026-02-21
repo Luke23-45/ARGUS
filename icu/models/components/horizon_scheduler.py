@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import logging
+from icu.utils.train_utils import ScalingSteward
 
 logger = logging.getLogger("ClinicalHorizonScheduler")
 
@@ -32,17 +33,27 @@ class ClinicalHorizonScheduler(nn.Module):
         
     def get_gamma(self, current_epoch: int) -> float:
         """Calculates gamma based on epoch (Legacy)."""
-        # [v29.5] Redirect to step-based logic using a default n_batches=200
-        return self.get_gamma_step(current_epoch * 200)
+        # [SOTA FIX - DYNAMIC BUDGET] Use initialized dynamic parameter or tuning baseline
+        spe = getattr(self, 'steps_per_epoch', ScalingSteward.SOTA_REF_STEPS)
+        return self.get_gamma_step(current_epoch * spe)
+
+    def scale_dynamics(self, steps_per_epoch: int):
+        """[SOTA v2026] Unifies horizon ramps across step densities."""
+        if steps_per_epoch <= 0: return
+        self.steps_per_epoch = steps_per_epoch
+        logger.info(f"[Horizon] Scaling Dynamics: {steps_per_epoch} steps/epoch")
 
     def get_gamma_step(self, total_steps: int) -> float:
         """
         [v29.5 SOTA FIX] Step-Invariant Horizon Ramp (Abyssal #5).
-        Uses ScalingSteward reference steps to ensure identical ramps across densities.
+        Uses current steps_per_epoch to ensure identical ramps across densities.
         """
-        # Ref: 200 steps = 1 epoch
-        warmup_steps = self.warmup_epochs * 200
-        ramp_steps = self.ramp_epochs * 200
+        # [SOTA FIX - DYNAMIC BUDGET] Dynamic Epoch Bound: 1 epoch = self.steps_per_epoch
+        # Fallback to SOTA reference if scale_dynamics hasn't been called
+        spe = getattr(self, 'steps_per_epoch', ScalingSteward.SOTA_REF_STEPS)
+        
+        warmup_steps = self.warmup_epochs * spe
+        ramp_steps = self.ramp_epochs * spe
         
         if total_steps < warmup_steps:
             return self.start_gamma

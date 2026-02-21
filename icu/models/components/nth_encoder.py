@@ -210,6 +210,51 @@ class NTHAttention(nn.Module):
         
         return self.norm(residual + out)
 
+class RMSNorm(nn.Module):
+    """
+    [2025 SOTA] Root Mean Square Layer Normalization.
+    Faster and more stable than standard LayerNorm for deep transformers.
+    """
+    def __init__(self, d_model: int, eps: float = 1e-8):
+        super().__init__()
+        self.eps = eps
+        self.scale = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x):
+        norm_x = x.norm(2, dim=-1, keepdim=True)
+        rms_x = norm_x * (x.size(-1) ** -0.5)
+        return self.scale * x / (rms_x + self.eps)
+
+class SotaTransformerBlock(nn.Module):
+    """
+    [2025 SOTA] Pre-RMSNorm + RoPE + SwiGLU Block.
+    Standard block for clinical sequence modeling.
+    """
+    def __init__(self, d_model: int, n_heads: int, drop_path_prob: float = 0.1):
+        super().__init__()
+        self.norm1 = RMSNorm(d_model)
+        self.attn = RoPEMultiheadAttention(d_model, n_heads)
+        self.norm2 = RMSNorm(d_model)
+        self.ffn_net = nn.Sequential(
+            SwiGLU(d_model, d_model * 4), 
+            nn.Linear(d_model * 4, d_model)
+        )
+        self.dropout = nn.Dropout(0.1)
+        self.drop_path = DropPath(drop_path_prob) if drop_path_prob > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # 1. Pre-Norm Attention
+        x_norm = self.norm1(x)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm, key_padding_mask=mask)
+        x = x + self.drop_path(self.dropout(attn_out))
+        
+        # 2. Pre-Norm FFN (SwiGLU)
+        x_norm = self.norm2(x)
+        ffn_out = self.ffn_net(x_norm)
+        x = x + self.drop_path(self.dropout(ffn_out))
+        
+        return x
+
 class NTHEncoderBlock(nn.Module):
     """
     [Step 3] The Combined NTH/TFT Encoder Block.

@@ -56,7 +56,6 @@ class TemporalContrastiveBuffer(nn.Module):
     def scale_dynamics(self, n_curr: int):
         """[SOTA v2026] Unifies buffer capacity across step densities."""
         if n_curr <= 0: return
-        
         new_capacity = ScalingSteward.get_steps(self.base_capacity, n_curr)
         if new_capacity != self.capacity:
              logger.info(f"[TCB] Scaling Capacity: {self.capacity} -> {new_capacity}")
@@ -74,17 +73,28 @@ class TemporalContrastiveBuffer(nn.Module):
              # Copy old data
              new_queue[:num_to_keep] = old_queue[:num_to_keep]
              self.register_buffer("queue", new_queue)
-             self.queue_filled.fill_(min(int(self.queue_filled), num_to_keep))
+             # Update pointers
+             new_filled = min(int(self.queue_filled), new_capacity)
+             self.queue_filled.fill_(new_filled)
+             self.queue_ptr.fill_(new_filled % new_capacity)
+             
+             # Sync shadows
+             self._shadow_filled = new_filled
+             self._shadow_ptr = new_filled % new_capacity
 
         # Scale adapter: (1 - strength) is the retention factor.
-        retention_ref = 1.0 - self.base_latent_adapter_strength
         retention_curr = ScalingSteward.get_decay(retention_ref, n_curr)
         self.latent_adapter_strength.fill_(1.0 - retention_curr)
         
         # [v31.0 SOTA FIX] Prototype Momentum Scaling (Smoking Gun #330)
-        # Rationale: Manifold anchoring must adapt at the same epoch-rate.
         scaled_mom = ScalingSteward.get_decay(0.99, n_curr)
         self.prototype_momentum.fill_(scaled_mom)
+
+        # [v2026 SOTA FIX] Unconditional Shadow Sync (Smoking Gun #Desync)
+        # Rationale: On resumption, registered buffers are loaded but local Python 
+        # shadow variables are 0. We must sync them even if capacity didn't change.
+        self._shadow_filled = int(self.queue_filled)
+        self._shadow_ptr = int(self.queue_ptr)
 
     @torch.no_grad()
     def _dequeue_and_enqueue(self, keys: torch.Tensor, scores: Optional[torch.Tensor] = None):
@@ -112,6 +122,7 @@ class TemporalContrastiveBuffer(nn.Module):
         # But we need to update 'queue_filled'.
         # We can just proceed.
         
+        # [FIX] Recalculate batch_size AFTER filtering to ensure consistency
         batch_size = keys.shape[0]
         if batch_size == 0:
             return

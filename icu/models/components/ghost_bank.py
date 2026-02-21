@@ -126,7 +126,6 @@ class SepsisGhostBank(nn.Module):
         """[SOTA v2026] Unifies bank capacity and decay across step densities."""
         if n_curr <= 0: return
         
-        # 1. Scale EMA Decays
         self.prototype_ema_decay.fill_(ScalingSteward.get_decay(0.99, n_curr))
         # Adapt mix rate: (1 - strength) is the retention factor.
         retention_ref = 1.0 - self.base_latent_adapter_strength
@@ -214,6 +213,14 @@ class SepsisGhostBank(nn.Module):
         if uncertainties is not None: uncertainties = uncertainties[is_finite]
 
         B = vitals.shape[0]
+        
+        # [v2026 SOTA FIX] DDP-Consensus Prototype Update (Abyssal #3.4)
+        # Rationale: Regardless of whether local B == 0, ALL ranks must call
+        # _update_prototype as it contains a DDP all_reduce. 
+        # Skipping this on rank-varying batch sizes (e.g. epoch tail) causes deadlock.
+        eff_decay = 0.1 if prototype_burst else None
+        self._update_prototype(latents, decay_override=eff_decay)
+        
         if B == 0: return
 
         # Intra-Batch Filtering
@@ -231,9 +238,6 @@ class SepsisGhostBank(nn.Module):
         else: uncertainties = torch.zeros(vitals.shape[0], 1, device=device)
         B = vitals.shape[0]
 
-        # Prototype Consensus
-        eff_decay = 0.1 if prototype_burst else None
-        self._update_prototype(latents, decay_override=eff_decay)
 
         # Vectorized Global Check
         # Rationale: Using the shadow variable for the size check to avoid sync.

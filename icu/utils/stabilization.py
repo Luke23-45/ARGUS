@@ -46,7 +46,7 @@ class StableContrastiveLoss(nn.Module):
     def scale_dynamics(self, n_curr: int):
         """[SOTA v2026] Unifies contrastive momentum across step densities."""
         if n_curr <= 0: return
-        # Baseline 0.99 for 200 steps
+        # Baseline 0.99 tuned on SOTA reference density
         self.momentum = ScalingSteward.get_decay(0.99, n_curr)
 
     def forward(self, features: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -206,7 +206,7 @@ class RobustLossScaler(nn.Module):
     def scale_dynamics(self, n_curr: int):
         """[SOTA v2026] Unifies uncertainty decay across step densities."""
         if n_curr <= 0: return
-        # Baseline 0.99 for 200 steps
+        # Baseline 0.99 tuned on SOTA reference density
         self.decay_buffer.fill_(ScalingSteward.get_decay(0.99, n_curr))
         self.decay = float(self.decay_buffer.item())
 
@@ -252,7 +252,7 @@ def unitwise_norm(x: torch.Tensor, norm_type: float = 2.0):
         # Norm over all dims except the first (output channels/features)
         return x.norm(norm_type, dim=tuple(range(1, x.ndim)), keepdim=True)
 
-def adaptive_gradient_clip_(parameters, clip_factor: float = 0.1, eps: float = 1e-3):
+def adaptive_gradient_clip_(parameters, clip_factor: float = 0.1, eps: float = 1e-2):
     """
     [SOTA v2025] Fused Adaptive Gradient Clipping (PyTorch 2.0+).
     Uses _foreach_ implementation to eliminate Python loop overhead.

@@ -956,11 +956,8 @@ def get_sota_callbacks(cfg: DictConfig) -> List[Callback]:
     
     # [SOTA] Only create EMACallback if use_teacher is enabled
     if cfg.model.get("use_teacher", False) and ema_decay > 0:
-        # [v2026] Scale EMA decay for epoch-level parity
-        n_curr = trainer.num_training_batches if trainer is not None else ScalingSteward.REF_STEPS
-        if n_curr > 0:
-            ema_decay = ScalingSteward.get_decay(ema_decay, n_curr)
-            
+        # [SOTA FIX - DYNAMIC BUDGET] Removed broken static initialization scaling.
+        # Dynamic scaling based on batches should be executed in on_train_start if desired.
         callbacks.append(EMACallback(
             decay=ema_decay, 
             update_every=ema_update_every

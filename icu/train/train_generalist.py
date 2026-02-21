@@ -315,7 +315,7 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
         from icu.utils.samplers import WeightedEpisodeSampler
         self.sampler = WeightedEpisodeSampler(
             self.train_ds, 
-            target_prevalence=0.10,
+            target_prevalence=0.15,
             shuffle=True, 
             seed=self.cfg.seed,
             drop_last=True
@@ -530,6 +530,7 @@ def main(cfg: DictConfig):
         num_sanity_val_steps=0,  # [FIX] Allow calibration first
         accumulate_grad_batches=cfg.train.get("accumulate_grad_batches", 1),
         val_check_interval=cfg.train.get("val_check_interval", 1.0),
+
         # [PERF] Limit validation batches for speed during experimentation
         limit_val_batches=cfg.train.get("debug_limit_val", 20) if cfg.train.get("debug_run", False) else cfg.train.get("limit_val_batches", 1.0),
         # [DEBUG] Limit training batches for rapid smoke test

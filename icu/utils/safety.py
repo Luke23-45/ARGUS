@@ -46,8 +46,9 @@ class SafetyConfig:
     Derived from PhysioNet 2019 Challenge & Sepsis-3 Guidelines.
     """
     # Max absolute jump between time steps (1h)
-    MAX_DELTA_SBP = 60.0   # mmHg (Relaxed from 40.0 for early training stability)
-    MAX_DELTA_HR = 60.0    # bpm (Relaxed from 50.0 for early training stability)
+    MAX_DELTA_SBP = 40.0  # mmHg (Systolic Blood Pressure) [REVERTED] Tight Safety Bounds (Physiological Limits)
+    # Rationale: 60.0 was too loose, allowing clinically dangerous oscillations.
+    MAX_DELTA_HR = 50.0   # bpm (Heart Rate)
     MAX_DELTA_MAP = 30.0   # mmHg
     
     # Absolute Physiological Bounds (Life-Critical)

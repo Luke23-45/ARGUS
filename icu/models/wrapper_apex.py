@@ -353,7 +353,7 @@ class ICUSpecialistWrapper(pl.LightningModule):
         """[SOTA v2026] Unified Mathematical Hyperparameter Scaling for Phase 2."""
         n_curr = self.trainer.num_training_batches
         
-        logger.info(f"⚡ [SOTA] Phase 2 Scaling: Unifying dynamics for {n_curr} steps (Ref: {ScalingSteward.REF_STEPS})")
+        logger.info(f"⚡ [SOTA] Phase 2 Scaling: Unifying dynamics for {n_curr} steps (Ref: {ScalingSteward.SOTA_REF_STEPS})")
         
         # 1. Scale AWR Engine (Advantage-Weighted Regression)
         # Specialist training depends heavily on these weights.
