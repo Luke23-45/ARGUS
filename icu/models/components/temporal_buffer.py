@@ -83,6 +83,7 @@ class TemporalContrastiveBuffer(nn.Module):
              self._shadow_ptr = new_filled % new_capacity
 
         # Scale adapter: (1 - strength) is the retention factor.
+        retention_ref = 1.0 - self.base_latent_adapter_strength
         retention_curr = ScalingSteward.get_decay(retention_ref, n_curr)
         self.latent_adapter_strength.fill_(1.0 - retention_curr)
         
@@ -122,8 +123,17 @@ class TemporalContrastiveBuffer(nn.Module):
         # But we need to update 'queue_filled'.
         # We can just proceed.
         
-        # [FIX] Recalculate batch_size AFTER filtering to ensure consistency
+        # [v2026 SOTA FIX] Batch Size Hard-Cap (Smoking Gun #Overflow)
+        # Rationale: If steps/epoch is low (debug or small dataset), scaled capacity 
+        # might be smaller than the batch size (rank_batch * world_size). 
+        # We cap intake to the bank's total capacity.
         batch_size = keys.shape[0]
+        if batch_size > self.capacity:
+            keys = keys[-self.capacity:]
+            if scores is not None:
+                scores = scores[-self.capacity:]
+            batch_size = self.capacity
+
         if batch_size == 0:
             return
 

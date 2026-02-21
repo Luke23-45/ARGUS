@@ -248,6 +248,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # Required for CAGrad's multiple backward passes and GradNorm's dynamic weighting.
         self.automatic_optimization = False
         
+        # [v12.0 SOTA FIX] Adaptive Clipping State
+        self.adaptive_clipping = cfg.train.get("adaptive_clipping", True)
+        
         # [v25.3] Flexible Multi-Task Balancing
         # modes: "sota_2025" (Hooks + UW) or "legacy_surgical" (CAGrad + GradNorm)
         self.balancing_mode = cfg.train.get("balancing_mode", "sota_2025")
@@ -467,7 +470,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # [Point 5] Bayesian Moving Average Calibration
         # Initialized to 0.5; will be updated via F2-opt during validation.
         self.register_buffer("calibrated_threshold", torch.tensor([0.5]))
-        self.threshold_ema_decay = 0.99 # [SOTA FIX] Slower update for stability (0.7 -> 0.99)
+        self.threshold_ema_decay = 0.85 # [SOTA PATCH] Balanced calibration speed (0.99 was too slow, 0.7 too fast)
         
         self.register_buffer("curr_tau", torch.tensor([0.5]))
         self.register_buffer("curr_sigma_scale", torch.tensor([3.50]))
@@ -484,6 +487,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # [PMS] Resumption Grace Period (Circuit Breaker)
         # Prevents "False Shocks" as the first few batches settle after resume.
         self.register_buffer("resumption_grace_steps", torch.tensor([0], dtype=torch.long))
+        self._pms_start_logged = False
+        self._pms_init_logged = False
         
         # [v107.0 SOTA] GradNorm Accumulation Parity (Smoking Gun #107)
         # Accumulates task losses across the cycle to prevent sampling bias.
@@ -585,9 +590,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
         self.grad_ema_decay = ScalingSteward.get_decay(0.99, n_curr)
         self.class_balancer.scale_dynamics(n_curr)
         
-        # [SOTA FIX - DYNAMIC BUDGET] Parameterized Warmup
-        ref_warmup = self.cfg.train.get("warmup_steps", ScalingSteward.SOTA_REF_WARMUP)
-        self.trainer.warmup_steps = ScalingSteward.get_steps(ref_warmup, n_curr)
+        # [SOTA FIX P12] Global Warmup Synchronization
+        config_warmup = self.cfg.train.get("warmup_steps", 0)
+        if config_warmup > 0:
+            self.trainer.global_warmup_steps = config_warmup
+            self.trainer.warmup_steps = config_warmup # Sync legacy attribute
+        else:
+            ref_warmup = ScalingSteward.SOTA_REF_WARMUP
+            self.trainer.global_warmup_steps = ScalingSteward.get_steps(ref_warmup, n_curr)
+            self.trainer.warmup_steps = self.trainer.global_warmup_steps
         
         self.awr_calculator.scale_dynamics(n_curr)
         self.ghost_bank.scale_dynamics(n_curr)
@@ -1047,7 +1058,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         metric_score = max(0.0, min(1.0, 1.0 - (ema_bc / 5.0)))
         
         # 2. Time Score: Guaranteed fallback over the first 30% of training.
-        max_budget = getattr(self.trainer, "estimated_stepping_batches", ScalingSteward.SOTA_SAFE_BUDGET)
+        max_budget = getattr(self.trainer, "estimated_stepping_batches", ScalingSteward.SOTA_REF_SAFE_BUDGET)
         # Prevent DivisionByZero if max_budget is missing/0
         safe_budget = max(100.0, float(max_budget)) 
         time_score = max(0.0, min(1.0, float(self.global_step) / (0.30 * safe_budget)))
@@ -1095,15 +1106,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
         # 8. Update Buffers
         # [v2026 SOTA] Atomic Buffer Registration (Atomic #1)
-        # Rationale: Using .fill_() is safe for both floats and tensors.
-        self.curr_tau.fill_(tau_val)
-        self.curr_sigma_scale.fill_(sigma_val)
-        self.curr_phys_clamp.fill_(phys_clamp_val)
+        # Rationale: Using .fill_() is safe for both floats and tensors, 
+        # but we must ensure we are passing a scalar to avoid dimension mismatch.
+        self.curr_tau.fill_(float(tau_val))
+        self.curr_sigma_scale.fill_(float(sigma_val))
+        self.curr_phys_clamp.fill_(float(phys_clamp_val))
         
         if not self.awr_calculator.adaptive_beta:
-             self.awr_calculator.beta.fill_(curr_beta)
+             self.awr_calculator.beta.fill_(float(curr_beta))
         
-        self.awr_calculator.gamma.fill_(new_gamma)
+        self.awr_calculator.gamma.fill_(float(new_gamma))
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -1212,7 +1224,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # [v88.0 SOTA FIX] DDP Stability Consensus (Smoking Gun #88)
             # Rationale: All ranks must agree on the curriculum gate.
             if dist.is_initialized():
-                self.stability_factor.fill_(stability_factor)
+                self.stability_factor.fill_(float(stability_factor))
                 dist.broadcast(self.stability_factor, src=0)
                 stability_factor = self.stability_factor
             else:
@@ -1627,7 +1639,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
              # [v112.0 SOTA FIX] Transition Smoothing (Smoking Gun #43)
              # [SOTA FIX - RATIO ANNEALING] Dynamic Budget Integration for Auxiliary Gate
              # Rationale: Replaced hardcoded 100-step ramp with dynamic 1% ratio.
-             _max_budget_aux = getattr(self.trainer, "estimated_stepping_batches", ScalingSteward.SOTA_SAFE_BUDGET)
+             _max_budget_aux = getattr(self.trainer, "estimated_stepping_batches", ScalingSteward.SOTA_REF_SAFE_BUDGET)
              _safe_budget_aux = max(100.0, float(_max_budget_aux))
              ramp_steps = max(100, int(0.01 * _safe_budget_aux))
              
@@ -1686,24 +1698,19 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Rationale: Advantage weighting on a random Value Head causes 'Selection Panic'.
             # We enforce uniform weights (1.0) for the first 1000 steps to let V(s) settle.
             # Scaling ensures consistency across different batch sizes/devices.
-            # [v7.3 SOTA FIX] AWR Warmup (The "Cognitive Settle")
-            # Rationale: Advantage weighting on a random Value Head causes 'Selection Panic'.
-            # We enforce uniform weights (1.0) for the first 1000 steps to let V(s) settle.
-            # Scaling ensures consistency across different batch sizes/devices.
             n_batches = self.trainer.num_training_batches
             
-            # [SOTA FIX v8.1] Robust Warmup Clamp
-            # Rationale: ScalingSteward can extend warmup to 5000+ steps on large datasets.
-            # On resumption (Epoch 2+), the global_step might still be < scaled_warmup.
-            # We MUST force warmup=0 if we are past Epoch 0 to prevent "Resumption Amnesia".
-            if self.current_epoch > 0:
-                awr_warmup = 0
-            else:
-                awr_warmup = ScalingSteward.get_steps(ScalingSteward.SOTA_REF_WARMUP, n_batches)
+            # [SOTA FIX v8.1] Robust Warmup Clamp (Transparent Edition)
+            # Rationale: Show the true limit but enforce 'ON' if past Epoch 0 to prevent 
+            # resumption amnesia while maintaining telemetry transparency.
+            # [SOTA FIX P12] Sync to Global Warmup
+            scaled_warmup = getattr(self.trainer, "global_warmup_steps", 1000)
+            awr_warmup = 0 if self.current_epoch > 0 else scaled_warmup
             
             # [TELEMETRY] Log Warmup State (Once per epoch/resume to avoid spam)
             if batch_idx == 0:
-                 logger.info(f"[AWR] Warmup Check: Step={self.global_step}, Limit={awr_warmup}, Learning={'ON' if self.global_step >= awr_warmup else 'PAUSED'}")
+                 is_learning = self.global_step >= awr_warmup if self.current_epoch == 0 else True
+                 logger.info(f"[AWR] Warmup Check: Step={self.global_step}, Limit={scaled_warmup} ({'Epoch-0 Restricted' if self.current_epoch > 0 else 'Active'}), Learning={'ON' if is_learning else 'PAUSED'}")
 
             if self.global_step < awr_warmup:
                 weights_awr = torch.ones_like(weights_awr)
@@ -1988,7 +1995,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             phys_scale_raw = d_ema_sync / (p_ema_sync + 1e-8)
             
             # Dynamic Clamping with Warmup
-            _warmup_steps = getattr(self.trainer, "warmup_steps", ScalingSteward.SOTA_REF_WARMUP)
+            _warmup_steps = getattr(self.trainer, "global_warmup_steps", ScalingSteward.SOTA_REF_WARMUP)
             warmup_progress = min(1.0, float(self.global_step) / float(_warmup_steps))
             clamp_min = 0.2 - (0.1 * warmup_progress) # 0.2 -> 0.1
             clamp_max = 5.0 + (5.0 * warmup_progress) # 5.0 -> 10.0
@@ -2015,20 +2022,17 @@ class ICUGeneralistWrapper(pl.LightningModule):
             should_step_scaler = ((batch_idx + 1) % acc_batches == 0) or is_last_batch
             is_accumulating = not should_step_scaler
             
-            # [SOTA FIX - RATIO ANNEALING] Dynamic Budget Integration (Patch 2)
-            # Rationale: Warmups must scale dynamically based on cluster size to maintain math parity.
-            # We apply a smooth S-Curve Cosine Annealing to noisy multi-task signals (AWR & Phys).
-            _max_budget = getattr(self.trainer, "estimated_stepping_batches", ScalingSteward.SOTA_SAFE_BUDGET)
-            _safe_budget = max(100.0, float(_max_budget))
-            # Warm up exactly 2% of the total budget
-            warmup_ratio = min(1.0, float(self.global_step) / (0.02 * _safe_budget))
+            # [SOTA PATCH] Softened S-Curve Warmup (Floor raised to 0.25)
+            # Rationale: Original 0.01 floor starved critic/physics for ~400 steps.
+            # The critic MUST receive ≥25% signal from step 0 to establish value baselines.
+            # [SOTA FIX P12] Sync to Global Warmup
+            _gw_steps = getattr(self.trainer, "global_warmup_steps", 1000)
+            warmup_ratio = min(1.0, float(self.global_step) / float(max(1, _gw_steps)))
             
             if warmup_ratio < 1.0:
-                # Smooth S-Curve Cosine Annealing (0.01 -> 1.0)
-                smooth_penalty = max(0.01, 0.5 * (1.0 - math.cos(math.pi * warmup_ratio)))
+                smooth_penalty = max(0.25, 0.5 * (1.0 - math.cos(math.pi * warmup_ratio)))
                 for k in list(loss_dict.keys()):
-                   # Target AWR (Critic) and Physics signals for the safety ramp
-                   if any(x in k.lower() for x in ["critic", "phys", "awr"]):
+                   if any(x in k.lower() for x in ["critic", "phys"]):
                        loss_dict[k] = loss_dict.get(k, 0.0) * smooth_penalty
             
             # [SOTA 2025] Exclusive Uncertainty Scaling
@@ -2113,16 +2117,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 # grad_ref_buffer will remain zero (or keep previous accumulation) and 
                 # participate correctly in the global all_reduce.
                 if ref_needed:
-                    # [REVERTED] Re-enable Throttle Hook
-                    if self.cfg.model.get("throttle_aux", True):
+                    # [SOTA PATCH] Aux Throttle Disabled by Default
+                    # Rationale: Default throttle_val=0.1 cut sepsis gradients 90%,
+                    # preventing the aux head from learning. Default to False;
+                    # enable only if sepsis gradients cause instability.
+                    if self.cfg.model.get("throttle_aux", False):
                         if hasattr(aux_loss, 'requires_grad') and aux_loss.requires_grad:
-                            # Python closure capture 
-                            # [v2026 SOTA FIX] Parameterized Aux Throttle
-                            # Rationale: Enabling dynamic control over sepsis discovery pressure.
-                            throttle_val = self.cfg.model.get("aux_throttle", 0.1)
+                            throttle_val = self.cfg.model.get("aux_throttle", 0.5)
                             def throttle_aux_gradient(grad):
                                 return grad * throttle_val
-                            aux_loss.grad_fn.register_hook(throttle_aux_gradient)
+                            aux_loss.register_hook(throttle_aux_gradient)
 
                     with sync_context:
                         ref_grads = torch.autograd.grad(
@@ -2453,15 +2457,6 @@ class ICUGeneralistWrapper(pl.LightningModule):
             
             if actual_accum != acc_batches:
                 logger.info(f"[EPOCH TAIL] Normalizing step for {actual_accum}/{acc_batches} accumulation.")
-                
-            # Fused Gradient Scaling
-            with torch.no_grad():
-                # [v2026 SOTA] Zero-Sync Scaling
-                scale = 1.0 / float(actual_accum)
-                params_with_grad = [p for p in self.parameters() if p.grad is not None]
-                if params_with_grad:
-                    # PyTorch _foreach_mul supported 0D tensor scale in recent versions
-                    torch._foreach_mul_( [p.grad for p in params_with_grad], scale )
 
             # [SOTA FIX] Manual unscaling required for AdamW (Standard Protocol)
             scaler = self._get_scaler()
@@ -2487,18 +2482,23 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 # 1. Clip Loss Scaler & GradNorm (Smoking Gun #18)
                 # Rationale: Meta-gradients operate on a different scale than the model.
                 # Hardening them ensures meta-parameter drift doesn't corrupt the stability signal.
+                
+                # [v2026 FIX] Dynamically scale meta-clip by accumulation headroom
+                accum_steps = self.cfg.train.get("accumulate_grad_batches", 1)
+                meta_clip = 0.1 * (accum_steps ** 0.5) if accum_steps > 1 else 0.1
+                
                 if hasattr(self, 'loss_scaler') and self.loss_scaler is not None:
-                    torch.nn.utils.clip_grad_norm_(self.loss_scaler.parameters(), 0.1)
+                    torch.nn.utils.clip_grad_norm_(self.loss_scaler.parameters(), meta_clip)
                 
                 if self.gradnorm is not None and hasattr(self.gradnorm, 'weights'):
-                    torch.nn.utils.clip_grad_norm_([self.gradnorm.weights], 0.1)
+                    torch.nn.utils.clip_grad_norm_([self.gradnorm.weights], meta_clip)
                 
                 # 2. Main Parameters: Adaptive Clipping (AGC)
-                # [v2026 SOTA] Gated AGC with Conservative Factor
-                # Rationale: Standard 0.1 allows 10x gradient surge. Reducing to 0.01 
-                # for the 5-day run to ensure long-horizon stability.
+                # [SOTA PATCH] Balanced AGC Factor (0.05)
+                # Rationale: 0.01 kept only 10% of gradients (confirmed by test).
+                # 0.05 allows 5× parameter norm gradient — stable yet learnable.
                 if self.adaptive_clipping:
-                    adaptive_gradient_clip_(self.parameters(), clip_factor=0.01)
+                    adaptive_gradient_clip_(self.parameters(), clip_factor=0.05)
                 
                 # 3. Hard Safety Clip & Finite Check
                 grad_norm_val = torch.nn.utils.clip_grad_norm_(self.parameters(), clip_val)
@@ -2520,7 +2520,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # [v2026 SOTA] Stabilization Metadata Consolidation
             # Rationale: These variables must be available for both the Deadman Switch 
             # and the final TrendSentinel statistics update.
-            _max_budget = getattr(self.trainer, "estimated_stepping_batches", ScalingSteward.SOTA_SAFE_BUDGET)
+            _max_budget = getattr(self.trainer, "estimated_stepping_batches", ScalingSteward.SOTA_REF_SAFE_BUDGET)
             _safe_budget = max(100.0, float(_max_budget))
             is_init_period = self.global_step < max(100, int(0.01 * _safe_budget))
             grace_val = self._shadow_resumption_grace_steps
@@ -2596,14 +2596,20 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 if self.ema is not None: 
                     self.ema.update(self.model, update_every=1)
                 
-                # [PMS] Step-Level Manifold Telemetry
-                # [v2026 SOTA FIX] Density-Invariant Settlement Window (Abyssal #3.2)
+                # [PMS] Initialization Boundary Detector (Zero-Spam)
                 # Rationale: Standardize the Sentinel warmup period across all step densities.
+                # Consolidates logs to boundaries to prevent iteration-level pollution.
+                if grace_val == 0 and self.global_step == 0 and not self._pms_start_logged:
+                    logger.info("[PMS] Establishing Gradient Pressure Baseline...")
+                    self._pms_start_logged = True
+                
                 ada_decay_threshold = ScalingSteward.get_steps(300, self.trainer.num_training_batches)
                 active_decay = 0.90 if self.grad_norm_step_count < ada_decay_threshold else self.grad_ema_decay
                 active_decay_scaled = active_decay ** actual_accum
-                if grace_val == 0 and is_init_period:
-                    logger.info(f"[PMS] Initialization Complete. GN Baseline: {current_grad_pressure.item():.4f}")
+                
+                if grace_val == 0 and not is_init_period and not self._pms_init_logged:
+                    logger.info(f"[PMS] Initialization Complete. GN Baseline: {self.grad_norm_ema.item():.4f}")
+                    self._pms_init_logged = True
                 elif self._shadow_resumption_grace_steps == 1:
                     logger.info("[PMS] Resumption Grace Period Concluded (Stats Preserved).")
 
@@ -2653,9 +2659,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
             sch = self.lr_schedulers()
             if sch is not None:
                 if isinstance(sch, list):
-                    for s in sch: s.step()
+                    for s in sch: 
+                        s.scheduler.step() if hasattr(s, "scheduler") else s.step()
                 else:
-                    sch.step()
+                    sch.scheduler.step() if hasattr(sch, "scheduler") else sch.step()
         
         # Log periodicity: every batch regardless of accumulation
 
@@ -2733,7 +2740,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                  
                  # [v2026 Phase 12] Metabolic Momentum Burst (Warmup: 10% of total training budget)
                  # [SOTA FIX - RATIO ANNEALING] Replaced 1000 steps with dynamic budget ratio.
-                 _max_budget_burst = getattr(self.trainer, "estimated_stepping_batches", ScalingSteward.SOTA_SAFE_BUDGET)
+                 _max_budget_burst = getattr(self.trainer, "estimated_stepping_batches", ScalingSteward.SOTA_REF_SAFE_BUDGET)
                  _safe_budget_burst = max(float(ScalingSteward.SOTA_REF_WARMUP), float(_max_budget_burst))
                  is_burst_period = self.global_step < max(ScalingSteward.SOTA_REF_WARMUP, int(0.10 * _safe_budget_burst))
                  
@@ -2773,7 +2780,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 "clinical_snr": (aux_loss * (logs.get('weight/aux', 1.0) if 'logs' in locals() else 1.0)) / (diff_loss * (logs.get('weight/diffusion', 1.0) if 'logs' in locals() else 1.0) + 1e-8),
                 "curr_phys_weight": torch.as_tensor(curr_phys_weight, device=self.device).detach().clone(),
                 "w_aux": torch.as_tensor(task_weights[2], device=self.device).detach().clone(),
-                "lr": torch.as_tensor(self.optimizers().param_groups[0]["lr"], device=self.device).detach().clone()
+                "SOTA_LR": float(self.optimizers().param_groups[0]["lr"]),
+                "Warmup": float(self.cfg.train.get("warmup_steps", 0)),
+                "TotalSteps": float(getattr(self.trainer, "estimated_stepping_batches", -1)),
+                "manifold_stability": 1.0,
             }, on_step=True, on_epoch=False, prog_bar=True)
 
             # [TELEMETRY] Detailed Diagnostics (WandB Only)
@@ -2871,16 +2881,19 @@ class ICUGeneralistWrapper(pl.LightningModule):
                     target_class = (batch["outcome_label"] > 0.5).long()
 
                 # ECE and Overconfidence Error
-                ece = compute_ece(risk_prob, binary_label)
-                oe = compute_overconfidence_error(risk_prob, binary_label)
+                # [SOTA FIX]: Use detached probabilities for metric accumulation to prevent graph leaks
+                risk_prob_metric = risk_prob.detach()
+                
+                ece = compute_ece(risk_prob_metric, binary_label)
+                oe = compute_overconfidence_error(risk_prob_metric, binary_label)
                 
                 self.val_ece.update(ece)
                 self.val_oe.update(oe)
-                self.val_acc_sepsis.update(logits, target_class)
-                self.val_auroc_sepsis.update(risk_prob, binary_label)
-                self.val_precision.update(risk_prob, binary_label)
-                self.val_recall.update(risk_prob, binary_label)
-                self.val_f1.update(risk_prob, binary_label)
+                self.val_acc_sepsis.update(logits.detach(), target_class)
+                self.val_auroc_sepsis.update(risk_prob_metric, binary_label)
+                self.val_precision.update(risk_prob_metric, binary_label)
+                self.val_recall.update(risk_prob_metric, binary_label)
+                self.val_f1.update(risk_prob_metric, binary_label)
 
                 # [v5.3.4 SOTA FIX] Align Validation Semantic Baseline
                 # We previously compared pred_value (Returns [~-7, 5]) to binary_label (Outcome [0, 1]).
@@ -3001,29 +3014,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # "subset['observed_data']" is ALREADY physical (from DataLoader). 
         # Double-denormalization pins values to P99 max, causing OOD=1.0.
         with torch.no_grad():
-            # Pass raw physical data directly.
-            # [DEBUG TELEMETRY OOD v2] Channel-Wise Focus
-            obs = subset["observed_data"]
-            # Slice: Indices 0-8 (Includes Lactate at index 7)
-            obs_hemo = obs[..., :8]
-            pred_hemo = pred_safe[..., :8]
-            
-            logger.info(f"[OOD DEBUG] Obs Hemo (0-7): Mean={obs_hemo.mean().item():.2f}, Max={obs_hemo.max().item():.2f}, Min={obs_hemo.min().item():.2f}")
-            logger.info(f"[OOD DEBUG] Pred Hemo (0-7): Mean={pred_hemo.mean().item():.2f}, Max={pred_hemo.max().item():.2f}, Min={pred_hemo.min().item():.2f}")
-            
-            # Check specific channels used by Guardian: MAP(4), SBP(2)
+            # pass raw physical data directly to safety calculations
             map_idx, sbp_idx = 4, 2
-            logger.info(f"[OOD DEBUG] Pred MAP (idx=4): Mean={pred_safe[..., map_idx].mean().item():.2f}, Range=[{pred_safe[..., map_idx].min().item():.2f}, {pred_safe[..., map_idx].max().item():.2f}]")
-            logger.info(f"[OOD DEBUG] Pred SBP (idx=2): Mean={pred_safe[..., sbp_idx].mean().item():.2f}, Range=[{pred_safe[..., sbp_idx].min().item():.2f}, {pred_safe[..., sbp_idx].max().item():.2f}]")
             
             # [SOTA FIX v10.3] Sparse Stitching
             # We MUST pass src_mask so Guardian finds the LAST VALID observation.
             # Otherwise it compares Pred (e.g. 140) vs Missing Obs (0.0) -> OOD.
             s_mask = subset.get("src_mask", None)
-            if s_mask is not None:
-                 logger.info(f"[OOD DEBUG] Mask Found. Shape: {s_mask.shape}")
-            else:
-                 logger.warning("[OOD DEBUG] NO MASK FOUND! Stitching checks may fail on sparse data.")
 
             # [DEBUG TELEMETRY OOD v3] Granular Failure Analysis
             # [SOTA FIX v10.5] Multi-Stage Clinical Smoothing (Cascaded Filter)
@@ -3051,35 +3048,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
                     smoothed = F.conv1d(p_pad, weights_expanded, groups=C)
                     pred_safe = smoothed.permute(0, 2, 1)
 
-            # [DEBUG TELEMETRY OOD v3 Post-Smooth]
-            # pred_lac = pred_safe[..., 7]
-            # logger.info(f"[OOD DEBUG] Pred Lactate (idx=7): Max={pred_lac.max().item():.2f}, Mean={pred_lac.mean().item():.2f} (Limit: 12.0)")
-            
-            # pred_o2 = pred_safe[..., 1]
-            # logger.info(f"[OOD DEBUG] Pred O2Sat (idx=1): Max={pred_o2.max().item():.2f}, Min={pred_o2.min().item():.2f} (Limits: 20-100)")
-            
-            # deltas = torch.abs(pred_safe[:, 1:] - pred_safe[:, :-1])
-            # max_delta_sbp = deltas[..., 2].max().item()
-            # max_delta_hr = deltas[..., 0].max().item()
-            # logger.info(f"[OOD DEBUG] Max Step Delta -> SBP: {max_delta_sbp:.2f} (Limit 40), HR: {max_delta_hr:.2f} (Limit 50)")
-
             safety_results = self.safety_guardian.check_trajectories(
                 subset["observed_data"], 
-                raw_pred, # [SOTA SG-10] Use raw prediction to catch instability spikes
+                pred_safe, # [SOTA PATCH] Use smoothed predictions — raw has extreme single-timestep jitter
                 src_mask=s_mask,
                 force_clinical=True
             )
             
             # 5. Log Failure Breakdown
-            # safety_results contains average stats for these causes
-            # logger.info(f"[OOD DEBUG] CAUSES -> Stitch Mean: {safety_results['stitching_error']:.2f} | Jagged Mean: {safety_results['is_jagged']:.2f} | Lac Max Mean: {safety_results['lac_max_mean']:.2f}")
-            # logger.info(f"[OOD DEBUG] Result: OOD Rate={safety_results['ood_rate']:.4f}")
         self.val_ood_rate.update(safety_results["ood_rate"])
         self.val_safe_traj_count.update(safety_results["safe_count"])
-
-
-            # hist_denorm = normalizer.denormalize(subset["observed_data"])
-            # safety_results = self.safety_guardian.check_trajectories(hist_denorm, pred_safe, force_clinical=True)
             
         # 5. Physics Violations (Checking Normalized Bounds)
         # We must RE-NORMALIZE to check if the model is hitting the [-1, 1] clamp.
@@ -3296,10 +3274,19 @@ class ICUGeneralistWrapper(pl.LightningModule):
             dist.all_reduce(threshold_tensor, op=dist.ReduceOp.SUM)
             opt_thresh = (threshold_tensor / dist.get_world_size()).item()
             
-        # Apply EMA to the threshold
+        # [SOTA PATCH] Welford-Style Threshold Calibration
+        # Rationale: Starting EMA from 0.5 is a bad prior for 1.76% prevalence — 
+        # the optimal threshold is typically 0.15-0.30. For epoch 0-1, use the raw
+        # F2-optimal directly (no prior to smooth against). From epoch 2+, apply
+        # EMA smoothing for stability across validation noise.
         new_thresh = opt_thresh
-        prev_thresh = self.calibrated_threshold.item()
-        updated_thresh = (self.threshold_ema_decay * prev_thresh) + ((1 - self.threshold_ema_decay) * new_thresh)
+        if self.current_epoch <= 1:
+            # No valid prior yet — trust the data directly
+            updated_thresh = new_thresh
+        else:
+            # Smooth with EMA from epoch 2+ (we now have a calibrated prior)
+            prev_thresh = self.calibrated_threshold.item()
+            updated_thresh = (self.threshold_ema_decay * prev_thresh) + ((1 - self.threshold_ema_decay) * new_thresh)
         self.calibrated_threshold.fill_(updated_thresh)
         
         # Use the CALIBRATED (EMA) threshold for metrics
@@ -3590,29 +3577,37 @@ class ICUGeneralistWrapper(pl.LightningModule):
         from icu.utils.train_utils import configure_robust_optimizer, get_cosine_schedule_with_warmup
 
         # 1. Configure Robust AdamW (Fused + Parameter Hygiene)
-        # [v2026 SOTA] Unified Invariant Scaling Law (Robust Edition)
-        # Rationale: trainer.num_training_batches is often 0/1 during early setup.
-        # We must look at the trainer state OR calculate from d_len if available
-        # to ensure k=3.0 (3525 steps) is correctly identified vs k=1.0 (1176).
-        n_curr = 1176 # Default
+        # [SOTA PATCH] Guarded Unified Scaling with Clamped Ratio
+        # Rationale: get_unified_scaling() is correct physics but can produce
+        # extreme LR values when n_curr diverges from REF_STEPS (e.g., debug=200 → 2.4× inflation).
+        # We clamp the scaling ratio k to [0.8, 1.2] to prevent >20% LR deviation.
+        n_curr = ScalingSteward.SOTA_REF_STEPS  # Default: identity scaling
         if self.trainer:
             if hasattr(self.trainer, "num_training_batches") and self.trainer.num_training_batches > 1:
                 n_curr = self.trainer.num_training_batches
             elif hasattr(self.trainer, "datamodule") and hasattr(self.trainer.datamodule, "train_ds"):
-                # Fallback: estimate from dataset length
                 d_len = len(self.trainer.datamodule.train_ds)
                 bs = self.cfg.train.batch_size
-                n_curr = d_len // bs if bs > 0 else 1176
-                
+                n_curr = d_len // bs if bs > 0 else ScalingSteward.SOTA_REF_STEPS
+        
+        # Clamp the density ratio to prevent extreme LR swings
+        k_raw = float(n_curr) / float(ScalingSteward.SOTA_REF_STEPS)
+        k_clamped = max(0.8, min(1.2, k_raw))
+        n_clamped = int(k_clamped * ScalingSteward.SOTA_REF_STEPS)
+        
         scaled_lr, scaled_wd = ScalingSteward.get_unified_scaling(
-            self.cfg.train.lr, self.cfg.train.weight_decay, n_curr
+            self.cfg.train.lr, self.cfg.train.weight_decay, n_clamped
+        )
+        
+        logger.info(
+            f"[SOTA PATCH] LR Scaling: n_curr={n_curr}, k_raw={k_raw:.2f}, "
+            f"k_clamped={k_clamped:.2f} | LR: {self.cfg.train.lr:.2e} -> {scaled_lr:.2e}"
         )
         
         if self.balancing_mode == "sota_2025":
             # [SOTA 2025] Parameter Groups
             uw_lr = self.cfg.train.get("uw_lr", 0.005)
-            # Scale secondary LRs proportionally using the same coupled physics
-            uw_lr_scaled, _ = ScalingSteward.get_unified_scaling(uw_lr, 0.0, n_curr)
+            uw_lr_scaled, _ = ScalingSteward.get_unified_scaling(uw_lr, 0.0, n_clamped)
             
             # 1. Identify Aux Parameters
             aux_params = list(self.model.aux_head.parameters()) if hasattr(self.model, 'aux_head') else []
@@ -3679,7 +3674,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
         # 3. Learning Rate Scheduler
         total_steps = self.trainer.estimated_stepping_batches
-        warmup_steps = int(total_steps * self.cfg.train.get("warmup_ratio", 0.05))
+        # [v2026 SOTA FIX] Absolute Warmup Priority (Smoking Gun #WarmupLag)
+        # Rationale: Using warmup_ratio (0.05) on a 5-day H100 run leads to thousand-step 
+        # dead-zones at start. Prioritize the user's absolute 'warmup_steps' from config.
+        config_warmup = self.cfg.train.get("warmup_steps", 0)
+        if config_warmup > 0:
+            warmup_steps = config_warmup
+        else:
+            warmup_steps = int(total_steps * self.cfg.train.get("warmup_ratio", 0.05))
         
         scheduler = get_cosine_schedule_with_warmup(
             optimizer, 

@@ -139,3 +139,5 @@ tests/
 debug_
 scripts/
 report.md
+error.md
+temp_logs.md

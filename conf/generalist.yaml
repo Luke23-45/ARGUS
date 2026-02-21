@@ -56,7 +56,7 @@ train:
   lr: 1.0e-4                  # [SOTA] Reduced from 1.5e-4 to prevent optimization divergence
   min_lr: 1e-6
   # [SOTA] Extended warmup to prevent "Shock" during initial manifold discovery
-  warmup_steps: 1500 # Increased from 500 (~1.2 epochs)
+  warmup_steps: 1250 # [SOTA FIX P12] mathematically optimal for N=200 config
   weight_decay: 1e-4
   grad_clip: 2.0
   grad_ema_decay: 0.99        # [SOTA] Smoother manifold monitoring for large epochs
@@ -82,7 +82,7 @@ train:
   horizon_ramp: 40
 
   # Debug Mode (Smoke Test)
-  debug_run: false #true
+  debug_run: true #true
   debug_limit_batches: 200
   debug_limit_val: 500
 

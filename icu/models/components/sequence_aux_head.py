@@ -81,7 +81,7 @@ class SequenceAuxHead(nn.Module):
         n_heads: int = 4, 
         drop_path_prob: float = 0.1,
         # [v14.1 PATCH] Configurable ASL hyperparameters
-        gamma_neg: float = 2.0,  # [v33.0 SOTA FIX] Corrected from 6.0 to 2.0 (Prevents Grad Starvation)
+        gamma_neg: float = 4.0,  # [SOTA PATCH] Balanced focus: 4.0 suppresses easy negatives without starving gradients
         gamma_pos: float = 0.0,  # No down-weighting of precious positives
         clip: float = 0.05,      # Asymmetric clipping
         prevalence: float = 0.0176 # [v33.0 SOTA FIX] Dynamic Prior (Sepsis-3 Baseline)

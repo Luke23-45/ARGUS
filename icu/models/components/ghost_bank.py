@@ -212,6 +212,15 @@ class SepsisGhostBank(nn.Module):
         latents = latents[is_finite]
         if uncertainties is not None: uncertainties = uncertainties[is_finite]
 
+        # [v2026 SOTA FIX] Batch Size Hard-Cap (Smoking Gun #Overflow)
+        # Rationale: Capacity scales with steps/epoch. If steps/epoch is low,
+        # batch_size might exceed bank capacity.
+        vitals = vitals[:self.capacity]
+        masks = masks[:self.capacity]
+        labels = labels[:self.capacity]
+        latents = latents[:self.capacity]
+        if uncertainties is not None: uncertainties = uncertainties[:self.capacity]
+        
         B = vitals.shape[0]
         
         # [v2026 SOTA FIX] DDP-Consensus Prototype Update (Abyssal #3.4)
@@ -440,9 +449,9 @@ class SepsisGhostBank(nn.Module):
             probs_uniform = torch.ones_like(probs_prioritized) / current_size
             probs = 0.95 * probs_prioritized + 0.05 * probs_uniform
             
-            # multinomial still requires a one-time sync or JIT-friendly implementation
-            # For now, we use the scaled rand approach if not in JIT
-            idx1 = torch.multinomial(probs, num_ghosts, replacement=True)
+            # [v2026 SOTA] DDP Parity for Multinomial
+            # Multinomial requires CPU tensors to properly use the CPU generator across all PyTorch versions.
+            idx1 = torch.multinomial(probs.cpu(), num_ghosts, replacement=True, generator=rng).to(device)
             
         out = {
             "vitals": self.raw_vitals[idx1],
@@ -464,9 +473,15 @@ class SepsisGhostBank(nn.Module):
             u2 = torch.rand(num_ghosts, generator=rng, device='cpu').to(device)
             idx2 = (u2 * self.size.float()).long()
             
-            dist = torch.distributions.Beta(torch.tensor([mixup_alpha], device=device), 
-                                          torch.tensor([mixup_alpha], device=device))
-            lam = dist.sample((num_ghosts, 1))
+            # [v2026 SOTA] Consistent DDP Beta Sampling
+            # Beta distribution does not accept generator. We fork and seed manually to ensure DDP parity.
+            lam_seed = int(torch.randint(0, 1000000, (1,), generator=rng).item())
+            
+            with torch.random.fork_rng(devices=[device.index] if device.type == 'cuda' else []):
+                torch.manual_seed(lam_seed)
+                dist = torch.distributions.Beta(torch.tensor([mixup_alpha], device=device), 
+                                              torch.tensor([mixup_alpha], device=device))
+                lam = dist.sample((num_ghosts, 1))
             
             out["anchors"] = lam * self.latent_anchors[idx1] + (1 - lam) * self.latent_anchors[idx2]
             out["labels"] = lam.squeeze(-1) * self.raw_labels[idx1].float() + (1 - lam).squeeze(-1) * self.raw_labels[idx2].float()

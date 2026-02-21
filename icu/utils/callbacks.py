@@ -113,14 +113,21 @@ def format_metric_sota(v: Any) -> str:
     - Clean '0.000' for zero
     - Standard string for non-numerics
     """
+    # [v16.7 FIX] Tensor Unpacking & Granular Scientific Format
+    if hasattr(v, 'item'):
+        try: v = float(v.item())
+        except: return str(v)
+    
     if not isinstance(v, (float, int)):
         return str(v)
     
     abs_v = abs(float(v))
     if abs_v == 0:
         return "0.000"
-    elif abs_v < 0.001:
-        return f"{v:.2e}"
+    elif abs_v < 0.01:
+        return f"{v:.3e}"
+    elif abs_v < 1.0:
+        return f"{v:.4f}"
     else:
         return f"{v:.3f}"
 
@@ -294,8 +301,8 @@ class AnomalyGuardian(Callback):
             # Rationale: Zeroing gradients mid-accumulation without resetting the 
             # accumulation counter causes should_step to fire with incomplete gradient
             # history in the next cycle. Reset to 0 for a clean restart.
-            if hasattr(pl_module, "grad_accum_idx"):
-                pl_module.grad_accum_idx.fill_(0)
+            if hasattr(pl_module, "_shadow_grad_accum_idx"):
+                pl_module._shadow_grad_accum_idx = 0
             self._handle_anomaly(trainer, pl_module, "Gradient Anomaly (NaN/Inf) detected. Weights shielded. Accumulation cycle reset.")
 
 

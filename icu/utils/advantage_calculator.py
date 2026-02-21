@@ -463,8 +463,10 @@ class ICUAdvantageCalculator(nn.Module):
         # 2. Scale Telemetry Buffers
         self.ess_ema_decay.fill_(ScalingSteward.get_decay(0.95, n_curr, ref_steps=ref_steps))
         
-        # 3. Scale Growth Rates (Baseline: 1.5)
-        self.beta_growth_factor.fill_(float(1.5 ** (ref_steps / max(1, n_curr))))
+        # [SOTA PATCH] Fixed inverted scaling law for growth factor
+        # Rationale: Growth must slow down when there are MORE steps, meaning 
+        # the exponent should be (n_curr / ref_steps) to represent a fraction of the reference step.
+        self.beta_growth_factor.fill_(float(1.5 ** (n_curr / max(1, ref_steps))))
         
         # 4. Scale Whitening Momentum (Ref: 0.999)
         self.whitening_momentum.fill_(ScalingSteward.get_decay(self.base_whitening_momentum, n_curr, ref_steps=ref_steps))
@@ -771,11 +773,11 @@ class ICUAdvantageCalculator(nn.Module):
                  # Assuming mask means "any feature valid"
                  rewards = rewards * src_mask.any(dim=-1).float()
 
-        # [PATCH #2] Removed hardcoded ×10.0 amplifier.
-        # Rationale: The ×10 bypassed the reward_cap (2.0), making effective range [-40, +20]
-        # which drowned the sparse terminal signal (±2.0). Dense rewards are now properly
-        # bounded by reward_cap, maintaining correct sparse/dense ratio.
-        return rewards
+        # [PATCH FIX] Restored ×10.0 amplifier.
+        # Rationale: The entire AWR calibration (beta, max_weight, ESS targeting) was tuned
+        # with ×10 in place. Removing it collapsed reward-to-noise ratio 10×, causing
+        # EV stall and uniform AWR weights. The reward_cap acts BEFORE this scaling.
+        return rewards * 10.0
         
 
     # =========================================================================
@@ -1408,7 +1410,7 @@ class ICUAdvantageCalculator(nn.Module):
                 if weights.numel() > 0:
                     try:
                         # Find 95th percentile of RAW weights
-                        p95_t.fill_(torch.quantile(weights.detach().float(), 0.95)) # Removed .item()
+                        p95_t.fill_(torch.quantile(weights.detach().float(), 0.95).item())
                     except:
                         pass # Fallback if quantile fails
                 
