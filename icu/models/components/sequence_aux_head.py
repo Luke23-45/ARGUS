@@ -63,7 +63,10 @@ class AsymmetricLoss(nn.Module):
         elif reduction == 'sum':
             return loss.sum()
         else:
-            return loss # reduction='none'
+            # [SOTA FIX Phase 8] Dimensional Reduction Guard for RL-Finetuning
+            # Rationale: reduction='none' must return [B] sample-wise loss, NOT [B, C].
+            # Otherwise, broadcasting [B, T] + [B, C] crashes diffusion.py
+            return loss.sum(dim=-1)
 
 class SequenceAuxHead(nn.Module):
     """

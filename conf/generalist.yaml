@@ -44,7 +44,7 @@ model:
   use_ddim_sampling: true
   use_auxiliary_head: true
   num_phases: 6 # SOTA-Clinical: 2 sub-experts per natural phase (Stable, Pre-Shock, Shock)
-  use_teacher: false  # [SOTA] Enable Teacher-Student bootstrapping for stable value estimation
+  use_teacher: true  # [SOTA] Enable Teacher-Student bootstrapping for stable value estimation
 
 
 # --- Training Hyperparameters ---
@@ -96,7 +96,7 @@ train:
   adaptive_clipping: true
   target_ess: 0.30            # [v1.5 SOTA] Target 30% Batch Selection (Relaxed from 12%)
   awr_momentum: 0.98          # [v38.0] Selection Smoothing Momentum (was 0.95)
-  beta_min: 1.2               # [v38.0] Selection Floor (Raised to 1.2 to mimic Resumption Boost)
+  beta_min: 0.5               # [v38.0] Selection Floor (Recovered to 0.5 for high sensitivity)
   alpha_min: 0.1              # [SOTA SG-2] Prevents minority task starvation;
   
   # AWR Calibration Speed/Quality (v10.1 Upgrade)

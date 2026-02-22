@@ -158,21 +158,20 @@ class BayesianProjectedScaler(nn.Module):
         log_vars_clamped = torch.clamp(log_vars_active, min=-5.0, max=8.0)
         precision = torch.exp(-log_vars_clamped)
         
-        # [SOTA v5.0] NASA-Tier Mathematical Decoupling (Exact Graph Separation)
-        # Rationale: Previous versions ran backprop through `log(softplus(EMA + diff))`, resulting in
+        # [SOTA v5.1] Exact Mathematical Decoupling (NASA-Tier Orthogonal Projection)
+        # Rationale: Previous version ran backprop through `log(softplus(EMA + diff))`, resulting in
         # extreme "Double Suppression" that stifled converged gradients. 
-        # By mathematically decoupling the compute graph:
-        # 1. Network Weights (Theta) receive explicit, exact gradients from the log-compressed Batch Loss.
-        # 2. Uncertainty Weights (Sigma) learn smoothly from the Log-Compressed EMA Loss.
-        # This isolates variances perfectly and ensures scale-invariance WITHOUT derivative throttling.
-        
-        log_batch_losses = torch.log(F.softplus(losses_tensor) + 1.0)
-        log_ema_losses = torch.log(F.softplus(avg_losses) + 1.0)
+        # By separating Theta and Sigma updates exactly based on Kendall et al.:
         
         # Component 1: Network Updates (Theta)
-        theta_loss = (0.5 * precision.detach() * log_batch_losses * uw_weights).sum()
+        # We use the EXACT RAW loss for the network weights, scaled linearly by precision.
+        # This prevents the exponential gradient suppression of high-magnitude tasks (e.g., GMSE).
+        theta_loss = (0.5 * precision.detach() * losses_tensor * uw_weights).sum()
         
         # Component 2: Uncertainty Updates (Sigma)
+        # We use the smoothed EMA loss to update the log_vars (Sigma), preventing batch-to-batch
+        # thrashing and ensuring stable loss landscape calibration.
+        log_ema_losses = torch.log(F.softplus(avg_losses) + 1.0)
         sigma_loss = (0.5 * precision * log_ema_losses.detach() * uw_weights + 0.5 * log_vars_clamped).sum()
         
         # Fused AutoGrad Root

@@ -974,9 +974,9 @@ class ICUAdvantageCalculator(nn.Module):
                     # if values is not None: values = values[mask] # values not passed to this function
                     # if rewards is not None: rewards = rewards[mask] # rewards not passed to this function
         
-        # [SOTA v3.1] Mask-Aware Statistics
+        # [SOTA v3.1] Mask-Aware Statistics: Use ~mask.bool() to select valid (0) data
         if mask is not None:
-            adv_flat = advantages[mask.bool()]
+            adv_flat = advantages[~mask.bool()]
         else:
             adv_flat = advantages.reshape(-1)
 
@@ -1172,8 +1172,8 @@ class ICUAdvantageCalculator(nn.Module):
         if mask is not None:
              # advantages is [B, T], mu/sigma are scalars
              norm_flat = (advantages - mu) / sigma
-             # Mask out invalid steps for count/sums
-             norm_flat = norm_flat.view(-1)[mask.view(-1) == 0]
+             # Mask out invalid steps for count/sums (0=Valid, 1=Pad)
+             norm_flat = norm_flat.view(-1)[mask.view(-1) < 0.5]
         else:
              norm_flat = norm_adv.view(-1)
              
@@ -1374,7 +1374,8 @@ class ICUAdvantageCalculator(nn.Module):
                 
                 # [v4.1.9 SOTA FIX] Mask-Aware Bisection Solver (Smoking Gun #Padding-Bleed)
                 if mask is not None:
-                    a_valid = advantages[mask.bool()]
+                    # [v4.1.11 FIX] Use ~mask to select valid data (0=Valid)
+                    a_valid = advantages[~mask.bool()]
                 else:
                     a_valid = advantages.reshape(-1)
                 

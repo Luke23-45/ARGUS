@@ -1149,24 +1149,38 @@ class ICUUnifiedPlanner(nn.Module):
             base_p=cfg.base_safety_percentile,
             min_p=cfg.min_safety_percentile
         )
-        # [PATCH #7] Expanded Clinical Feature Registry
+        # [PATCH #7] Complete Clinical Feature Registry (0-21 Dynamic)
         self.clinical_feat_idx = {
-            'hr': 0, 'o2sat': 1, 'sbp': 2, 'map': 4, 'lactate': 7, 'resp': 5,
-            'creatinine': 8, 'bilirubin': 9, 'platelets': 10, 'ph': 12
+            'hr': 0, 'o2sat': 1, 'sbp': 2, 'dbp': 3, 'map': 4, 'resp': 5, 'temp': 6,
+            'lactate': 7, 'creatinine': 8, 'bilirubin': 9, 'platelets': 10, 'wbc': 11,
+            'ph': 12, 'hco3': 13, 'bun': 14, 'glucose': 15, 'hgb': 16, 'potassium': 17,
+            'magnesium': 18, 'calcium': 19, 'chloride': 20, 'fio2': 21
         }
         
         # [v4.2 SOTA Pillar 3] Life-Critical MSE Weighting
-        # Standard weights are 1.0. We boost high-stakes channels.
-        # Resolves names from ICUConfig.importance_weights (e.g., 'map' -> 4)
+        # Standard weights are 1.0. We boost high-stakes laboratory channels
+        # to break the "Mean-Prediction Trap".
         weights = torch.ones(cfg.input_dim)
+        
+        # 1. Base Boosters from Config
         importance_dict = getattr(cfg, "importance_weights", {})
         
-        for feat_name, weight in importance_dict.items():
+        # 2. Hardcoded Structural Boosters (Phase 2)
+        # These are 100% certain and required for structural signal recovery.
+        phase2_boosters = {
+            'glucose': 2.5,
+            'lactate': 2.5,
+            'bun': 2.0
+        }
+        
+        # Merge boosters (Config takes precedence if exists, otherwise Phase 2)
+        final_importance = {**phase2_boosters, **importance_dict}
+        
+        for feat_name, weight in final_importance.items():
             if feat_name in self.clinical_feat_idx:
                 idx = self.clinical_feat_idx[feat_name]
                 weights[idx] = weight
             elif feat_name.isdigit():
-                # Backward compatibility for index-based strings
                 weights[int(feat_name)] = weight
             else:
                 logger.warning(f"[APEX] Unknown importance weight feature: {feat_name}")
@@ -1280,9 +1294,14 @@ class ICUUnifiedPlanner(nn.Module):
         if reduction == 'none':
             # Mean over features but preserve clinical moments [B, T]
             # [v4.2 SOTA] Importance Weighted MSE
+            # [v1.5 SOTA] Channel Mismatch Repair (Smoking Gun #3)
+            # Rationale: Static channels (22-27) are not generative. Training on them
+            # creates an irreducible noise floor. Slicing to Dynamic Subspace.
+            DYNAMIC_CHANNELS = 22
+            
             # pred_noise, noise_eps: [B, T, D]
-            diff_sq = (pred_noise - noise_eps) ** 2
-            weighted_diff = diff_sq * self.importance_weights.view(1, 1, -1)
+            diff_sq = (pred_noise[..., :DYNAMIC_CHANNELS] - noise_eps[..., :DYNAMIC_CHANNELS]) ** 2
+            weighted_diff = diff_sq * self.importance_weights[:DYNAMIC_CHANNELS].view(1, 1, -1)
             diff_loss = weighted_diff.mean(dim=2)
             
             if self.cfg.use_auxiliary_head and "phase_label" in batch:

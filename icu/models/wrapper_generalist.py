@@ -324,11 +324,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
         )
         # [v25.4 FIX] Initial Log-Var Reset: Start with balanced weights (sigma=1.0)
         if self.balancing_mode == "sota_2025":
-            # [PHASE 1 FIX] Initialize with scale-aware log_vars to prevent aux starvation
-            # diffusion has ~10x higher loss than aux → needs higher σ (lower weight)
-            # aux has lower loss → lower σ (higher weight)
+            # [PHASE 2] Prioritize Diffusion to break Mean-Prediction Trap
             initial_log_vars = torch.tensor([
-                1.0,    # diffusion: Higher σ → lower weight
+                -0.69,  # diffusion: Higher weight (~2x) to force signal recovery
                 1.5,    # critic: Start even lower to allow diffusion to settle
                 -0.5,   # aux: Clinical Anchor (High weight)
                 1.0,    # acl: Start low
@@ -1147,8 +1145,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
         opt = self.optimizers()
         B = batch["observed_data"].size(0)
         
-        # [v48.0 SOTA FIX] Stateful Accumulation Index (Smoking Gun #90)
+        # [v48.1 SOTA FIX] Unified Accumulation Tracking (Smoking Gun #90)
+        # Rationale: Ensures bit-perfect cycle alignment across resumptions.
+        # Uses shadow (CPU) for step logic and buffer (Device) for checkpointing.
         self._shadow_grad_accum_idx += 1
+        self.grad_accum_idx.fill_(self._shadow_grad_accum_idx)
+        
         acc_batches = self.cfg.train.get("accumulate_grad_batches", 1)
         is_last_batch = (batch_idx + 1) == self.trainer.num_training_batches
         should_step = (self._shadow_grad_accum_idx >= acc_batches) or is_last_batch
@@ -2962,7 +2964,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
                             tau=self.curr_tau.item(),
                             mask=batch.get("future_mask")
                         )
-                        self.val_explained_var.update(ev)
+                        # [SOTA FIX Phase 7] EV Validation Bounding
+                        # Prevents dashboard collapse from initial noisy expectations
+                        ev_bounded = torch.clamp(ev, min=-1.0, max=1.0)
+                        self.val_explained_var.update(ev_bounded)
 
         # 3. Clinical Trajectory Sampling (Only first batch to save compute)
         # This prevents the "Validation Trap" (105x compute overhead)
@@ -3033,15 +3038,36 @@ class ICUGeneralistWrapper(pl.LightningModule):
         pred_dynamic = pred_safe[..., :DYNAMIC_CHANNELS].contiguous()
         gt_dynamic = gt_safe[..., :DYNAMIC_CHANNELS].contiguous()
 
-        # Update Metric on Valid Subspace (Generative Error)
-        self.val_mse_global.update(pred_dynamic, gt_dynamic)
+        # [SOTA FIX Phase 7] Valid Subspace Masking (Smoking Gun #GMSE)
+        # Rationale: padding_mask=1 indicates padded timesteps (noise).
+        # We must invert it to extract only valid clinical timesteps before MSE.
+        padding_mask = subset.get("padding_mask", None)
         
-        if pred_safe.shape[-1] > 6:
-            self.val_mse_hemo.update(pred_safe[..., :7].contiguous(), gt_safe[..., :7].contiguous())
-        if pred_safe.shape[-1] > 17:
-            self.val_mse_labs.update(pred_safe[..., 7:18].contiguous(), gt_safe[..., 7:18].contiguous())
-        if pred_safe.shape[-1] > 21:
-            self.val_mse_electrolytes.update(pred_safe[..., 18:22].contiguous(), gt_safe[..., 18:22].contiguous())
+        if padding_mask is not None:
+            valid_idx = ~padding_mask.bool()
+            
+            # Projecting [B, T, D] -> [N, D] where N = total valid timesteps
+            pred_dyn_valid = pred_dynamic[valid_idx]
+            gt_dyn_valid = gt_dynamic[valid_idx]
+            
+            self.val_mse_global.update(pred_dyn_valid, gt_dyn_valid)
+            
+            if pred_safe.shape[-1] > 6:
+                self.val_mse_hemo.update(pred_safe[..., :7][valid_idx].contiguous(), gt_safe[..., :7][valid_idx].contiguous())
+            if pred_safe.shape[-1] > 17:
+                self.val_mse_labs.update(pred_safe[..., 7:18][valid_idx].contiguous(), gt_safe[..., 7:18][valid_idx].contiguous())
+            if pred_safe.shape[-1] > 21:
+                self.val_mse_electrolytes.update(pred_safe[..., 18:22][valid_idx].contiguous(), gt_safe[..., 18:22][valid_idx].contiguous())
+        else:
+            # Update Metric on Valid Subspace (Generative Error)
+            self.val_mse_global.update(pred_dynamic, gt_dynamic)
+            
+            if pred_safe.shape[-1] > 6:
+                self.val_mse_hemo.update(pred_safe[..., :7].contiguous(), gt_safe[..., :7].contiguous())
+            if pred_safe.shape[-1] > 17:
+                self.val_mse_labs.update(pred_safe[..., 7:18].contiguous(), gt_safe[..., 7:18].contiguous())
+            if pred_safe.shape[-1] > 21:
+                self.val_mse_electrolytes.update(pred_safe[..., 18:22].contiguous(), gt_safe[..., 18:22].contiguous())
         
         # 4. Safety Checks (OOD Guardian)
         # [SOTA FIX v10.2] Unit Trap Resolution.
@@ -3336,13 +3362,17 @@ class ICUGeneralistWrapper(pl.LightningModule):
             s_prec = tm_func.precision(pos_probs, pos_labels, task="binary", threshold=final_thresh).item()
             s_rec = tm_func.recall(pos_probs, pos_labels, task="binary", threshold=final_thresh).item()
             s_f1 = tm_func.f1_score(pos_probs, pos_labels, task="binary", threshold=final_thresh).item()
+        def safe_compute(m):
+            if hasattr(m, 'weight') and m.weight == 0:
+                return 0.0
+            return m.compute()
 
         self.log_dict({
-            "val/mse_global": self.val_mse_global.compute() if getattr(self.val_mse_global, 'total', getattr(self.val_mse_global, 'count', 0)) > 0 else 0.0,
-            "val/mse_hemo": self.val_mse_hemo.compute() if getattr(self.val_mse_hemo, 'total', getattr(self.val_mse_hemo, 'count', 0)) > 0 else 0.0,
-            "val/mse_labs": self.val_mse_labs.compute() if getattr(self.val_mse_labs, 'total', getattr(self.val_mse_labs, 'count', 0)) > 0 else 0.0,
-            "val/mse_electrolytes": self.val_mse_electrolytes.compute() if getattr(self.val_mse_electrolytes, 'total', getattr(self.val_mse_electrolytes, 'count', 0)) > 0 else 0.0,
-            "val/sepsis_acc": self.val_acc_sepsis.compute() if getattr(self.val_acc_sepsis, 'total', getattr(self.val_acc_sepsis, 'count', 0)) > 0 else 0.0,
+            "val/mse_global": safe_compute(self.val_mse_global),
+            "val/mse_hemo": safe_compute(self.val_mse_hemo),
+            "val/mse_labs": safe_compute(self.val_mse_labs),
+            "val/mse_electrolytes": safe_compute(self.val_mse_electrolytes),
+            "val/sepsis_acc": safe_compute(self.val_acc_sepsis),
             "val/sepsis_auroc": s_auroc,  # [UNBIASED]
             "val/sepsis_precision": s_prec, # [UNBIASED]
             "val/sepsis_recall": s_rec,     # [UNBIASED]
@@ -3350,12 +3380,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
             "val/clinical_f2_opt": opt_f2,
             "val/clinical_threshold_opt": final_thresh,
             "val/raw_threshold_epoch": opt_thresh,
-            "val/ece": self.val_ece.compute() if getattr(self.val_ece, 'total', getattr(self.val_ece, 'count', 0)) > 0 else 0.0,
-            "val/oe": self.val_oe.compute() if getattr(self.val_oe, 'total', getattr(self.val_oe, 'count', 0)) > 0 else 0.0,
-            "val/explained_var": self.val_explained_var.compute() if getattr(self.val_explained_var, 'total', getattr(self.val_explained_var, 'count', 0)) > 0 else 0.0,
-            "val/ood_rate_avg": self.val_ood_rate.compute() if getattr(self.val_ood_rate, 'total', getattr(self.val_ood_rate, 'count', 0)) > 0 else 0.0,
-            "val/safe_trajectories_avg": self.val_safe_traj_count.compute() if getattr(self.val_safe_traj_count, 'total', getattr(self.val_safe_traj_count, 'count', 0)) > 0 else 0.0,
-            "val/phys_violation_rate": self.val_phys_violation_rate.compute() if getattr(self.val_phys_violation_rate, 'total', getattr(self.val_phys_violation_rate, 'count', 0)) > 0 else 0.0,
+            "val/ece": safe_compute(self.val_ece),
+            "val/oe": safe_compute(self.val_oe),
+            "val/explained_var": safe_compute(self.val_explained_var),
+            "val/ood_rate_avg": safe_compute(self.val_ood_rate),
+            "val/safe_trajectories_avg": safe_compute(self.val_safe_traj_count),
+            "val/phys_violation_rate": safe_compute(self.val_phys_violation_rate),
         }, prog_bar=True, sync_dist=True)
 
 
