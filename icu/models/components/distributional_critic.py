@@ -18,7 +18,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Union
 
 class GatedValueBlock(nn.Module):
     """
@@ -143,62 +143,118 @@ class IQLQuantileLoss(nn.Module):
         self.tau = tau   # IQL Expectile (0.7 = Conservative)
         self.delta = delta # Huber threshold
 
-    def forward(self, pred_quantiles: torch.Tensor, target_returns: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred_quantiles: torch.Tensor, target_returns: torch.Tensor, tau: Optional[float] = None, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Computes Dual Expectile-Quantile Loss.
         
         Args:
             pred_quantiles: [B, T, N]
             target_returns: [B, T]
+            tau: Optional override for risk-aversion expectile
+            mask: [B, T] Surgical Mask for padding/truncation
         """
         B, T, N = pred_quantiles.shape
         device = pred_quantiles.device
+        if mask is not None and mask.dim() == 3:
+            mask = mask.any(dim=-1)
+            
+        curr_tau = tau if tau is not None else self.tau
         
-        # 1. Conservative IQL Expectile Baseline
-        v_pred_mean = pred_quantiles.mean(dim=-1)
-        diff = target_returns - v_pred_mean
-        # [v2026 SOTA] Standardized Weighting
-        tau_t = torch.as_tensor([self.tau], device=device)
+        # [SOTA FIX] Unified Value Estimator (Avoids Schizophrenic Critic)
+        # We use the same weighted consensus as bootstrapping for graph-consistency.
+        taus_q = torch.linspace(1/(2*N), 1 - 1/(2*N), N, device=device)
+        tau_t = torch.as_tensor([curr_tau], device=device)
+        # Weight distribution toward lower quantiles if tau > 0.5 (pessimism)
+        tau_w = torch.where(taus_q < 0.5, tau_t, 1.0 - tau_t)
+        uni_w = torch.ones_like(taus_q)
+        
+        # Normalize weights
+        w_p = tau_w / (tau_w.sum() + 1e-8)
+        w_n = uni_w / (uni_w.sum() + 1e-8)
+        weights = 0.5 * w_p + 0.5 * w_n
+        
+        # v_pred_safe: [B, T] - Distribution-Aware Expectile Summary (Mean if tau=0.5)
+        v_pred_safe = (pred_quantiles * weights.view(1, 1, N)).sum(dim=-1)
+        diff = target_returns - v_pred_safe
+        
+        # 1. Expectile Loss (The "Selector" - Component 1)
         weight_iql = torch.where(diff < 0, 1.0 - tau_t, tau_t)
-        expectile_loss = (weight_iql * (diff**2)).mean()
+        raw_expectile_loss = weight_iql * (diff**2)
         
-        # 2. QR-DQN Distributional Hub (Quantile Huber)
-        target_expanded = target_returns.unsqueeze(-1) # [B, T, 1]
-        errors = target_expanded - pred_quantiles # [B, T, N]
+        if mask is not None:
+            mask_f = mask.float()
+            expectile_loss = (raw_expectile_loss * mask_f).sum() / (mask_f.sum() + 1e-8)
+        else:
+            expectile_loss = raw_expectile_loss.mean()
         
-        # Stable Huber component
-        abs_err = torch.abs(errors)
-        huber_loss = torch.where(
-            abs_err <= self.delta,
-            0.5 * (errors**2),
-            self.delta * (abs_err - 0.5 * self.delta)
-        )
+        # 2. Quantile Regression Loss (The "Estimator" - Component 2)
+        # Huber loss between each quantile pred and the scalar target return
+        errors = target_returns.unsqueeze(-1) - pred_quantiles # [B, T, N]
+        huber_loss = F.huber_loss(pred_quantiles, target_returns.unsqueeze(-1).expand_as(pred_quantiles), reduction='none', delta=self.delta)
         
-        # Pinball Loss weighting
-        # Midpoint quantiles [1/2N, 3/2N... (2N-1)/2N]
-        taus = torch.linspace(0.0, 1.0, N + 1, device=device)
-        taus = (taus[:-1] + taus[1:]).view(1, 1, N) / 2.0
-        
+        # Quantile penalty: |tau - I(error < 0)| * Loss
+        # Here taus represents the quantile locations [0...1]
+        taus = taus_q.view(1, 1, N)
         quantile_weight = torch.abs(taus - (errors < 0).float())
-        qr_loss = (quantile_weight * huber_loss).mean()
+        raw_qr_loss = quantile_weight * huber_loss
         
-        # 3. Crossing Guard (Double-Safety)
-        # Even with sorting, we penalize crossing to push the raw logits 
-        # toward a naturally monotonic manifold (faster convergence).
-        diff_q = pred_quantiles[:, :, 1:] - pred_quantiles[:, :, :-1]
-        crossing_penalty = torch.relu(-diff_q).mean() * 5.0
+        if mask is not None:
+            # Broadcast mask to quantiles [B, T, N]
+            qr_loss = (raw_qr_loss * mask_f.unsqueeze(-1)).sum() / (mask_f.sum() * N + 1e-8)
+        else:
+            qr_loss = raw_qr_loss.mean()
+        
+        # 3. Structural Crossing Penalty (Monotonicity Guard)
+        # Ensure Q_i <= Q_{i+1}
+        diff_q = pred_quantiles[..., 1:] - pred_quantiles[..., :-1]
+        crossing_penalty = torch.relu(-diff_q).mean() * 10.0
         
         return expectile_loss + qr_loss + crossing_penalty
 
     @staticmethod
-    def compute_explained_variance(pred_quantiles: torch.Tensor, target_returns: torch.Tensor) -> torch.Tensor:
+    def compute_explained_variance(pred_quantiles: torch.Tensor, target_returns: torch.Tensor, tau: float = 0.5, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Calculates EV using the mean of the distribution.
-        Returns a 0-dim tensor (Zero-Sync).
+        Calculates the Explained Variance using a Distribution-Aware Value summary.
+        
+        Formula: 1 - Var(target - pred) / Var(target)
+        SOTA Implementation: Mask-aware using Welford's-style identity if mask provided.
         """
-        v_pred = pred_quantiles.mean(dim=-1).detach()
+        B, T, N = pred_quantiles.shape
+        if mask is not None and mask.dim() == 3:
+            mask = mask.any(dim=-1)
+            
+        device = pred_quantiles.device
+        
+        # 1. Distribution-Aware Value Summary
+        # [v2026 SOTA] Aligning the "Ruler" with the "Objective"
+        taus_q = torch.linspace(1/(2*N), 1 - 1/(2*N), N, device=device)
+        tau_t = torch.as_tensor([tau], device=device)
+        tau_w = torch.where(taus_q < 0.5, tau_t, 1.0 - tau_t)
+        uni_w = torch.ones_like(taus_q)
+        w_p = tau_w / (tau_w.sum() + 1e-8)
+        w_n = uni_w / (uni_w.sum() + 1e-8)
+        weights = 0.5 * w_p + 0.5 * w_n
+        
+        v_pred = (pred_quantiles * weights.view(1, 1, N)).sum(dim=-1).detach()
         y_true = target_returns.detach()
         
-        var_y = torch.var(y_true) + 1e-8
-        ev = 1.0 - torch.var(y_true - v_pred) / var_y
-        return ev # [v2026 SOTA] Return tensor to avoid .item() sync
+        if mask is not None:
+            mask_f = mask.float().detach()
+            # Only compute over non-masked steps
+            n = mask_f.sum()
+            if n < 2: return torch.tensor(0.0, device=device)
+            
+            # Masked Mean & Variance
+            def masked_var(x, m, n_count):
+                mu = (x * m).sum() / n_count
+                return ((x - mu)**2 * m).sum() / (n_count - 1 + 1e-8)
+            
+            var_y = masked_var(y_true, mask_f, n) + 1e-8
+            var_err = masked_var(y_true - v_pred, mask_f, n)
+        else:
+            var_y = torch.var(y_true) + 1e-8
+            var_err = torch.var(y_true - v_pred)
+            
+        ev = 1.0 - var_err / var_y
+        return ev
+ # [v2026 SOTA] Return tensor to avoid .item() sync

@@ -66,7 +66,8 @@ import numpy as np
 import random
 import traceback
 import gc
-
+import zlib
+import os
 # [v2025 SOTA] Implementation Imports
 from icu.core.cagrad import CAGrad
 from icu.core.gradnorm import GradNormBalancer
@@ -1729,13 +1730,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
         
         # 6. Critic Loss (Gradient Allowed)
         # pred_values (L540) has gradients. returns is detached.
-        critic_loss = self.model.value_loss_fn(pred_values, returns)
+        # [SOTA v4.1] Implicit Distributional Critic Task
+        # [v4.1.6 SOTA FIX] Mask-Aware Critic (Smoking Gun #Padding-Bleed)
+        critic_loss = self.model.value_loss_fn(pred_values, returns, tau=self.curr_tau.item(), mask=f_mask)
         
-        # Update Explained Variance (No Grad for Metric)
-        with torch.no_grad():
-            self.train_explained_var.update(
-                self.model.value_loss_fn.compute_explained_variance(pred_values, returns)
-            )
+        # [v2026 SOTA] Telemetry consolidated at step-end (L2703) to prevent double-counting.
 
         # [v4.1.2 SOTA FIX] Global Prevalence & Mask Parity
         if dist.is_initialized():
@@ -2243,48 +2242,47 @@ class ICUGeneralistWrapper(pl.LightningModule):
                             proj_refs.append(g_ref_accum[name])
                     
                     if proj_params:
-                        # [v2026 SOTA] Advanced PCGrad (Magnitude Preservation + Soft Margin)
-                        # Rationale: Classic PCGrad suffers from Gradient Starvation (shrinking GMSE 
-                        # vectors to 2% under 170° conflict) and Float Thrashing boundaries.
+                        # [v5.0 SOTA] Global PCGrad Mathematical Projection
+                        # Rationale: Layer-wise PCGrad applies identical rotational operations to all 
+                        # layers regardless of magnitude, violently tearing Adam/LAMB momentum spaces. 
+                        # Projecting the gradients globally across the entire vector space preserves the 
+                        # geometric magnitude relationships while fusing 2000 kernels down to 2.
                         
-                        # 3. Fused Compute: Dot Products and Norms
-                        p_dot_ref = torch.stack([torch.sum(p * r) for p, r in zip(proj_params, proj_refs)])
-                        p_sq = torch.stack([torch.sum(p * p) for p in proj_params]) + 1e-8
-                        ref_sq = torch.stack([torch.sum(r * r) for r in proj_refs]) + 1e-8
+                        # 1. Fuse total gradients into 1D vectors for Global Projection
+                        flat_p = torch.cat([p.view(-1) for p in proj_params])
+                        flat_r = torch.cat([r.view(-1) for r in proj_refs])
                         
-                        p_norm = torch.sqrt(p_sq)
-                        r_norm = torch.sqrt(ref_sq)
-                        cos_sim = p_dot_ref / (p_norm * r_norm)
+                        # 2. Global Dot Product
+                        dot_pr = torch.sum(flat_p * flat_r, dtype=torch.float32)
                         
-                        # Alphas Calculation (Tensorized)
-                        raw_alphas = -1.0 * (p_dot_ref / ref_sq)
+                        # 3. Soft Margin Check
+                        # We only project if they are actively fighting (cos_sim < -0.05)
+                        sq_p = torch.sum(flat_p * flat_p, dtype=torch.float32) + 1e-8
+                        sq_r = torch.sum(flat_r * flat_r, dtype=torch.float32) + 1e-8
                         
-                        # [SOTA FIX 1] Soft Margin & Dynamic Scale Clamp
-                        # Only project if cos_sim < -0.05 (prevent 90.001° float jitter loop)
-                        # Clamp dynamically based on inherent scale differences
-                        max_scales = (p_norm / r_norm) * 5.0
-                        v_mask = (cos_sim < -0.05) & torch.isfinite(raw_alphas)
+                        norm_p = torch.sqrt(sq_p)
+                        norm_r = torch.sqrt(sq_r)
+                        cos_sim = dot_pr / (norm_p * norm_r)
                         
-                        clamped_alphas = torch.where(
-                            v_mask, 
-                            torch.max(-max_scales, torch.min(raw_alphas, max_scales)), 
-                            torch.zeros_like(raw_alphas)
-                        )
+                        if cos_sim < -0.05:
+                            # 4. Global Alpha Coefficient
+                            raw_alpha = -1.0 * (dot_pr / sq_r)
+                            
+                            # Dynamic Clamping
+                            # Mathematical ceiling based on inherent vector scale disparities to prevent
+                            # gradient explosion if reference vector is tiny.
+                            max_scale = (norm_p / norm_r) * 5.0
+                            alpha = torch.clamp(raw_alpha, min=-max_scale, max=max_scale)
+                            
+                            # 5. Global Fused Projection Update (g_p <- g_p + alpha * g_r)
+                            # This replaces the entire `foreach` loop and applies exactly perfectly.
+                            torch._foreach_add_(proj_params, proj_refs, alpha=alpha.item())
                         
-                        # Store pre-projection magnitudes for preservation
-                        original_norms = [torch.norm(p).item() for p in proj_params]
+                        # Note: Artificial Magnitude Restoration (CAGrad-Lite) was explicitly deleted here to allow
+                        # natural gradient decay at the Pareto front.
                         
-                        # 4. Fused Update: Projection (g <- g + alpha * ref)
-                        alpha_list = [clamped_alphas[i] for i in range(len(proj_params))]
-                        scaled_refs = torch._foreach_mul(proj_refs, alpha_list)
-                        torch._foreach_add_(proj_params, scaled_refs)
-                        
-                        # [SOTA FIX 2] Magnitude Preservation (CAGrad-Lite)
-                        # Restore original magnitude so Diffusion isn't starved
-                        for i, p in enumerate(proj_params):
-                            if clamped_alphas[i].item() != 0.0:
-                                new_norm = torch.norm(p).item() + 1e-8
-                                p.mul_(original_norms[i] / new_norm)
+                        # Note: Artificial Magnitude Restoration (CAGrad-Lite) was explicitly deleted here to allow
+                        # natural gradient decay at the Pareto front.
                         
                         # 5. Restore Reference (g <- g + ref)
                         if self.orthogonal_replay:
@@ -2686,8 +2684,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
         # --- 6. Telemetry & Metric Accumulation ---
         with torch.no_grad():
-            # [v4.1.2 SOTA FIX] Use distributional EV calculator for multi-quantile heads.
-            ev = self.model.value_loss_fn.compute_explained_variance(pred_values, returns)
+            # [v4.1.9 SOTA FIX] Mask-Aware Training EV (Smoking Gun #Padding-Bleed)
+            ev = self.model.value_loss_fn.compute_explained_variance(
+                pred_values, 
+                returns, 
+                tau=self.curr_tau.item(),
+                mask=f_mask
+            )
             
             # Update metric accumulators
             self.train_loss_total.update(total_loss.detach())
@@ -2792,7 +2795,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 "bgsl_loss": l_bgsl,
                 "tcb_loss": l_tcb,
                 "awr_ess": diag["ess"],
-                "explained_var": ev,
+                "train_ev": ev,
                 "ood_score": uncertainty[:B].mean(), # [FIX] Map to local variable, slice to main batch
                 "bank_size": self.ghost_bank.size.float(),
                 "clinical_snr": (aux_loss * (logs.get('weight/aux', 1.0) if 'logs' in locals() else 1.0)) / (diff_loss * (logs.get('weight/diffusion', 1.0) if 'logs' in locals() else 1.0) + 1e-8),
@@ -2821,7 +2824,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 "train/loss_tcb": self.train_loss_tcb,
                 "train/loss_phys": self.train_loss_phys,
                 "train/loss_gradnorm": self.train_loss_gradnorm,
-                "train/explained_var": self.train_explained_var,
+                "train/train_ev": self.train_explained_var,
                 "train/awr_ess": self.train_awr_ess,
                 "train/bank_avg_uncertainty": bank_unc,
                 "train/manifold_drift": manifold_drift,
@@ -2864,6 +2867,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         if "outcome_label" in batch and self.model.cfg.use_auxiliary_head:
             logits = out.get("aux_logits", None)
             value_preds = out.get("pred_value", None)
+            uncertainty = out.get("aux_uncertainty", None) # [v2026 SOTA] Extract for sepsis gating
             
             if logits is not None:
 
@@ -2914,38 +2918,50 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 self.val_f1.update(risk_prob_metric, binary_label)
 
                 # [v5.3.4 SOTA FIX] Align Validation Semantic Baseline
-                # We previously compared pred_value (Returns [~-7, 5]) to binary_label (Outcome [0, 1]).
-                # This caused the meaningless -0.005 value due to scale mismatch.
-                # Now we compute actual validation returns for a true Critic Quality check.
-                # [v4.1.3 SOTA FIX] Defending against NameError and Shape Mismatch
-                # value_preds: [B, T, N] quantiles from the distributional critic
-                if value_preds is not None:
+                # [v2026 SOTA] Expert Realignment: Measuring Student vs Teacher TD Parity.
+                # Rationale: Training optimizes Student to predict Teacher-bootstrapped targets.
+                # Validation EV must use the same "Ruler" to avoid measurement desync.
+                if value_preds is not None and "future_data" in batch:
                     with torch.no_grad():
-                        # Calculate ground truth rewards for the validation batch
-                        # [FIX] Double-Scale Prevention
-                        # 'future_data' is Raw. Computing reward on Normalized Data (via denormalize) is wrong.
-                        # We pass normalizer=None because the input IS ALREADY PHYSICAL.
-                        val_rewards = self.awr_calculator.compute_clinical_reward(
-                            batch["future_data"], # Raw
+                        # A. Teacher Pass (Frozen EMA) - Generate the target Return for EV check
+                        with self.ema_teacher_context():
+                            teacher_out = self.model(batch, reduction='none')
+                            target_values = self.model.value_head.get_expectile_summary(teacher_out["pred_value"], tau=self.curr_tau)
+                        
+                        # B. Identify Truncation (Critical for Windowed EV)
+                        is_truncated = batch.get("is_truncated", torch.zeros(bs, dtype=torch.bool, device=self.device))
+                        bootstrap_value = target_values[:, -1:] * is_truncated.float().unsqueeze(-1)
+
+                        # C. Clinical Reward
+                        rewards = self.awr_calculator.compute_clinical_reward(
+                            batch["future_data"], 
                             batch.get("outcome_label", None),
                             dones=batch.get("is_terminal", None),
                             feature_indices=self.clinical_feat_idx,
-                            normalizer=None, # [FIX] Do NOT denormalize raw data
+                            normalizer=None, 
                             src_mask=batch.get("future_mask", None),
                             training=self.training
                         )
-                        # Estimate GAE advantages and total returns
-                        # [v4.2 SOTA Pillar 2] CVaR-GAE with Synchronized Tau
+
+                        # D. Teacher-Student SAW (State Advantage Weighting)
                         v_student = self.model.value_head.get_expectile_summary(value_preds, tau=self.curr_tau)
-                        val_adv = self.awr_calculator.compute_gae(
-                            val_rewards, 
-                            v_student, 
-                            dones=batch.get("is_terminal", None)
+                        advantages = self.awr_calculator.compute_saw(
+                            rewards, 
+                            student_values=v_student,
+                            teacher_values=target_values,
+                            dones=batch.get("is_terminal", None),
+                            bootstrap_value=bootstrap_value
                         )
-                        val_returns = (val_adv + v_student).detach()
+                        val_returns = (advantages + v_student).detach()
                         
-                        # Use the distributional EV calculator
-                        ev = self.model.value_loss_fn.compute_explained_variance(value_preds, val_returns)
+                        # E. Distributional EV Measurement
+                        # [v4.1.7 SOTA FIX] Mask-Aware EV (Smoking Gun #Padding-Bleed)
+                        ev = self.model.value_loss_fn.compute_explained_variance(
+                            value_preds, 
+                            val_returns, 
+                            tau=self.curr_tau.item(),
+                            mask=batch.get("future_mask")
+                        )
                         self.val_explained_var.update(ev)
 
         # 3. Clinical Trajectory Sampling (Only first batch to save compute)
@@ -3322,11 +3338,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
             s_f1 = tm_func.f1_score(pos_probs, pos_labels, task="binary", threshold=final_thresh).item()
 
         self.log_dict({
-            "val/mse_global": self.val_mse_global.compute(),
-            "val/mse_hemo": self.val_mse_hemo.compute(),
-            "val/mse_labs": self.val_mse_labs.compute(),
-            "val/mse_electrolytes": self.val_mse_electrolytes.compute(),
-            "val/sepsis_acc": self.val_acc_sepsis.compute(),
+            "val/mse_global": self.val_mse_global.compute() if getattr(self.val_mse_global, 'total', getattr(self.val_mse_global, 'count', 0)) > 0 else 0.0,
+            "val/mse_hemo": self.val_mse_hemo.compute() if getattr(self.val_mse_hemo, 'total', getattr(self.val_mse_hemo, 'count', 0)) > 0 else 0.0,
+            "val/mse_labs": self.val_mse_labs.compute() if getattr(self.val_mse_labs, 'total', getattr(self.val_mse_labs, 'count', 0)) > 0 else 0.0,
+            "val/mse_electrolytes": self.val_mse_electrolytes.compute() if getattr(self.val_mse_electrolytes, 'total', getattr(self.val_mse_electrolytes, 'count', 0)) > 0 else 0.0,
+            "val/sepsis_acc": self.val_acc_sepsis.compute() if getattr(self.val_acc_sepsis, 'total', getattr(self.val_acc_sepsis, 'count', 0)) > 0 else 0.0,
             "val/sepsis_auroc": s_auroc,  # [UNBIASED]
             "val/sepsis_precision": s_prec, # [UNBIASED]
             "val/sepsis_recall": s_rec,     # [UNBIASED]
@@ -3334,12 +3350,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
             "val/clinical_f2_opt": opt_f2,
             "val/clinical_threshold_opt": final_thresh,
             "val/raw_threshold_epoch": opt_thresh,
-            "val/ece": self.val_ece.compute(),
-            "val/oe": self.val_oe.compute(),
-            "val/explained_var": self.val_explained_var.compute(),
-            "val/ood_rate_avg": self.val_ood_rate.compute(),
-            "val/safe_trajectories_avg": self.val_safe_traj_count.compute(),
-            "val/phys_violation_rate": self.val_phys_violation_rate.compute(),
+            "val/ece": self.val_ece.compute() if getattr(self.val_ece, 'total', getattr(self.val_ece, 'count', 0)) > 0 else 0.0,
+            "val/oe": self.val_oe.compute() if getattr(self.val_oe, 'total', getattr(self.val_oe, 'count', 0)) > 0 else 0.0,
+            "val/explained_var": self.val_explained_var.compute() if getattr(self.val_explained_var, 'total', getattr(self.val_explained_var, 'count', 0)) > 0 else 0.0,
+            "val/ood_rate_avg": self.val_ood_rate.compute() if getattr(self.val_ood_rate, 'total', getattr(self.val_ood_rate, 'count', 0)) > 0 else 0.0,
+            "val/safe_trajectories_avg": self.val_safe_traj_count.compute() if getattr(self.val_safe_traj_count, 'total', getattr(self.val_safe_traj_count, 'count', 0)) > 0 else 0.0,
+            "val/phys_violation_rate": self.val_phys_violation_rate.compute() if getattr(self.val_phys_violation_rate, 'total', getattr(self.val_phys_violation_rate, 'count', 0)) > 0 else 0.0,
         }, prog_bar=True, sync_dist=True)
 
 

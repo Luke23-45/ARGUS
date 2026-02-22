@@ -258,7 +258,7 @@ class ICUAdvantageCalculator(nn.Module):
         # Rationale: Higher floor (0.8) prevents AUROC collapse by ensuring 
         # broader manifold coverage.
         self.min_beta = min_beta            
-        self.max_beta = 20.0
+        self.max_beta = 5.0 # [FORENSIC FIX V3] Reduced from 20.0 to prevent selection dead-zone
         
         # [v29.1 SOTA FIX] Whitening Momentum Stability (Abyssal #1)
         self.register_buffer("whitening_momentum", torch.tensor([0.99]).float()) 
@@ -944,6 +944,9 @@ class ICUAdvantageCalculator(nn.Module):
             weights: Tensor of AWR weights (same shape as input)
             diagnostics: Dict with ESS, entropy, clipping rate, etc.
         """
+        if mask is not None and mask.dim() == 3:
+            mask = mask.any(dim=-1)
+            
         if advantages.numel() == 0:
             # [v163.0 SOTA FIX] Neutral Tensor for Empty Batch (Smoking Gun #163)
             # Rationale: We MUST NOT return early. Ranks with empty batches must 
@@ -1202,13 +1205,20 @@ class ICUAdvantageCalculator(nn.Module):
         
         # --- 4. Global Normalization & Sync ---
         # We want the weights to sum to 'num_total_samples' (standard AWR normalization)
+        # [v4.1.8 SOTA FIX] Mask-Aware Normalization (Smoking Gun #Padding-Bleed)
+        if mask is not None:
+             weights_local = weights_local * mask.view_as(weights_local).float()
+             numel_local = mask.float().sum().view(1)
+        else:
+             numel_local = torch.tensor([float(weights_local.numel())], device=weights_local.device)
+             
         sum_w_local = weights_local.sum().view(1)
-        numel_local = torch.tensor([float(weights_local.numel())], device=weights_local.device)
         
         if dist.is_initialized():
             sync_tensor = torch.stack([sum_w_local, numel_local])
             dist.all_reduce(sync_tensor, op=dist.ReduceOp.SUM)
             sum_w_global, numel_global = sync_tensor[0], sync_tensor[1]
+            
             # [v36.1 FIX] Weight Normalization Factor
             # norm_factor = total_count / global_sum
             norm_factor = numel_global / (sum_w_global + 1e-8)
@@ -1222,7 +1232,9 @@ class ICUAdvantageCalculator(nn.Module):
         
         # --- 6. Diagnostics & Adaptive Sync ---
         with torch.no_grad():
-            numel_local = weights.numel()
+            # [REGRESSION FIX v4.1.11] Preserve numel_local tensor from normalization block (L1208/1210)
+            # Rationale: numel_local = weights.numel() was overwriting the masked count tensor 
+            # with a Python int, crashing the .float() calls during DDP sync.
             
             # [v139.1 SOTA FIX] Empty Batch Diagnostic Guard (Removed early return #163)
             # Rationale: We no longer return early here, as all ranks must reach
@@ -1239,16 +1251,21 @@ class ICUAdvantageCalculator(nn.Module):
             # [SOTA 2025] DDP Global Synchronization
             # ESS and clipping rate must be global to prevent rank divergence
             if dist.is_initialized():
-                stats = torch.stack([sum_w, sum_w_sq, clipping_count, torch.tensor(numel_local, device=weights.device, dtype=torch.float32)])
+                stats = torch.stack([
+                    sum_w, 
+                    sum_w_sq, 
+                    clipping_count, 
+                    numel_local.float().view(-1)[0]
+                ])
                 dist.all_reduce(stats, op=dist.ReduceOp.SUM)
                 g_sum_w, g_sum_w_sq, g_clip_count, g_numel = stats[0], stats[1], stats[2], stats[3]
             else:
-                g_sum_w, g_sum_w_sq, g_clip_count, g_numel = sum_w, sum_w_sq, clipping_count, float(numel_local)
+                g_sum_w, g_sum_w_sq, g_clip_count, g_numel = sum_w, sum_w_sq, clipping_count, numel_local.float().item()
 
             # Global Effective Sample Size (ESS)
-            # [SOTA BUG FIX] Return ESS as Count (1..N), not Ratio (1/N..1).
-            # Consumers (Probes/Logs) expect Count.
-            ess = (g_sum_w ** 2) / (g_sum_w_sq + 1e-8)
+            # [SOTA BUG FIX] Return            # Global Effective Sample Size (ESS)
+            # [SOTA FIX v4.1] FP16 Overflow Prevention Protect g_sum_w squared calculation
+            ess = (g_sum_w.float() ** 2) / (g_sum_w_sq.float() + 1e-8)
             self.ess_buffer.copy_(ess.view_as(self.ess_buffer)) 
             
             # Global Clipping Rate
@@ -1261,7 +1278,8 @@ class ICUAdvantageCalculator(nn.Module):
                 beta_raw = self._update_adaptive_stats(
                     advantages, weights, ess, clipped_rate, 
                     total_batch_size=float(g_numel),
-                    turbo_mode=turbo_mode
+                    turbo_mode=turbo_mode,
+                    mask=mask # Forensic Fix
                 )
             
             # Weight Entropy (Information Theoretic)
@@ -1305,8 +1323,9 @@ class ICUAdvantageCalculator(nn.Module):
 
     def _update_adaptive_stats(
         self, advantages: torch.Tensor, weights: torch.Tensor, ess: torch.Tensor, clipped_rate: torch.Tensor,
-        total_batch_size: torch.Tensor = None, # Changed to torch.Tensor
-        turbo_mode: bool = False
+        total_batch_size: torch.Tensor = None, 
+        turbo_mode: bool = False,
+        mask: Optional[torch.Tensor] = None # Forensic Fix
     ) -> torch.Tensor:
         """
         [SOTA 2025] Dynamically adapts hyperparameters to squeeze performance.
@@ -1315,6 +1334,9 @@ class ICUAdvantageCalculator(nn.Module):
         Args:
             turbo_mode: If True, uses aggressive momentum decay (0.50) for rapid adaptation.
         """
+        if mask is not None and mask.dim() == 3:
+            mask = mask.any(dim=-1)
+            
         device = self.beta.device
         if turbo_mode:
              # [SHARP AXE] Turbo Adaptation
@@ -1350,35 +1372,51 @@ class ICUAdvantageCalculator(nn.Module):
                 # Rationale: Replaces .any() branching with weighted updates.
                 standard_mask = (clipped_rate <= 0.05).float()
                 
-                # Rationale: If target_ess (30) > batch_size (16), controller panics -> Beta=20.
-                # Fix: Dynamically clamp target to 50% of available batch size.
-                batch_size = total_batch_size if total_batch_size is not None else float(weights.numel())
-                current_raw_ess = ess 
-                
-                # Resolve Target (Vectorized)
-                if self.target_ess > 1.0:
-                    safe_cap = batch_size * 0.5 
-                    target_val = min(self.target_ess, safe_cap)
-                    current_val = current_raw_ess
+                # [v4.1.9 SOTA FIX] Mask-Aware Bisection Solver (Smoking Gun #Padding-Bleed)
+                if mask is not None:
+                    a_valid = advantages[mask.bool()]
                 else:
-                    target_val = self.target_ess
-                    current_val = current_raw_ess / (batch_size + 1e-6)
-
-                # [v2026 SOTA] Vectorized P-Controller (Zero-Sync)
-                # Rationale: Replaces branching with tensor operations for graph compatibility.
-                error_ess = (target_val - current_val)
-                correction = torch.exp(10.0 * error_ess * effective_gain)
+                    a_valid = advantages.reshape(-1)
                 
-                # Dynamic Clamping
-                c_min = torch.where(torch.as_tensor(turbo_mode, device=device), torch.as_tensor(0.05, device=device), torch.as_tensor(0.5, device=device))
-                c_max = torch.where(torch.as_tensor(turbo_mode, device=device), torch.as_tensor(20.0, device=device), torch.as_tensor(2.0, device=device))
-                correction = torch.clamp(correction, min=c_min, max=c_max)
+                if a_valid.numel() == 0:
+                    return beta_raw
                 
-                new_beta = self.beta * correction
+                # [v4.1.10 SOTA FIX] Dynamic Target ESS (Zero-Sync)
+                batch_size = total_batch_size if total_batch_size is not None else float(a_valid.numel())
+                if self.target_ess > 1.0:
+                    target_ess_count = min(self.target_ess, batch_size * 0.9)
+                else:
+                    target_ess_count = self.target_ess * batch_size
                 
-                # [SOTA v10.5] AWR Selection Recovery (Grid-Search Proven)
-                mom = effective_momentum
-                updated_beta = (mom * self.beta) + ((1.0 - mom) * new_beta)
+                target_ess_t = torch.tensor(target_ess_count, device=device, dtype=torch.float32)
+                    
+                a_max = a_valid.max()
+                # [SOTA FIX v4.1] FP16 Overflow Prevention: Force float32 for exponential sums
+                a_norm = (a_valid - a_max).float()
+                
+                def get_ess_at(b):
+                    w = torch.exp(a_norm / (b + 1e-8))
+                    sum_w = w.sum()
+                    return (sum_w * sum_w) / (w.pow(2).sum() + 1e-8)
+                
+                # Tensorized Control Block
+                low_t = torch.tensor(self.min_beta, device=device, dtype=torch.float32)
+                high_t = torch.tensor(self.max_beta, device=device, dtype=torch.float32)
+                
+                for _ in range(10):
+                    mid_t = (low_t + high_t) / 2.0
+                    ess_val = get_ess_at(mid_t)
+                    condition = ess_val < target_ess_t
+                    low_t = torch.where(condition, mid_t, low_t)
+                    high_t = torch.where(condition, high_t, mid_t)
+                
+                curr_beta_t = (low_t + high_t) / 2.0
+                
+                # Smooth update with momentum (Tensorized to prevent sync)
+                if not torch.is_tensor(effective_momentum):
+                    effective_momentum = torch.tensor(effective_momentum, device=device)
+                mom = 1.0 - effective_momentum
+                updated_beta = torch.lerp(self.beta, curr_beta_t.to(self.beta.dtype), mom)
                 
                 # Apply combined update (Saturation vs Standard is already fused)
                 self.beta.copy_(torch.where(standard_mask.bool(), torch.clamp(updated_beta, min=self.min_beta), self.beta))

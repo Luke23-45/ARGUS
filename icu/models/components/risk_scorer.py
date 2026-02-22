@@ -20,14 +20,19 @@ class PhysiologicalRiskScorer(nn.Module):
         self.map_threshold = map_threshold
         self.lactate_threshold = lactate_threshold
         
-    def forward(self, vitals: torch.Tensor, feature_indices: Dict[str, int]) -> torch.Tensor:
+    def forward(self, vitals: torch.Tensor, feature_indices: Dict[str, int], mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             vitals: [B, T, C] clinical vitals (denormalized)
             feature_indices: Map of feature names to indices
+            mask: [B, T] or [B, T, C] clinical mask
         Returns:
             risk_coef: [B] Scalar coefficient representing current instability
         """
+        # [v1.1 SOTA FIX] Dimensional Mask Awareness
+        if mask is not None and mask.dim() == 3:
+            mask = mask.any(dim=-1)
+            
         # 1. Extract raw features
         idx_map = feature_indices.get('map', 4)
         idx_lac = feature_indices.get('lactate', 7)
@@ -46,6 +51,13 @@ class PhysiologicalRiskScorer(nn.Module):
         # Risk from Lactate (high is bad)
         lac_risk = torch.sigmoid((lac_seq - self.lactate_threshold) * 2.0)
         
+        # [v1.1 SOTA FIX] Mask-Aware Risk Gating
+        # Rationale: Zero out risk for padded/missing timesteps BEFORE calculating max.
+        if mask is not None:
+            mask_f = mask.float()
+            map_risk = map_risk * mask_f
+            lac_risk = lac_risk * mask_f
+            
         # Aggregate Risk
         map_risk_max, _ = map_risk.max(dim=1)
         lac_risk_max, _ = lac_risk.max(dim=1)

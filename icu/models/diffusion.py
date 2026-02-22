@@ -1297,9 +1297,11 @@ class ICUUnifiedPlanner(nn.Module):
                 aux_out = self.aux_head(
                     out_alb["ctx_expert"], 
                     mask=ctx_mask, 
-                    targets=batch["phase_label"].long() if batch["phase_label"] is not None else None
+                    targets=batch["phase_label"].long() if batch["phase_label"] is not None else None,
+                    reduction=reduction # Forensic Fix
                 )
                 logits = aux_out["logits"]
+                probs = aux_out["probs"]
                 aux_loss = aux_out["loss"]
                 uncertainty = aux_out["uncertainty"]
                 
@@ -1307,7 +1309,10 @@ class ICUUnifiedPlanner(nn.Module):
                     # Fallback for inference or missing targets
                     aux_loss = torch.tensor(0.0, device=past.device)
             else:
+                logits = None
+                probs = None
                 aux_loss = torch.zeros(B, device=past.device)
+                uncertainty = torch.tensor(0.0, device=past.device)
         else:
             # [v4.2 SOTA] Importance Weighted MSE
             # [v1.5 SOTA] Channel Mismatch Repair (Smoking Gun #3)
@@ -1321,7 +1326,8 @@ class ICUUnifiedPlanner(nn.Module):
                 aux_out = self.aux_head(
                     out_alb["ctx_expert"], 
                     mask=ctx_mask, 
-                    targets=batch["phase_label"].long()
+                    targets=batch["phase_label"].long(),
+                    reduction=reduction # Forensic Fix
                 )
                 logits = aux_out["logits"]
                 probs = aux_out["probs"]
@@ -1351,19 +1357,22 @@ class ICUUnifiedPlanner(nn.Module):
                 # Apply IQL + Quantile Loss with masking
                 # We compute loss per-sample and apply mask before averaging
                 # pred_val: [B, T, N], target_val: [B, T]
-                raw_loss = self.value_loss_fn(pred_val, target_val) # Note: SOTA loss currently handles mean
-                # [REFINEMENT] Re-implementing masked loss call for utmost quality
-                B_idx, T_idx = target_val.shape
-                # Custom masked forward for IQLQuantileLoss
-                value_loss = self.value_loss_fn(pred_val, target_val) # Fallback to standard for now, will refine if f_mask is sparse
+                # [v6.1 SOTA FIX] Mask-Aware Critic Propagation
+                # Rationale: Ensuring the critic only learns from valid future time steps.
+                value_loss = self.value_loss_fn(pred_val, target_val, mask=f_mask)
             else:
                 value_loss = self.value_loss_fn(pred_val, target_val)
         
-        # Total loss (Value weight 0.5 is standard for AWR baselines)
-        # Handle broadcasting if reduction='none' (diff_loss is [B, T], aux_loss is [B])
+        # [v15.1 SOTA FIX] Robust Multi-Task Broadcasting (Smoking Gun #IndexError)
+        # Rationale: When reduction='none', aux_loss [B] must align with diff_loss [B, T].
+        # When reduction='mean', both are scalars. unsunsqueeze(1) on 0-dim tensor fails.
         aux_term = self.cfg.aux_loss_scale * aux_loss
-        if diff_loss.dim() > aux_loss.dim():
+        if reduction == 'none' and aux_term.dim() < diff_loss.dim():
+            # Align [B] -> [B, 1] for temporal broadcasting
             aux_term = aux_term.unsqueeze(1)
+        elif reduction != 'none' and aux_term.dim() > 0:
+             # Ensure scalar for reduction='mean'
+             aux_term = aux_term.mean()
             
         total = diff_loss + aux_term + 0.5 * value_loss
         logs = {}
@@ -1407,7 +1416,7 @@ class ICUUnifiedPlanner(nn.Module):
         src_mask = batch.get("src_mask", None)
         
         # [PHASE 4] Adaptive Compute & Risk Scoring
-        risk_coef = self.risk_scorer(past, self.clinical_feat_idx)
+        risk_coef = self.risk_scorer(past, self.clinical_feat_idx, mask=src_mask)
         if num_steps is None:
             steps_batch = self.adaptive_sampler.calculate_steps(risk_coef)
             steps = int(steps_batch.max().item())

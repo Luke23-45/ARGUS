@@ -27,7 +27,7 @@ class AsymmetricLoss(nn.Module):
         self.disable_torch_grad_focal_loss = disable_torch_grad_focal_loss
         self.eps = eps
 
-    def forward(self, x, y):
+    def forward(self, x, y, reduction='mean'):
         """"
         x: logits
         y: targets (multi-label binarized vector)
@@ -42,17 +42,14 @@ class AsymmetricLoss(nn.Module):
             xs_neg = (xs_neg + self.clip).clamp(max=1)
 
         # Basic Cross Entropy
-        # For positives: log(p)
-        # For negatives: log(1-p)
         los_pos = y * torch.log(xs_pos.clamp(min=self.eps))
         los_neg = (1 - y) * torch.log(xs_neg.clamp(min=self.eps))
         
         # Asymmetric Focusing
-        # Down-weight easy negatives (gamma_neg > gamma_pos)
         if self.gamma_neg > 0 or self.gamma_pos > 0:
             with torch.no_grad():
                 pt0 = xs_pos * y
-                pt1 = xs_neg * (1 - y)  # pt = p if t=1 else 1-p
+                pt1 = xs_neg * (1 - y)
                 pt = (pt0 + pt1).detach()
                 one_sided_gamma = self.gamma_pos * y + self.gamma_neg * (1 - y)
                 one_sided_w = torch.pow(1 - pt, one_sided_gamma)
@@ -61,7 +58,12 @@ class AsymmetricLoss(nn.Module):
         else:
             loss = -(los_pos + los_neg)
             
-        return loss.mean()
+        if reduction == 'mean':
+            return loss.mean()
+        elif reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss # reduction='none'
 
 class SequenceAuxHead(nn.Module):
     """
@@ -106,8 +108,9 @@ class SequenceAuxHead(nn.Module):
         
         # [v15.0 SOTA] Prior-Aware Initialization
         # Rationale: Standard init assumes 50/50, causing massive initial gradient shock.
-        # Fix: Hardcode bias to log(odds) of prevalence.
+        # Fix: Zero-init weight and hardcode bias to log(odds) of prevalence.
         final_layer = self.head[-1]
+        nn.init.zeros_(final_layer.weight) 
         
         # [v33.0 SOTA FIX] Dynamically calculated logit bias
         # Target: P(Positive) approx prevalence
@@ -138,7 +141,8 @@ class SequenceAuxHead(nn.Module):
         mask: Optional[torch.Tensor] = None, 
         targets: Optional[torch.Tensor] = None, 
         epoch_num: int = None,  # [API COMPAT] Unused with ASL
-        return_sequence: bool = False
+        return_sequence: bool = False,
+        reduction: str = 'mean'
     ) -> Dict[str, torch.Tensor]:
         """
         [SOTA 2025] Sequence-Aware Forward Pass (ASL v14.1).
@@ -207,7 +211,7 @@ class SequenceAuxHead(nn.Module):
             else:
                 targets_oh = targets.float().unsqueeze(-1) if targets.ndim == 1 else targets.float()
                     
-            loss = self.criterion(logits, targets_oh)
+            loss = self.criterion(logits, targets_oh, reduction=reduction)
         
         return {
             "logits": logits,

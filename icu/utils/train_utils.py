@@ -136,6 +136,12 @@ class ScalingSteward:
         import math
         k = float(n_curr) / float(ref_steps)
         
+        # [SOTA v4.0 Architectural FIX] Kinetic Invariance Guard
+        # Rationale: Extreme density ratios (e.g., debug mode or resumption glitches)
+        # can cause LR collapse. We clamp the ratio to ensure the manifold 
+        # temperature (LR) remains within stable physical boundaries.
+        k = max(0.2, min(5.0, k))
+        
         # We use negative exponents to counter-balance the increase in N
         lr_new = lr_ref * math.pow(k, -alpha)
         wd_new = wd_ref * math.pow(k, -(1.0 - alpha))

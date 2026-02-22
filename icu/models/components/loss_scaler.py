@@ -154,18 +154,29 @@ class BayesianProjectedScaler(nn.Module):
 
         # 4. Bayesian Multi-Tasking (Kendall et al.)
         log_vars_active = self.log_vars[indices]
-        # PGD Projection (Soft Clamp in forward for graph safety)
-        log_vars_clamped = torch.clamp(log_vars_active, min=-1.5)
+        # [SOTA v4.0] Expanded range allows tasks with tiny raw magnitudes to reach parity
+        log_vars_clamped = torch.clamp(log_vars_active, min=-5.0, max=8.0)
         precision = torch.exp(-log_vars_clamped)
         
-        # Positive Guard via Softplus
-        stabilized_loss = avg_losses + (losses_tensor - losses_tensor.detach())
-        stabilized_loss_pos = F.softplus(stabilized_loss)
+        # [SOTA v5.0] NASA-Tier Mathematical Decoupling (Exact Graph Separation)
+        # Rationale: Previous versions ran backprop through `log(softplus(EMA + diff))`, resulting in
+        # extreme "Double Suppression" that stifled converged gradients. 
+        # By mathematically decoupling the compute graph:
+        # 1. Network Weights (Theta) receive explicit, exact gradients from the log-compressed Batch Loss.
+        # 2. Uncertainty Weights (Sigma) learn smoothly from the Log-Compressed EMA Loss.
+        # This isolates variances perfectly and ensures scale-invariance WITHOUT derivative throttling.
         
-        # Combined weighting
-        regularization = F.softplus(log_vars_clamped)
-        weighted_losses = 0.5 * precision * stabilized_loss_pos * uw_weights + regularization
-        total_loss = weighted_losses.sum()
+        log_batch_losses = torch.log(F.softplus(losses_tensor) + 1.0)
+        log_ema_losses = torch.log(F.softplus(avg_losses) + 1.0)
+        
+        # Component 1: Network Updates (Theta)
+        theta_loss = (0.5 * precision.detach() * log_batch_losses * uw_weights).sum()
+        
+        # Component 2: Uncertainty Updates (Sigma)
+        sigma_loss = (0.5 * precision * log_ema_losses.detach() * uw_weights + 0.5 * log_vars_clamped).sum()
+        
+        # Fused AutoGrad Root
+        total_loss = theta_loss + sigma_loss
         
         # Telemetry
         metrics = {}
@@ -182,22 +193,30 @@ class BayesianProjectedScaler(nn.Module):
     def project_parameters(self):
         """Enforces clinical boundaries and ranking constraints."""
         # 1. Domain Clamp
-        self.log_vars.clamp_(min=-1.5, max=3.0)
+        # [SOTA v4.0] Expanded for >1000x magnitude gap support
+        self.log_vars.clamp_(min=-5.0, max=8.0)
         # 2. Diffusion Floor
         self.log_vars[0].clamp_(max=1.0)
-        # 3. Clinical Gating (Aux/ACL)
-        self.log_vars[2].clamp_(max=2.5)
-        self.log_vars[3].clamp_(max=2.5)
-        # 4. Physics Guard
-        self.log_vars[6].clamp_(max=3.0)
+        # 3. [SOTA v4.1] Critic EV Guard (Fix for EV Regression)
+        # Rationale: Critic loss (~15.0) causes log_vars to skyrocket to 8.0, dropping its precision 
+        # to e^-8 = 0.0003, mathematically starving it of gradient and devastating Explained Variance.
+        self.log_vars[1].clamp_(max=0.0) # Guaranteed minimum 1.0x weight
+        # 4. Clinical Gating (Aux/ACL)
+        self.log_vars[2].clamp_(max=4.0)
+        self.log_vars[3].clamp_(max=4.0)
+        # 5. Physics Guard
+        self.log_vars[6].clamp_(max=8.0)
 
     @torch.no_grad()
     def calibrate_log_vars(self, loss_dict: Dict[str, torch.Tensor], anchor_key: str = 'diffusion'):
         """
-        [SOTA v2026] Architectural ALI (Automatic Log-Var Initialization).
-        Sets log_vars such that all tasks contribute approximately equal gradient magnitudes 
-        relative to the anchor task at Step 0.
+        [SOTA 2025] Automatic Log-Var Initialization (ALI)
+        Harmonizes log-variances dynamically using first-batch empirical losses.
+        Ensures critical care heuristics start on equal footing with Diffusion.
         """
+        if self.is_calibrated.item():
+            return
+            
         device = self.log_vars.device
         raw_losses = torch.zeros(self.num_tasks, device=device)
         active_mask = torch.zeros(self.num_tasks, device=device)
@@ -206,7 +225,7 @@ class BayesianProjectedScaler(nn.Module):
         for i, key in enumerate(self.keys):
             if key in loss_dict:
                 # Use .mean() to handle potential sequence/batch dims
-                raw_losses[i] = loss_dict[key].detach().mean()
+                raw_losses[i] = loss_dict[key].detach().clone()
                 active_mask[i] = 1.0
 
         # 2. DDP Consensus (Zero-Sync protocol)
@@ -217,7 +236,7 @@ class BayesianProjectedScaler(nn.Module):
             raw_losses = dist_stats[0] / dist_stats[1].clamp(min=1)
 
         # 3. Derive Balances
-        if anchor_key not in self.keys:
+        if anchor_key not in self.keys or torch.sum(raw_losses) == 0:
             logger.error(f"[ALI] anchor_key {anchor_key} not in {self.keys}. Aborting.")
             return
             
