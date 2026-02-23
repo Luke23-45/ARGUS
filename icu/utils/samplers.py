@@ -16,10 +16,13 @@ Solution:
 
 import math
 import logging
+import os
+import time
 import torch
 import torch.distributed as dist
 import numpy as np
 from torch.utils.data import Sampler, Subset
+from pathlib import Path
 from typing import Iterator, Sized, Optional, List, Dict, Union
 
 logger = logging.getLogger("APEX_Samplers")
@@ -46,11 +49,20 @@ class EpisodeAwareSampler(Sampler[int]):
         
         self.dataset = dataset
         self.shuffle = shuffle
-        self.seed = seed
         self.drop_last = drop_last
         self.epoch = 0
         self.consumed = 0
         
+        # [SOTA FIX 2] Absolute DDP Seed Consensus
+        # Rationale: This sampler globally shuffles then shards. If ranks have different seeds,
+        # the global shuffles diverge, causing overlapping data and broken epochs.
+        self.seed = seed
+        if dist.is_available() and dist.is_initialized():
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            seed_t = torch.tensor([self.seed], dtype=torch.long, device=device)
+            dist.broadcast(seed_t, src=0)
+            self.seed = int(seed_t.item())
+            
         # --- 1. DDP Setup ---
         if dist.is_available() and dist.is_initialized():
             self.num_replicas = dist.get_world_size()
@@ -188,69 +200,98 @@ class WeightedEpisodeSampler(EpisodeAwareSampler):
         
         root_ds = dataset.dataset if isinstance(dataset, Subset) else dataset
         self.episode_weights = torch.ones(len(self.available_episodes))
-        sepsis_flags = []
+        # [v2026 SOTA] Atomic Sampler Sync & Optimization
+        # Rationale: Prevents I/O thumping by caching prevalence results and 
+        # using a single LMDB transaction for the entire scan.
+        cache_name = f"{root_ds.split}_prevalence_v1.npy"
+        root_path = getattr(root_ds, 'root_path', Path('.'))
+        cache_path = root_path / cache_name
         
-        # [SOTA FIX] Atomic LMDB Context for Initialization Scan
-        # Rationale: Dataset might not have an open env yet, or it might be closed.
-        # We must guarantee a valid handle for this synchronous scan and CLEAN UP afterwards
-        # to prevent file descriptor leaks into worker processes.
-        env_was_none = (getattr(root_ds, '_lmdb_env', None) is None)
+        sepsis_flags = None
         
-        # Force open if needed
-        if env_was_none:
-            if hasattr(root_ds, '_init_lmdb'):
-                root_ds._init_lmdb()
-            elif hasattr(root_ds, '_open_lmdb'): # Handle common naming variation
-                root_ds._open_lmdb()
-            else:
-                logger.warning("[Sampler] Could not force-init LMDB. Scan may fail if env is closed.")
+        # 1. Rank-Aware Sync Barrier (Wait-to-Load)
+        if not cache_path.exists() and self.num_replicas > 1 and self.rank != 0:
+            logger.info(f"[Sampler] Rank {self.rank} waiting for Rank 0 to finish prevalence scan...")
+            for _ in range(60): # 5 min timeout
+                if cache_path.exists(): break
+                time.sleep(5)
+                
+        if cache_path.exists():
+            try:
+                # Use mmap=True for zero-copy read if large
+                sepsis_flags = torch.from_numpy(np.load(str(cache_path)))
+                if self.rank == 0:
+                    logger.info(f"[Sampler] Prevalence cache loaded: {cache_path}")
+            except Exception as e:
+                if self.rank == 0:
+                    logger.warning(f"[Sampler] Cache corrupted, falling back to scan: {e}")
+                sepsis_flags = None
 
-        try:
-            # Optimize scan by caching env reference
-            env = getattr(root_ds, '_lmdb_env', None)
+        if sepsis_flags is None:
+            if self.rank == 0:
+                logger.info(f"[Sampler] Performing Prevalence Scan (Single Transaction)...")
             
-            for ep_id in self.available_episodes:
-                try:
-                    # Key format: ep_000000_labels
-                    meta = root_ds.episode_metadata[ep_id]
-                    
-                    # [Optimization] Check metadata first if available (Zero-Disk Read)
-                    # Sepsis flag is often cached in JSON metadata during ingestion
-                    if 'has_sepsis' in meta:
-                        has_sepsis = bool(meta['has_sepsis'])
-                    elif 'label' in meta: # Common variation
-                        has_sepsis = (meta['label'] > 0)
-                    else:
-                        # Fallback to byte read (Expensive but necessary)
-                        # Use internal env directly to avoid wrapper overhead
-                        label_key = f"{meta['episode_id']}_labels"
-                        
-                        if env is not None:
-                            with env.begin(write=False) as txn:
-                                raw_labels = txn.get(label_key.encode())
-                                if raw_labels is None:
-                                    has_sepsis = False
+            sepsis_flags_list = []
+            env_was_none = (getattr(root_ds, '_lmdb_env', None) is None)
+            
+            if env_was_none:
+                if hasattr(root_ds, '_init_lmdb'): root_ds._init_lmdb()
+                elif hasattr(root_ds, '_open_lmdb'): root_ds._open_lmdb()
+
+            try:
+                env = getattr(root_ds, '_lmdb_env', None)
+                # [SOTA FIX] Single-Transaction Lifecycle
+                if env is not None:
+                    with env.begin(write=False) as txn:
+                        for ep_id in self.available_episodes:
+                            try:
+                                meta = root_ds.episode_metadata[ep_id]
+                                if 'has_sepsis' in meta:
+                                    has_sepsis = bool(meta['has_sepsis'])
+                                elif 'label' in meta:
+                                    has_sepsis = (meta['label'] > 0)
                                 else:
-                                    # Copy=False is safe here as we just read bool state
-                                    labels = np.frombuffer(raw_labels, dtype=np.float32)
-                                    has_sepsis = np.any(labels > 0)
-                        else:
-                            # Last ditch: Try public API (might fail if closed)
+                                    label_key = f"{meta['episode_id']}_labels"
+                                    raw_labels = txn.get(label_key.encode())
+                                    if raw_labels is not None:
+                                        labels = np.frombuffer(raw_labels, dtype=np.float32)
+                                        has_sepsis = np.any(labels > 0)
+                                    else:
+                                        has_sepsis = False
+                                sepsis_flags_list.append(has_sepsis)
+                            except Exception:
+                                sepsis_flags_list.append(False)
+                else:
+                    # Fallback for empty ranks or missing env
+                    for ep_id in self.available_episodes:
+                        try:
+                            meta = root_ds.episode_metadata[ep_id]
+                            label_key = f"{meta['episode_id']}_labels"
                             raw_labels = root_ds._read_bytes(label_key)
                             labels = np.frombuffer(raw_labels, dtype=np.float32)
-                            has_sepsis = np.any(labels > 0)
-                            
-                    sepsis_flags.append(has_sepsis)
-                except Exception:
-                    # Default to False on read error to prevent crash
-                    sepsis_flags.append(False)
-        finally:
-            # [Hygiene] If we forced it open, we MUST close it.
-            # Leaving it open causes 'Bad Reader Lock' when DDP forks workers.
-            if env_was_none and hasattr(root_ds, 'close'):
-                root_ds.close()
-               
-        sepsis_flags = torch.tensor(sepsis_flags)
+                            sepsis_flags_list.append(np.any(labels > 0))
+                        except Exception:
+                            sepsis_flags_list.append(False)
+                
+                sepsis_flags = torch.tensor(sepsis_flags_list)
+                
+                # Rank 0 persists the cache atomically
+                if self.rank == 0:
+                    try:
+                        # [SOTA FIX 1] Prevent np.save from secretly appending ".npy" to our ".tmp" file
+                        temp_path = str(cache_path).replace('.npy', '.tmp.npy')
+                        np.save(temp_path, sepsis_flags.numpy())
+                        os.replace(temp_path, str(cache_path))
+                    except Exception as e:
+                        logger.warning(f"[Sampler] Failed to save prevalence cache: {e}")
+            finally:
+                if env_was_none and hasattr(root_ds, 'close'):
+                    root_ds.close()
+
+        if sepsis_flags is None:
+            sepsis_flags = torch.zeros(len(self.available_episodes), dtype=torch.bool)
+        
+        sepsis_flags = sepsis_flags.bool()
         n_sepsis = sepsis_flags.sum().item()
         n_stable = len(sepsis_flags) - n_sepsis
         

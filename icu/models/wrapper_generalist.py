@@ -477,7 +477,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         
         # [PMS] Manifold Stability Monitoring (v26.5 SOTA)
         # [v26.6 FIX] Initialize to 0.0 so TrendSentinel's bias correction (1 - beta^t) works.
-        self.register_buffer("stability_factor", torch.tensor([1.0]), persistent=False)
+        self.register_buffer("stability_factor", torch.tensor([1.0]))
         self.register_buffer("grad_norm_ema", torch.tensor([1.0]))
         self.register_buffer("grad_norm_std", torch.tensor([0.0])) 
         self.register_buffer("grad_norm_step_count", torch.tensor([0], dtype=torch.long))
@@ -1619,6 +1619,31 @@ class ICUGeneralistWrapper(pl.LightningModule):
                      self.model.value_head(teacher_global_unified),
                      tau=self.curr_tau
                 )
+
+                # [v2026 SOTA] Adaptive Stochastic Bootstrapping (Shatter the Echo Chamber)
+                # Rationale: In offline datasets, s -> s' transitions are fixed, causing the Critic
+                # to overfit and memorize deterministic paths (EV > 0.80). 
+                # We inject dynamic variance scaled to the global synced Advantage StdDev. This acts 
+                # as Continuous Label Smoothing, forcing the Distributional Critic to widen its 
+                # quantiles and learn generalizable structural means rather than point-memorization.
+                with torch.no_grad():
+                    # 1. Fetch DDP-Synced Global Scale (Shape: [1])
+                    adv_scale = self.awr_calculator.adv_std.detach().clamp(min=1e-3)
+                    
+                    # 2. Compute 5% Jitter limits
+                    noise_sigma = 0.05 * adv_scale
+                    target_noise = torch.randn_like(target_values) * noise_sigma
+                    
+                    # 3. Apply 2-Sigma Iron Dome (Zero-Sync, Broadcast-Safe)
+                    # We use pure tensor operations to avoid .item() syncs or view_as crashes.
+                    limit = 2.0 * noise_sigma
+                    
+                    # torch.clamp supports broadcasting in PT 1.9+. 
+                    # Using max/min for absolute backward/forward compatibility.
+                    target_noise = torch.max(torch.min(target_noise, limit), -limit)
+                    
+                    # 4. Inject
+                    target_values = target_values + target_noise.detach()
 
                 # B. Run Anchor Head (if applicable)
                 teacher_logits = None

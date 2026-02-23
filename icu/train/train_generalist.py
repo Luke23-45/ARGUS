@@ -317,7 +317,7 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
         # [SOTA FIX] DDP Diversity Guarantee (Smoking Gun #14)
         # Rationale: Without adding rank to the seed, all GPUs sample the EXACT same indices,
         # wasting N-1 GPUs of compute and correlating gradients perfectly.
-        ddp_seed = self.cfg.seed + get_rank()
+        ddp_seed = self.cfg.seed
         
         self.sampler = WeightedEpisodeSampler(
             self.train_ds, 
