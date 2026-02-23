@@ -85,51 +85,17 @@ logger.setLevel(logging.INFO)
 #    or represent sensor disconnection/malfunction.
 # 4. Surviving Sepsis Campaign Guidelines (2021 Update)
 
+# Iridium SQW-Synced Physics Bounds (Prevents Denormalizer Out-of-Bounds Exceptions)
 PHYSICS_BOUNDS_TS: Dict[str, Tuple[float, float]] = {
-    # =========================================================================
-    # GROUP A: HEMODYNAMICS (Linear Distribution)
-    # =========================================================================
-    'HR':       (20.0, 300.0),    # <20 = asystole/PEA; >300 = flutter/artifact
-    'O2Sat':    (20.0, 100.0),    # <20% = incompatible with life
-    'SBP':      (30.0, 300.0),    # Systolic Blood Pressure (mmHg)
-    'DBP':      (10.0, 200.0),    # Diastolic Blood Pressure (mmHg)
-    'MAP':      (20.0, 250.0),    # Mean Arterial Pressure (<65 = septic shock)
-    'Resp':     (4.0, 80.0),      # Respiratory Rate (bpm)
-    'Temp':     (24.0, 45.0),     # Temperature (°C) - Hypothermia to Hyperpyrexia
-    
-    # =========================================================================
-    # GROUP B: LABS & SEPSIS DRIVERS (Log-Normal Distribution)
-    # These have "heavy tails" - Normal values are low; High values indicate pathology.
-    # =========================================================================
-    'Lactate':      (0.1, 35.0),     # mmol/L. Normal <2. >4 = shock. >20 = profound
-    'Creatinine':   (0.1, 25.0),     # mg/dL. Kidney function marker
-    'Bilirubin':    (0.1, 80.0),     # mg/dL. Liver function. >50 = extreme failure
-    'Platelets':    (1.0, 2000.0),   # 10^9/L. Clotting capacity
-    'WBC':          (0.1, 200.0),    # 10^9/L. Infection response
-    'pH':           (6.5, 7.8),      # Acid-Base balance (tight range!)
-    'HCO3':         (5.0, 60.0),     # mEq/L. Bicarbonate
-    'BUN':          (1.0, 250.0),    # mg/dL. Blood Urea Nitrogen
-    'Glucose':      (10.0, 1500.0),  # mg/dL. DKA can drive very high
-    'Hgb':          (2.0, 25.0),     # g/dL. Hemoglobin
-    'Potassium':    (1.0, 12.0),     # mEq/L. Cardiac arrest risk >7
-    
-    # =========================================================================
-    # GROUP C: ELECTROLYTES & SUPPORT
-    # =========================================================================
-    'Magnesium':    (0.5, 10.0),     # mg/dL
-    'Calcium':      (2.0, 20.0),     # mg/dL
-    'Chloride':     (50.0, 150.0),   # mEq/L
-    'FiO2':         (0.21, 1.0),     # Fraction Inspired O2 (21%-100%)
-
-    # =========================================================================
-    # GROUP D: CONTEXT & DEMOGRAPHICS
-    # =========================================================================
-    'Age':          (15.0, 100.0),   # PhysioNet is adult dataset
-    'Gender':       (0.0, 1.0),      # Binary encoding
-    'Unit1':        (0.0, 1.0),      # MICU vs SICU flag
-    'Unit2':        (0.0, 1.0),      # Additional unit flag
-    'HospAdmTime':  (-1000.0, 0.0),  # Hours before ICU (capped ~40 days)
-    'ICULOS':       (0.0, 2000.0)    # ICU Length of Stay (hours, ~80 days max)
+    'HR': (30.0, 180.0), 'O2Sat': (50.0, 100.0), 'SBP': (50.0, 220.0),
+    'DBP': (30.0, 120.0), 'MAP': (40.0, 150.0), 'Resp': (8.0, 45.0), 'Temp': (32.0, 41.0),
+    'Lactate': (0.2, 15.0), 'Creatinine': (0.2, 10.0), 'Bilirubin': (0.1, 8.0), 
+    'Platelets': (10.0, 1000.0), 'WBC': (1.0, 50.0), 'pH': (6.8, 7.8), 
+    'HCO3': (10.0, 50.0), 'BUN': (2.0, 100.0), 'Glucose': (20.0, 600.0),
+    'Hgb': (5.0, 20.0), 'Potassium': (2.0, 7.5), 'Magnesium': (1.0, 5.0),
+    'Calcium': (5.0, 15.0), 'Chloride': (70.0, 130.0), 'FiO2': (0.21, 1.0),
+    'Age': (15.0, 100.0), 'Gender': (0.0, 1.0), 'Unit1': (0.0, 1.0),
+    'Unit2': (0.0, 1.0), 'HospAdmTime': (-1000.0, 0.0), 'ICULOS': (0.0, 2000.0)
 }
 
 # =============================================================================
@@ -179,7 +145,7 @@ class ClinicalNormalizer(nn.Module):
         ts_channels: int = 28, 
         static_channels: int = 6,
         safety_margin: float = 0.05,
-        epsilon: float = 1e-3,          # High epsilon for FP16 stability
+        epsilon: float = 1e-6,          # Iridium Precision FP16 Shield
         use_per_patient: bool = False,  # RevIN-style instance normalization
         store_instance_stats: bool = True  # Store stats for denormalization
     ):
@@ -356,10 +322,10 @@ class ClinicalNormalizer(nn.Module):
             # =================================================================
             # 5. APPLY LOG TRANSFORM TO STATS (Alignment!)
             # =================================================================
-            # If data will be log-transformed at runtime, stats MUST also be
-            # log-transformed during calibration for correct normalization.
-            t_min_processed = torch.where(self.log_mask, torch.log1p(t_min), t_min)
-            t_max_processed = torch.where(self.log_mask, torch.log1p(t_max), t_max)
+            # Relu guard prevents RuntimeWarnings on negative linear channels 
+            # (e.g., HospAdmTime) during torch.where dual-evaluation.
+            t_min_processed = torch.where(self.log_mask, torch.log1p(torch.relu(t_min)), t_min)
+            t_max_processed = torch.where(self.log_mask, torch.log1p(torch.relu(t_max)), t_max)
 
             # =================================================================
             # 6. CALCULATE FINAL RANGE WITH SAFETY MARGIN
@@ -646,10 +612,11 @@ class ClinicalNormalizer(nn.Module):
         # 2. Scale back to statistical range
         x_scaled = x_01 * (s_max - s_min) + s_min
         
-        # 3. [SOTA 2025 FIX] Tanh-Guard Protection
-        # Expanded guards to cover DKA Glucose (1500+) and extreme values
-        LOG_GUARD = 15.0 # covers exp(15) ~= 3.2 million (plenty for high-range logs)
-        LINEAR_GUARD = 5000.0 # covers any physical vital sign
+        # 3. [Iridium SOTA FIX] FP16 Hard Math Protection
+        # max FP16 is 65504. log(65500) = 11.08. 
+        # LOG_GUARD MUST be <= 11.0 to prevent Day-4 NaN explosions.
+        LOG_GUARD = 11.0 
+        LINEAR_GUARD = 5000.0
         
         # Note: x_scaled IS the value we want to operate on. 
         # For log channels, x_scaled is in log-space (e.g., log(100) = 4.6).
@@ -685,8 +652,8 @@ class ClinicalNormalizer(nn.Module):
         # Undo z-score normalization
         x = x * self._instance_std + self._instance_mean
         
-        # Guards
-        LOG_GUARD = 15.0 
+        # Guards (FP16 Safe)
+        LOG_GUARD = 11.0 
         LINEAR_GUARD = 5000.0
         
         rank = len(x.shape)

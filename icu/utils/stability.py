@@ -23,13 +23,19 @@ class DynamicThresholding(nn.Module):
 
     def forward(self, x: torch.Tensor, update_ema: bool = True) -> torch.Tensor:
         B = x.shape[0]
+        # [SOTA FIX 1] Empty Batch Guard: Quantile crashes if B=0
+        if B == 0:
+            return x
+            
+        # [SOTA FIX 2] Iron Dome NaN Armor
+        # If x has NaNs, quantile returns NaN, and x * scale stays NaN.
+        # We must protect both the anchor (quantile) and the payload (x).
+        x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+            
         abs_x = torch.abs(x)
         flat_abs = abs_x.view(B, -1)
         
-        # [v168.0 SOTA FIX] Per-Sample Manifold Preservation (Smoking Gun #67)
-        # Rationale: Using batch-average squashing causes 'Gradient Bullying'.
-        # One bad sample rescales the whole batch.
-        # Fix: Calculate quantile PER SAMPLE.
+        # Per-Sample Manifold Preservation
         sample_s = torch.quantile(flat_abs.detach().float(), self.percentile, dim=1) # [B]
         
         # [v67.0 SOTA FIX] DDP Governance Consensus
@@ -88,8 +94,12 @@ class ForensicStabilityAuditor(nn.Module):
             denom = (s_max - s_min).clamp(min=1e-3)
             true_sigma = 2.0 * (p_processed - s_min) / denom - 1.0
             
-            phys_violations = (torch.abs(true_sigma) > 2.5).float().mean()
-            max_sigma = torch.abs(true_sigma).max()
+            # [SOTA FIX] Telemetry Crash Prevention
+            # If the model hallucinates NaNs, max() returns NaN, permanently crashing W&B/Loggers.
+            safe_sigma = torch.nan_to_num(true_sigma, nan=0.0, posinf=1e4, neginf=-1e4)
+            
+            phys_violations = (torch.abs(safe_sigma) > 2.5).float().mean()
+            max_sigma = torch.abs(safe_sigma).max()
 
         # 2. Honest OOD Check
         ood_results = {}

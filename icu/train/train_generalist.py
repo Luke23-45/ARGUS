@@ -313,11 +313,17 @@ class ICUGeneralistDataModule(pl.LightningDataModule):
         # [v4.1 SOTA] Balanced Clinical Sampling
         # Ensures 15% sepsis prevalence to solve "Generative Collapse" / EV collapse.
         from icu.utils.samplers import WeightedEpisodeSampler
+        
+        # [SOTA FIX] DDP Diversity Guarantee (Smoking Gun #14)
+        # Rationale: Without adding rank to the seed, all GPUs sample the EXACT same indices,
+        # wasting N-1 GPUs of compute and correlating gradients perfectly.
+        ddp_seed = self.cfg.seed + get_rank()
+        
         self.sampler = WeightedEpisodeSampler(
             self.train_ds, 
             target_prevalence=0.15,
             shuffle=True, 
-            seed=self.cfg.seed,
+            seed=ddp_seed,
             drop_last=True
         )
 

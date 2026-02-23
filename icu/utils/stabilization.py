@@ -226,13 +226,19 @@ class RobustLossScaler(nn.Module):
             floors = torch.where(self.loss_emas > 5.0, torch.as_tensor([5.0], device=L.device), torch.as_tensor([2.0], device=L.device))
         
         # 3. Apply Clamping and Weighting
-        # log_var = self.log_vars.clamp(min=-2.0, max=floors) 
-        # Wait, floors is a tensor, clamp can take tensor max in PyTorch 1.10+
-        log_var = torch.clamp(self.log_vars, min=-2.0)
-        log_var = torch.min(log_var, floors)
+        log_var_clamped = torch.clamp(self.log_vars, min=-2.0)
+        log_var_clamped = torch.min(log_var_clamped, floors)
+        
+        # [SOTA FIX 1] Straight-Through Estimator (STE) for Gradient Survival
+        # If log_vars hits the floor, torch.min kills the gradient. 
+        # STE ensures the forward pass uses the clamped value, but 100% of the downward gradient reaches log_vars.
+        log_var = self.log_vars + (log_var_clamped - self.log_vars).detach()
         
         precision = torch.exp(-log_var)
-        scaled_losses = precision * L + 0.5 * log_var
+        
+        # [SOTA FIX 2] Exact Kendall Mathematical Formulation
+        # Both terms require the 0.5 multiplier to symmetrically balance the partial derivatives.
+        scaled_losses = 0.5 * precision * L + 0.5 * log_var
         
         total_loss = scaled_losses.sum()
         
@@ -394,6 +400,12 @@ class TrendSentinel:
         [SOTA 2026] Computes the scale-invariant directional standard deviation distance.
         Directional (Clamp min=0): Downward drops (convergence) do not trigger anomalies.
         Relative Floor (EMA * 0.1): Prevents hypersensitivity when gradients stabilize at large magnitudes.
+        
+        [v2026.1 STABILITY FIX] Dynamic Floor Relaxation:
+        Increased absolute floor from 0.05 to 0.20 to prevent the "Hypersensitivity Trap".
+        With floor=0.05 and EMA≈0.39, a norm of 0.86 yields Z=5.33 (false positive).
+        With floor=0.20, the same scenario yields Z=1.98 (correctly absorbed as noise).
+        Validated by forensic_stability_probe.py.
         """
         if not isinstance(current_val, torch.Tensor):
             current_val = torch.as_tensor(current_val, device=ema.device)
@@ -403,8 +415,9 @@ class TrendSentinel:
         diff = torch.clamp(current_val - ema, min=0.0)
         
         # 2. Dynamic Scale-Invariant Floor:
-        # Guarantees at least a 10% relative tolerance margin for mini-batch stochasticity.
-        dynamic_floor = (ema * 0.1) + 0.05
+        # Guarantees at least a 20% absolute tolerance margin for mini-batch stochasticity.
+        # [v2026.1 FIX] Relaxed from 0.05 to 0.20 to prevent Hypersensitivity Trap.
+        dynamic_floor = (ema * 0.1) + 0.20
         safe_std = torch.clamp(std, min=dynamic_floor) 
         
         return diff / safe_std

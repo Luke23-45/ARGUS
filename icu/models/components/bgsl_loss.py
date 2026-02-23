@@ -75,10 +75,11 @@ class BGSLLoss(nn.Module):
         asl_w = torch.pow(1.0 - p_target, gamma_weight)
         
         # 6. Base Loss
+        # [SOTA FIX] Alarm Fatigue Prevention: ASL inherently handles imbalance.
+        # Multiplying by pos_weight here causes catastrophic gradient explosion.
         bce = F.binary_cross_entropy_with_logits(
             logits, targets, 
-            reduction='none', 
-            pos_weight=torch.tensor([self.pos_weight], device=logits.device)
+            reduction='none'
         )
         
         return asl_w * bce
@@ -109,14 +110,18 @@ class BGSLLoss(nn.Module):
 
         # Masking: true = masked/padding
         if mask is not None:
-             l_state = (l_state_unreduced * (~mask).unsqueeze(-1)).sum() / ((~mask).sum() + 1e-8)
+             # [SOTA FIX] Strict type-casting for compiled/FP16 safety
+             valid_mask = (~mask.bool()).float()
+             l_state = (l_state_unreduced * valid_mask.unsqueeze(-1)).sum() / (valid_mask.sum() + 1e-8)
         else:
              l_state = l_state_unreduced.mean()
              
         # [v5.1 SOTA] Restored full probability signal
         pred_prob = torch.sigmoid(pred_state)
         
-        slopes = past_vitals[:, 1:] - past_vitals[:, :-1]
+        # [SOTA FIX] Slice to dynamic channels (0-22) so static constants don't dilute velocity
+        DYNAMIC_CHANNELS = 22
+        slopes = past_vitals[:, 1:, :DYNAMIC_CHANNELS] - past_vitals[:, :-1, :DYNAMIC_CHANNELS]
         vit_velocity = slopes.abs().mean(dim=-1, keepdim=True) # [B, T-1, 1]
         surprise = torch.sigmoid(vit_velocity * 2.0).detach() + 0.5 # [B, T-1, 1]
         
@@ -127,8 +132,10 @@ class BGSLLoss(nn.Module):
         l_trend_unreduced = F.mse_loss(pred_slopes, true_slopes, reduction='none')
         
         if mask is not None:
-            slope_mask = mask[:, 1:] | mask[:, :-1] # Union of masks
-            l_trend = (l_trend_unreduced * surprise * (~slope_mask).unsqueeze(-1)).sum() / ((~slope_mask).sum() + 1e-8)
+            # [SOTA FIX] Strict Boolean OR preventing Float bitwise crash
+            slope_mask = mask[:, 1:].bool() | mask[:, :-1].bool() 
+            valid_slope = (~slope_mask).float()
+            l_trend = (l_trend_unreduced * surprise * valid_slope.unsqueeze(-1)).sum() / (valid_slope.sum() + 1e-8)
         else:
             l_trend = (l_trend_unreduced * surprise).mean()
         
@@ -142,8 +149,10 @@ class BGSLLoss(nn.Module):
         l_shock_unreduced = F.mse_loss(pred_accel, true_accel, reduction='none')
         
         if mask is not None:
-            accel_mask = mask[:, 2:] | mask[:, 1:-1] | mask[:, :-2]
-            l_shock = (l_shock_unreduced * num_shock.detach() * (~accel_mask).unsqueeze(-1)).sum() / ((~accel_mask).sum() + 1e-8)
+            # [SOTA FIX] Strict Boolean OR preventing Float bitwise crash
+            accel_mask = mask[:, 2:].bool() | mask[:, 1:-1].bool() | mask[:, :-2].bool()
+            valid_accel = (~accel_mask).float()
+            l_shock = (l_shock_unreduced * num_shock.detach() * valid_accel.unsqueeze(-1)).sum() / (valid_accel.sum() + 1e-8)
         else:
             l_shock = (l_shock_unreduced * num_shock.detach()).mean()
         

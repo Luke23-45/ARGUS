@@ -300,6 +300,16 @@ class ICUTrajectoryDataset(Dataset):
                 raise KeyError(f"LMDB Key failure: {key}. Index desynchronization detected.")
             return data
 
+    def close(self):
+        """
+        Explicitly closes the LMDB environment.
+        Necessary for SOTA resource hygiene before DDP worker forking.
+        """
+        if self._lmdb_env is not None:
+            self._lmdb_env.close()
+            self._lmdb_env = None
+            logger.info(f"[{self.split.upper()}] LMDB Environment closed.")
+
     @functools.lru_cache(maxsize=512) # [OPTIMIZATION] Reduced cache size to prevent OOM
     def _fetch_numpy(self, key: str, dtype_str: str, shape: Tuple[int, ...]) -> np.ndarray:
         """

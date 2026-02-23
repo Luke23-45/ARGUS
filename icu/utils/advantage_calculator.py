@@ -974,9 +974,9 @@ class ICUAdvantageCalculator(nn.Module):
                     # if values is not None: values = values[mask] # values not passed to this function
                     # if rewards is not None: rewards = rewards[mask] # rewards not passed to this function
         
-        # [SOTA v3.1] Mask-Aware Statistics: Use ~mask.bool() to select valid (0) data
+        # [SOTA FIX] Mask-Aware Statistics: mask=1 is VALID. Drop the inversion.
         if mask is not None:
-            adv_flat = advantages[~mask.bool()]
+            adv_flat = advantages[mask.bool()]
         else:
             adv_flat = advantages.reshape(-1)
 
@@ -1108,20 +1108,23 @@ class ICUAdvantageCalculator(nn.Module):
         # [SOTA v30.5 FIX] DDP Consensus: Threshold must be identical across ranks.
         with torch.no_grad():
             # [v139.0 SOTA FIX] Empty Batch Guard (Smoking Gun #139)
+            # [SOTA FIX] DDP-Safe Empty Batch Guard
             if adv_flat.numel() > 10:
                 p99 = torch.quantile(adv_flat.detach().float(), 0.99)
             else:
-                # Default high quantile if batch is too small or empty
-                p99 = torch.tensor(20.0, device=advantages.device)
+                # Use absolute floor so empty ranks DO NOT hijack the ReduceOp.MAX
+                p99 = torch.tensor(-10000.0, device=advantages.device)
             
-            # [v153.0 SOTA FIX] NaN Quantile Guard (Smoking Gun #153)
-            # Rationale: If Rank N has all NaNs, quantile returns NaN. 
-            # all_reduce(MAX) would then poison the entire cluster.
+            # Protect against NaNs destroying the cluster
             if not torch.isfinite(p99):
-                p99.fill_(20.0)
+                p99.fill_(-10000.0)
 
             if dist.is_initialized():
                 dist.all_reduce(p99, op=dist.ReduceOp.MAX)
+                
+            # If ALL ranks were empty, fallback to safe upper bound
+            if p99.item() < -5000.0:
+                p99.fill_(20.0)
                 
             advantages = torch.clamp(advantages, max=p99)
         
@@ -1170,10 +1173,9 @@ class ICUAdvantageCalculator(nn.Module):
         
         # 1. Prepare data for search (Mask-aware)
         if mask is not None:
-             # advantages is [B, T], mu/sigma are scalars
              norm_flat = (advantages - mu) / sigma
-             # Mask out invalid steps for count/sums (0=Valid, 1=Pad)
-             norm_flat = norm_flat.view(-1)[mask.view(-1) < 0.5]
+             # [SOTA FIX] Clean boolean extraction of VALID steps
+             norm_flat = norm_flat[mask.bool()]
         else:
              norm_flat = norm_adv.view(-1)
              
@@ -1372,10 +1374,10 @@ class ICUAdvantageCalculator(nn.Module):
                 # Rationale: Replaces .any() branching with weighted updates.
                 standard_mask = (clipped_rate <= 0.05).float()
                 
-                # [v4.1.9 SOTA FIX] Mask-Aware Bisection Solver (Smoking Gun #Padding-Bleed)
+                # [SOTA FIX] Mask-Aware Bisection Solver
                 if mask is not None:
-                    # [v4.1.11 FIX] Use ~mask to select valid data (0=Valid)
-                    a_valid = advantages[~mask.bool()]
+                    # Keep valid data
+                    a_valid = advantages[mask.bool()]
                 else:
                     a_valid = advantages.reshape(-1)
                 
@@ -1451,27 +1453,29 @@ class ICUAdvantageCalculator(nn.Module):
                 
             # B. Adaptive Clipping (Target = 95th Percentile)
             if self.adaptive_clipping:
-                # [v163.0 SOTA FIX] Deadlock-Free Adaptive Sync (Smoking Gun #163)
-                # Rationale: Ranks with zero samples must NOT skip the all_reduce
-                # or the cluster will hang. We use 0.0 as a neutral MAX element.
-                p95_t = torch.tensor([0.0], device=self.max_weight.device, dtype=self.max_weight.dtype)
+                p95_t = torch.tensor([-10000.0], device=self.max_weight.device, dtype=self.max_weight.dtype)
                 
-                if weights.numel() > 0:
+                # [SOTA FIX] Drop padding zeros before calculating quantile!
+                if mask is not None:
+                    valid_weights = weights[mask.bool()]
+                else:
+                    valid_weights = weights.reshape(-1)
+                
+                if valid_weights.numel() > 10:
                     try:
-                        # Find 95th percentile of RAW weights
-                        p95_t.fill_(torch.quantile(weights.detach().float(), 0.95).item())
+                        p95_t.fill_(torch.quantile(valid_weights.detach().float(), 0.95).item())
                     except:
-                        pass # Fallback if quantile fails
+                        pass 
                 
-                # Check for NaN before sync
                 if not torch.isfinite(p95_t):
-                    p95_t.fill_(0.0)
+                    p95_t.fill_(-10000.0)
 
                 if dist.is_initialized():
-                    # Every rank calls this, even if p95 is 0.0
                     dist.all_reduce(p95_t, op=dist.ReduceOp.MAX)
+                    
+                if p95_t.item() < -5000.0:
+                    p95_t.fill_(20.0) # Safe default if all ranks empty
                 
-                # No branching on .any() or p95_t > 1e-6
                 target_clip = torch.clamp(p95_t * 1.2, min=2.0, max=20.0)
                 self.max_weight.copy_(torch.where(p95_t > 1e-6, target_clip.to(self.max_weight.dtype), self.max_weight))
             # [DDP SYNCHRONIZATION] Prevent divergence of adaptive parameters across ranks

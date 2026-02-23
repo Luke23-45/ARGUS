@@ -110,9 +110,10 @@ class ScalingSteward:
         return int(target_steps * (n_curr / max(1, ref_steps)))
 
     @staticmethod
-    def get_unified_scaling(lr_ref: float, wd_ref: float, n_curr: int, ref_steps: int = SOTA_REF_STEPS, alpha: float = 0.5) -> Tuple[float, float]:
+    def get_unified_scaling(lr_ref: float, wd_ref: float, n_curr: int, ref_steps: int = SOTA_REF_STEPS, alpha: float = 1.0) -> Tuple[float, float]:
         """
-        [v2026 SOTA] Invariant Kinetic Energy Law for AdamW.
+        [SOTA 2026] Invariant Kinetic Energy Law for AdamW.
+        Default alpha=1.0 (Linear Scaling) is preferred for MoE stability.
         
         Rationale: To preserve total regularization energy per epoch (N * LR * WD),
         if steps (N) increase by k, then (LR * WD) must decrease by 1/k.
@@ -744,6 +745,10 @@ class RotationalSaver:
             )
             self._worker_thread.start()
             
+            # [SOTA FIX] Register Exit Handler to prevent data loss on success/crash
+            import atexit
+            atexit.register(self.cleanup)
+            
         # STATE RECOVERY (The Fix for Amnesia)
         self.saved_epochs = self._scan_disk()
 
@@ -885,11 +890,21 @@ class RotationalSaver:
                 self._upload_queue.task_done()
 
     def cleanup(self):
-        """Graceful shutdown of worker thread."""
+        """Graceful shutdown: Flushes queue before killing worker."""
+        if self._upload_queue is not None:
+            # Block main thread until all pending uploads are done
+            if not self._upload_queue.empty():
+                logging.getLogger(__name__).info("[SAVER] Finishing pending backups before exit...")
+                # timeout ensures we don't hang forever if network dies
+                # But queue.join() doesn't take timeout in all python versions, looping is safer
+                while not self._upload_queue.empty():
+                    time.sleep(0.5)
+        
         if self._shutdown_event:
             self._shutdown_event.set()
+        
         if self._worker_thread and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=10.0)
+            self._worker_thread.join(timeout=5.0)
 
 
 class SOTA_DistributedGatherer:
@@ -1065,9 +1080,10 @@ class TieredEMA:
                     shadow_params.append(self.shadow[name])
 
         # 3. Fused Execution (PyTorch 2.0+ Speedup)
-        if torch.cuda.is_available():
-             torch.cuda.synchronize()
-             
+        # [SOTA FIX] Removed explicit cuda.synchronize().
+        # Rationale: Explicit sync flushes the entire GPU pipeline, destroying throughput.
+        # Accessing non_blocking data on CPU implicitly manages necessary barriers.
+        
         if model_params and hasattr(torch, "_foreach_lerp_"):
             # lerp(start, end, weight) -> start + weight * (end - start)
             # We want: shadow * decay + model * (1-decay)

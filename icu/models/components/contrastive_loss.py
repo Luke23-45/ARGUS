@@ -47,7 +47,7 @@ class AsymmetricContrastiveLoss(nn.Module):
             y = y.reshape(-1)
             if mask is not None:
                 if mask.dim() == 3: mask = mask.any(dim=-1)
-                m = mask.reshape(-1)
+                m = mask.reshape(-1).bool() # [SOTA FIX] Enforce boolean indexing strictly
                 z = z[m]
                 y = y[m]
         

@@ -114,19 +114,27 @@ class TemporalSampler(nn.Module):
         # 1. Calculate Scores
         scores = self.scorer(x) # [B, T, 1]
         
-        # Mask out padding (set score to -inf)
+        # 1. Mask out padding safely
         if mask is not None:
             # mask is True for Padding.
-            scores = scores.masked_fill(mask.unsqueeze(-1), -1e9)
+            scores = scores.masked_fill(mask.unsqueeze(-1).bool(), -torch.inf)
             
         # 2. Calculate Attention/Weights
-        weights = F.softmax(scores, dim=1) # [B, T, 1] -> Soft importance
+        weights = F.softmax(scores, dim=1) # [B, T, 1]
+        
+        # [SOTA FIX 1] Iron Dome NaN Flush
+        weights = weights.nan_to_num(0.0)
         
         # 3. Apply Weighting (Soft "Sampling")
-        # We multiply the input by its normalized importance relative to the uniform average.
-        # This amplifies spikes and suppresses flatlines.
-        T = x.shape[1]
-        x_weighted = x * (weights * T) # Scale so mean is 1.0 (approximating identity if uniform)
+        # [SOTA FIX 2] Dynamic Valid Token Scaling (Prevents LayerNorm Explosion)
+        if mask is not None:
+            # Count valid tokens (False in mask). Clamp to 1.0 to prevent div/0
+            valid_count = (~mask.bool()).sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1.0)
+        else:
+            valid_count = torch.tensor(x.shape[1], dtype=x.dtype, device=x.device)
+            
+        # Scale by valid_count to ensure mean is 1.0 only across actual clinical data
+        x_weighted = x * (weights * valid_count)
         
         if self.top_k is not None and self.top_k < T:
             # Hard Top-K Selection

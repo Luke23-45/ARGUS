@@ -254,10 +254,16 @@ class ICUSpecialistDataModule(pl.LightningDataModule):
         
         # [v2.0 SOTA FIX] Plug in the Sepsis-Aware Stateful Sampler
         # Rationale: Direct shuffling (random) often misses sparse clinical events.
+        
+        # [SOTA FIX] DDP Diversity Guarantee (Smoking Gun #14)
+        # Rationale: Without adding rank to the seed, all GPUs sample the EXACT same indices,
+        # wasting N-1 GPUs of compute and correlating gradients perfectly.
+        ddp_seed = self.cfg.get("seed", 42) + get_rank()
+        
         sampler = create_sepsis_aware_sampler(
             self.train_ds, 
             sepsis_boost_factor=self.cfg.train.get("sepsis_boost_factor", 10.0),
-            seed=self.cfg.get("seed", 42)
+            seed=ddp_seed
         )
         
         return DataLoader(

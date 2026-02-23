@@ -190,17 +190,66 @@ class WeightedEpisodeSampler(EpisodeAwareSampler):
         self.episode_weights = torch.ones(len(self.available_episodes))
         sepsis_flags = []
         
-        for ep_id in self.available_episodes:
-            try:
-                # Key format: ep_000000_labels
-                label_key = f"{root_ds.episode_metadata[ep_id]['episode_id']}_labels"
-                raw_labels = root_ds._read_bytes(label_key)
-                labels = np.frombuffer(raw_labels, dtype=np.float32)
-                has_sepsis = np.any(labels > 0)
-                sepsis_flags.append(has_sepsis)
-            except Exception:
-                sepsis_flags.append(False)
-                
+        # [SOTA FIX] Atomic LMDB Context for Initialization Scan
+        # Rationale: Dataset might not have an open env yet, or it might be closed.
+        # We must guarantee a valid handle for this synchronous scan and CLEAN UP afterwards
+        # to prevent file descriptor leaks into worker processes.
+        env_was_none = (getattr(root_ds, '_lmdb_env', None) is None)
+        
+        # Force open if needed
+        if env_was_none:
+            if hasattr(root_ds, '_init_lmdb'):
+                root_ds._init_lmdb()
+            elif hasattr(root_ds, '_open_lmdb'): # Handle common naming variation
+                root_ds._open_lmdb()
+            else:
+                logger.warning("[Sampler] Could not force-init LMDB. Scan may fail if env is closed.")
+
+        try:
+            # Optimize scan by caching env reference
+            env = getattr(root_ds, '_lmdb_env', None)
+            
+            for ep_id in self.available_episodes:
+                try:
+                    # Key format: ep_000000_labels
+                    meta = root_ds.episode_metadata[ep_id]
+                    
+                    # [Optimization] Check metadata first if available (Zero-Disk Read)
+                    # Sepsis flag is often cached in JSON metadata during ingestion
+                    if 'has_sepsis' in meta:
+                        has_sepsis = bool(meta['has_sepsis'])
+                    elif 'label' in meta: # Common variation
+                        has_sepsis = (meta['label'] > 0)
+                    else:
+                        # Fallback to byte read (Expensive but necessary)
+                        # Use internal env directly to avoid wrapper overhead
+                        label_key = f"{meta['episode_id']}_labels"
+                        
+                        if env is not None:
+                            with env.begin(write=False) as txn:
+                                raw_labels = txn.get(label_key.encode())
+                                if raw_labels is None:
+                                    has_sepsis = False
+                                else:
+                                    # Copy=False is safe here as we just read bool state
+                                    labels = np.frombuffer(raw_labels, dtype=np.float32)
+                                    has_sepsis = np.any(labels > 0)
+                        else:
+                            # Last ditch: Try public API (might fail if closed)
+                            raw_labels = root_ds._read_bytes(label_key)
+                            labels = np.frombuffer(raw_labels, dtype=np.float32)
+                            has_sepsis = np.any(labels > 0)
+                            
+                    sepsis_flags.append(has_sepsis)
+                except Exception:
+                    # Default to False on read error to prevent crash
+                    sepsis_flags.append(False)
+        finally:
+            # [Hygiene] If we forced it open, we MUST close it.
+            # Leaving it open causes 'Bad Reader Lock' when DDP forks workers.
+            if env_was_none and hasattr(root_ds, 'close'):
+                root_ds.close()
+               
         sepsis_flags = torch.tensor(sepsis_flags)
         n_sepsis = sepsis_flags.sum().item()
         n_stable = len(sepsis_flags) - n_sepsis

@@ -147,12 +147,17 @@ class RoPEMultiheadAttention(nn.Module):
              scores = scores + attn_mask
              
         if key_padding_mask is not None:
-            # key_padding_mask [B, T] -> True means ignore
-            # Expand to [B, 1, 1, T] for broadcast
-            mask_expanded = key_padding_mask.unsqueeze(1).unsqueeze(2)
-            scores = scores.masked_fill(mask_expanded, -1e9)
+            # [SOTA FIX 1] Strict boolean mask expansion
+            mask_expanded = key_padding_mask.unsqueeze(1).unsqueeze(2).bool()
+            # [SOTA FIX 2] Use -torch.inf for exact 0.0 softmax probability
+            scores = scores.masked_fill(mask_expanded, -torch.inf)
             
         weights = F.softmax(scores, dim=-1)
+        
+        # [SOTA FIX 3] Iron Dome: If an entire row is masked, Softmax(-inf) yields NaN.
+        # We MUST flush these NaNs to 0.0 to prevent the V-projection from corrupting.
+        weights = weights.nan_to_num(0.0)
+        
         output = torch.matmul(weights, v) # [B, H, T, D_h]
         
         # Reassemble

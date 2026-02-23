@@ -1508,7 +1508,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Every batch now has sepsis signal via the Summoned Ghosts.
             # We remove the 0.1x multiplier and train with full magnitude.
             with torch.no_grad():
-                probs = torch.softmax(logits, dim=-1)
+                probs = torch.sigmoid(logits) # [SOTA FIX] Use Sigmoid to match ASL
                 # logits/probs: [B+G, C], targets_expanded: [B+G]
                 true_probs = probs.gather(-1, targets_expanded.unsqueeze(-1).long())
                 error = 1.0 - true_probs.squeeze(-1)
@@ -1535,8 +1535,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Rationale: SequenceAuxHead uses generic AsymmetricLoss. We MUST override with 
             # RiskAwareAsymmetricLoss to apply Critical Penalty for Shock/Hypoxia.
             
-            # Note: We ignore aux_loss_base from the head in favor of the wrapper's risk-aware loss.
-            raw_aux_loss = self.risk_aware_loss(logits, targets_one_hot, risk_coef_expanded, class_weights=class_weights)
+            # [SOTA FIX] Alarm Fatigue Prevention: Disable brute-force class weights.
+            # ASL inherently handles the 3.1% imbalance via gamma_neg and Prior Bias Init.
+            # Multiplying by 32x class_weights causes catastrophic false positives.
+            raw_aux_loss = self.risk_aware_loss(logits, targets_one_hot, risk_coef_expanded, class_weights=None)
             aux_loss = raw_aux_loss * cfm * mining_weight_avg
 
             # [v17.4 GIST-Q] Uncertainty-Weighted CGA
@@ -1634,10 +1636,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # Must be OUTSIDE no_grad so 'logits' (Student) gradients flow
         if teacher_logits is not None:
              # Surgical Mask: Only anchor Student representations for the main batch [0:B]
-             # [v20.1 SOTA FIX] Precise Multiclass Anchoring
-             # BCE on independent logits is unstable for multiclass. 
-             # We use MSE on probabilities (Softmax) for smooth representative alignment.
-             l_anchor = F.mse_loss(torch.softmax(logits[:B], dim=-1), torch.softmax(teacher_logits, dim=-1))
+             # [SOTA FIX] Distill independent sigmoids to perfectly align with ASL manifold
+             l_anchor = F.mse_loss(torch.sigmoid(logits[:B]), torch.sigmoid(teacher_logits))
              
              # [v112.0 SOTA FIX] Transition Smoothing (Smoking Gun #43)
              # [SOTA FIX - RATIO ANNEALING] Dynamic Budget Integration for Auxiliary Gate
@@ -2562,7 +2562,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 # Check for "Manifold Shock" (5-Sigma Outlier)
                 z_score = TrendSentinel.calculate_z_score(current_p, self.grad_norm_ema, self.grad_norm_std)
                 if z_score > 5.0:
-                    logger.warning(f"☄️ [IRON DOME] Blocked 5-Sigma Gradient Spike (Z={z_score.item():.2f}). Skipping step.")
+                    # [v2026.1 STABILITY FIX] Enhanced Diagnostics
+                    logger.warning(
+                        f"☄️ [IRON DOME] Blocked 5-Sigma Gradient Spike "
+                        f"(Z={z_score.item():.2f}, Norm={current_p:.4f}, "
+                        f"EMA={self.grad_norm_ema.item():.4f}, STD={self.grad_norm_std.item():.4f}). "
+                        f"Skipping step."
+                    )
                     should_apply = False
                 
                 # Check for "Manifold Collapse" (Emergency Shutdown)
@@ -2621,24 +2627,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
                     logger.info("[PMS] Establishing Gradient Pressure Baseline...")
                     self._pms_start_logged = True
                 
-                ada_decay_threshold = ScalingSteward.get_steps(300, self.trainer.num_training_batches)
-                active_decay = 0.90 if self.grad_norm_step_count < ada_decay_threshold else self.grad_ema_decay
-                active_decay_scaled = active_decay ** actual_accum
-                
                 if grace_val == 0 and not is_init_period and not self._pms_init_logged:
                     logger.info(f"[PMS] Initialization Complete. GN Baseline: {self.grad_norm_ema.item():.4f}")
                     self._pms_init_logged = True
                 elif self._shadow_resumption_grace_steps == 1:
                     logger.info("[PMS] Resumption Grace Period Concluded (Stats Preserved).")
-
-                if grace_val <= 0:
-                    ema_bc, std_bc = TrendSentinel.update_stats(
-                        current_grad_pressure, 
-                        self.grad_norm_ema, 
-                        self.grad_norm_std, 
-                        active_decay_scaled,
-                        step_tensor=self.grad_norm_step_count
-                    )
                 # [v12.8.3 SOTA FIX] Direct Attachment Projection
                 if hasattr(self, 'loss_scaler') and self.loss_scaler is not None:
                     if hasattr(self.loss_scaler, 'project_parameters'):
@@ -2663,6 +2656,26 @@ class ICUGeneralistWrapper(pl.LightningModule):
                      self.gn_acc_count.fill_(0)
             else:
                 logger.warning(f"⚠️ Gradient Spike Detected (Norm={grad_norm_val.item():.2f}). Skipping optimization step for batch {batch_idx}.")
+            
+            # [v2026.1 STABILITY FIX] Decoupled Sentinel Update
+            # Rationale: The TrendSentinel MUST see every gradient norm, including
+            # spikes that are blocked by the Iron Dome. Without this, the EMA becomes
+            # permanently stale after a block, causing a "Hypersensitivity Trap" where
+            # the model can never recover from a single false positive.
+            # Validated by forensic_stability_probe.py: Z-escalation 5.70→7.19 (broken)
+            # vs stable convergence (fixed).
+            ada_decay_threshold = ScalingSteward.get_steps(300, self.trainer.num_training_batches)
+            active_decay = 0.90 if self.grad_norm_step_count < ada_decay_threshold else self.grad_ema_decay
+            active_decay_scaled = active_decay ** (self._shadow_grad_accum_idx if self._shadow_grad_accum_idx > 0 else 1)
+            
+            if grace_val <= 0 and not is_init_period:
+                TrendSentinel.update_stats(
+                    current_grad_pressure, 
+                    self.grad_norm_ema, 
+                    self.grad_norm_std, 
+                    active_decay_scaled,
+                    step_tensor=self.grad_norm_step_count
+                )
             
             # [v23.0 SOTA FIX] Mandatory Reservoir Purge (Smoking Gun #224)
             # Rationale: Regardless of step success, we MUST wipe the gradients 
@@ -2880,9 +2893,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 probs = out.get("aux_probs", None)
                 
                 if probs is not None:
-                    # Multi-class: Sum sepsis stages (Indices 1+)
+                    # Multi-class: Probabilistic Union for independent sigmoids
+                    # P(Any Sepsis) = 1 - Product(1 - P(Class_i))
                     if probs.shape[-1] > 1:
-                        risk_prob = probs[:, 1:].sum(dim=1)
+                        risk_prob = 1.0 - (1.0 - probs[:, 1:]).prod(dim=1)
                     else:
                         risk_prob = probs.squeeze()
                 else:

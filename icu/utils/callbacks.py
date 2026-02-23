@@ -398,13 +398,17 @@ class ClinicalMetricCallback(Callback):
             
             # Legacy/Fallback Logic
             elif clean_preds.dim() == 2 and clean_preds.shape[-1] > 1:
-                # Multi-class logits: [B, num_classes]
+                # [SOTA FIX] ASL Alignment: Independent Sigmoids, NOT Softmax
                 if self.inputs_are_logits:
-                    probs = torch.softmax(clean_preds, dim=-1)
+                    probs = torch.sigmoid(clean_preds)
                 else:
                     probs = clean_preds
-                # P(Sick) = 1 - P(Stable), where Stable is class 0
-                clean_preds = 1.0 - probs[:, 0]
+                
+                # Metric: P(Any Sepsis) = 1.0 - P(All Healthy)
+                # Assuming Class 0 is 'Stable', Classes 1+ are 'Risk'
+                # Probabilistic Union: 1 - Product(1 - P_risk)
+                sick_probs = probs[:, 1:]
+                clean_preds = 1.0 - (1.0 - sick_probs).prod(dim=1)
             elif self.inputs_are_logits:
                 # Binary logits: [B] or [B, 1]
                 if clean_preds.dim() == 2:
@@ -460,14 +464,19 @@ class GradientHealthMonitor(Callback):
 
     def on_after_backward(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         if trainer.global_step % self.log_every_n_steps == 0:
-            # 1. Total Norm
-            all_grads = [p.grad.detach().flatten() for p in pl_module.model.parameters() if p.grad is not None]
-            if not all_grads: return
+            # 1. Total Norm (SOTA Fused Implementation)
+            # [SOTA FIX] Avoid torch.cat() VRAM spike via _foreach_norm
+            grads = [p.grad for p in pl_module.model.parameters() if p.grad is not None]
+            if not grads: return
             
-            total_norm = torch.cat(all_grads).norm(2).item()
+            # Math: Global L2 = sqrt(sum(local_L2^2))
+            if hasattr(torch, "_foreach_norm"):
+                local_norms = torch._foreach_norm(grads, 2)
+                total_norm = torch.linalg.vector_norm(torch.stack(local_norms), 2).item()
+            else:
+                total_norm = torch.norm(torch.stack([torch.norm(g, 2) for g in grads]), 2).item()
             
             # Use sync_dist=True with reduce_fx="max" to log the WORST gradient norm across GPUs.
-            # This prevents noisy logs and highlights instability on any rank.
             pl_module.log("health/grad_norm_total", total_norm, on_step=True, sync_dist=True, reduce_fx="max", prog_bar=True)
             
             # 2. Expert Utilization (MoE Check)
@@ -478,10 +487,16 @@ class GradientHealthMonitor(Callback):
                     if match:
                         eid = int(match.group(1))
                         if eid not in expert_patterns: expert_patterns[eid] = []
-                        expert_patterns[eid].append(param.grad.detach().flatten())
+                        expert_patterns[eid].append(param.grad)
             
             for eid, grads in expert_patterns.items():
-                gnorm = torch.cat(grads).norm(2).item()
+                # [SOTA FIX] Fused Expert Norm
+                if hasattr(torch, "_foreach_norm"):
+                    local_norms = torch._foreach_norm(grads, 2)
+                    gnorm = torch.linalg.vector_norm(torch.stack(local_norms), 2).item()
+                else:
+                    gnorm = torch.norm(torch.stack([torch.norm(g, 2) for g in grads]), 2).item()
+                
                 # Log worst-case Expert norm to detect collapse
                 pl_module.log(f"health/expert_{eid}_grad_norm", gnorm, on_step=True, sync_dist=True, reduce_fx="max")
                 
@@ -536,7 +551,13 @@ class EMACallback(Callback):
         self._init_ema(pl_module)
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        # [FIX] Skip if wrapper handles EMA updates manually
+        # [SOTA FIX] Manual Optimization Guard
+        # If the model handles optimization manually (wrapper_generalist), it MUST manage EMA stepping.
+        # Otherwise, we get double-updates (Decay Squared) and race conditions.
+        if not getattr(pl_module, "automatic_optimization", True):
+            return
+
+        # Legacy/Automatic Optimization Path
         if getattr(pl_module.cfg.train, 'manual_ema_update', False):
             return  # Wrapper handles update via its own ema.update() call
         

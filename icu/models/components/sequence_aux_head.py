@@ -116,20 +116,18 @@ class SequenceAuxHead(nn.Module):
         nn.init.zeros_(final_layer.weight) 
         
         # [v33.0 SOTA FIX] Dynamically calculated logit bias
-        # Target: P(Positive) approx prevalence
-        # bias = log(p / (1-p))
         bias_val = math.log(prevalence / (1.0 - prevalence))
         
         if num_classes > 1:
-            # Multi-class Case (Stable vs Pre-Shock vs Shock)
-            # Class 0 (Stable) is dominant -> Bias 0 (Reference)
-            # Classes > 0 are rare -> Bias mapped to logit space
-            nn.init.zeros_(final_layer.bias)
             with torch.no_grad():
+                # [SOTA FIX] Majority class (Stable) gets POSITIVE bias (starts at ~97% prob)
+                final_layer.bias[0].fill_(-bias_val)
+                # Minority classes (Sepsis) get NEGATIVE bias (starts at ~3% prob)
                 final_layer.bias[1:].fill_(bias_val)
         else:
-            # Binary Case
-            nn.init.constant_(final_layer.bias, bias_val)
+            with torch.no_grad():
+                # Binary Case: Single logit predicting the minority class
+                final_layer.bias.fill_(bias_val)
         
         # [v14.1 FORENSIC FIX] Revert to Asymmetric Loss (Smoking Gun #470)
         self.criterion = AsymmetricLoss(
@@ -178,23 +176,19 @@ class SequenceAuxHead(nn.Module):
         # [v89.0] Logit Clamping (Safety) - prevents gradient explosion
         logits = torch.clamp(logits, min=-20.0, max=20.0)
         
-        # 5. [v14.1] Probabilities - activation based on num_classes
-        if self.num_classes == 1:
-            probs = torch.sigmoid(logits)  # Binary classification
-        else:
-            probs = torch.softmax(logits, dim=-1)  # Multi-class classification
+        # 5. [SOTA FIX] ASL requires independent sigmoids even for multi-class
+        probs = torch.sigmoid(logits)
         
-        # 6. [v14.1 API COMPAT] Compute Predictive Entropy as Uncertainty Surrogate
+        # 6. Compute Predictive Entropy (Independent Binary Entropy)
         eps = 1e-12
-        if self.num_classes == 1:
-            p = probs.clamp(eps, 1.0 - eps)
-            entropy = -(p * p.log() + (1.0 - p) * (1.0 - p).log())
-        else:
-            p = probs.clamp(eps, 1.0 - eps)
-            entropy = -(p * p.log()).sum(dim=-1, keepdim=True)
+        p = probs.clamp(eps, 1.0 - eps)
+        entropy = -(p * p.log() + (1.0 - p) * (1.0 - p).log())
         
-        # Normalize entropy to [0, 1]
-        max_entropy = float(torch.log(torch.tensor(max(self.num_classes, 2), dtype=torch.float32)))
+        if self.num_classes > 1:
+            entropy = entropy.mean(dim=-1, keepdim=True)
+            
+        # Max binary entropy is exactly ln(2)
+        max_entropy = float(math.log(2.0))
         uncertainty = (entropy / max_entropy).clamp(0.0, 1.0)
         
         if uncertainty.ndim == 1:
