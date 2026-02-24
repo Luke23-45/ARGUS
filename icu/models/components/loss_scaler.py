@@ -123,6 +123,10 @@ class BayesianProjectedScaler(nn.Module):
                 avg_losses_all = self.loss_accumulator / (self.task_counters + 1e-8)
                 avg_losses = avg_losses_all[indices] if has_losses else torch.tensor([], device=device)
                 
+                # [SG-4 FIX] Increment step_count in non-DDP path
+                # Without this, step_count stays at 0 forever, permanently
+                # locking EMA decay at the warmup value (0.95 instead of 0.99).
+                self.step_count += 1
                 is_warmup = (self.step_count < self.warmup_steps)
                 curr_decay = torch.where(is_warmup, torch.as_tensor([0.95], device=device), self.decay)
                 self.loss_emas.lerp_(avg_losses_all, 1.0 - curr_decay)
@@ -166,6 +170,9 @@ class BayesianProjectedScaler(nn.Module):
         # Component 1: Network Updates (Theta)
         # We use the EXACT RAW loss for the network weights, scaled linearly by precision.
         # This prevents the exponential gradient suppression of high-magnitude tasks (e.g., GMSE).
+        # Note: TCB explosion is handled by the Magnitude Throttle (L149-155) which
+        # smoothly dampens tasks exceeding 20x the diffusion anchor via uw_weights.
+        # The SG-4 step_count fix ensures the throttle's EMAs converge properly.
         theta_loss = (0.5 * precision.detach() * losses_tensor * uw_weights).sum()
         
         # Component 2: Uncertainty Updates (Sigma)

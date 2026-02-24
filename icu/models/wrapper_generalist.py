@@ -1013,6 +1013,19 @@ class ICUGeneralistWrapper(pl.LightningModule):
         if hasattr(dataset, "_lmdb_env"):
             dataset._lmdb_env = None
 
+        # [v12.5 SOTA FIX] Pre-Training Validation (Resumption Trauma Detector)
+        # Rationale: Detect metric regression or loading bugs before starting training.
+        # This provides a clean baseline to verify bit-perfect restoration.
+        if self.trainer is not None and getattr(self.trainer, "ckpt_path", None) is not None:
+             logger.info("🔍 [RESUME] Running Pre-Training Validation to detect resumption trauma...")
+             try:
+                 # Ensure we have a valid dataloader from datamodule
+                 val_loader = self.trainer.datamodule.val_dataloader()
+                 self.trainer.validate(self, dataloaders=val_loader)
+                 logger.info("✅ [RESUME] Pre-Training Validation Complete. Baseline Established.")
+             except Exception as e:
+                 logger.warning(f"⚠️ [RESUME] Pre-Training Validation skipped or failed: {e}")
+
     def on_train_epoch_start(self):
         """[Phase 3/4] Update AWR Horizon and SOTA v4.2 Warmup."""
         # [v26.4 SOTA FIX] Force Sampler Synchronization

@@ -9,19 +9,16 @@ defaults:
 run_name: "gen_v1_${now:%Y-%m-%d_%H-%M-%S}"
 seed: 42
 compile_model: false
-save_checkpoints: false
-debug_save_epochs: [2]     # [DEBUG] List of epochs to save snapshots (e.g., [5, 10, 50])
+save_checkpoints: true
+debug_save_epochs: []     # [DEBUG] List of epochs to save snapshots (e.g., [5, 10, 50])
 
 # --- Directory Paths ---
-output_dir: "outputs/phase1"           # Main output directory
+output_dir: "/content/icu/phase1/"           # Main output directory
 checkpoint_dir: "/content/icu/checkpoints/"  # [OK] Large files, infrequent writes
 log_dir: "/content/icu/logs/"         # [CRITICAL] Must be LOCAL for WandB (High freq IO)
 backup_dir: null                        # Remote/backup directory
-resume_from: null #"/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-29_16-52-27-latest-epoch=13.ckpt"
-# resume_from: "/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-25_12-31-59-latest-epoch=05.ckpt"     # Explicit checkpoint to resume from (optional)
-# "/content/drive/MyDrive/pda/models/checkpoints/icu_model-epoch=05-val/clinical_auroc=0.747.ckpt"          
-#"/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-01-16_16-21-21-latest-epoch=17.ckpt"
-# --- Model Architecture (ICUUnifiedPlanner) ---
+resume_from: null
+
 model:
   input_dim: 28
   static_dim: 6
@@ -82,7 +79,7 @@ train:
   horizon_ramp: 40
 
   # Debug Mode (Smoke Test)
-  debug_run: true #true
+  debug_run: false #true
   debug_limit_batches: 200
   debug_limit_val: 500
 
@@ -102,7 +99,7 @@ train:
   # AWR Calibration Speed/Quality (v10.1 Upgrade)
   # - "full": Scans all trajectories (~5-10 min, best for final training)
   # - "sample": Random subset (~10-30 sec, best for testing)
-  awr_calibration_mode: "sample" # full for whole population scan or sample
+  awr_calibration_mode: "full" # full for whole population scan or sample
   awr_max_samples: 10000      # [SOTA FIX] Increased for Batch 2048 / Full Sepsis-3 Population
   
   # [SOTA REMOVED] Redundant batch_size (Defined in train.batch_size)

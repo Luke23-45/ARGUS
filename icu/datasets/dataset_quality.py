@@ -51,7 +51,7 @@ from typing import List, Tuple, Optional, Dict
 # CONFIGURATION
 # ==============================================================================
 
-LMDB_MAP_SIZE = 10 * 1024 ** 3  # 10GB (Project Standard)
+LMDB_MAP_SIZE = 3 * 1024 ** 3  # 10GB (Project Standard)
 RESERVOIR_SIZE = 200_000
 SEED = 2026
 MIN_STAY_HOURS = 8   # Minimum ICU stay to include
@@ -411,17 +411,12 @@ class QualityIngestionEngine:
         self.cnt = 0
         self.errors = 0
     
-    def process(self, file_list: List[Path], commit_every: int = 5000):
-        """Process all files with periodic commits for crash-resilience."""
-        n_total = len(file_list)
-        for start_idx in range(0, n_total, commit_every):
-            end_idx = min(start_idx + commit_every, n_total)
-            batch = file_list[start_idx : end_idx]
-            
-            with self.env.begin(write=True) as txn:
-                for fpath in tqdm(batch, desc=f"Building {self.split} (Chunk {start_idx//commit_every + 1})"):
-                    try:
-                        df = pd.read_csv(fpath, sep='|')
+    def process(self, file_list: List[Path]):
+        """Process all files in the list."""
+        with self.env.begin(write=True) as txn:
+            for fpath in tqdm(file_list, desc=f"Building {self.split}"):
+                try:
+                    df = pd.read_csv(fpath, sep='|')
                     
                     # Process patient
                     features, labels, raw_masks, decayed_masks = process_patient(df)

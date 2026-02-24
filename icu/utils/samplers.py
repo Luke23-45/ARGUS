@@ -228,8 +228,23 @@ class WeightedEpisodeSampler(EpisodeAwareSampler):
                 sepsis_flags = None
 
         if sepsis_flags is None:
+            # [SOTA FIX] Check for Metadata-Only Fast-Path
+            # Rationale: dataset_quality.py now embeds 'has_sepsis' in the index.
+            # If present, we can build the flags in O(N) memory-speed without touching LMDB.
+            try:
+                if all('has_sepsis' in root_ds.episode_metadata.get(ep_id, {}) for ep_id in self.available_episodes):
+                    if self.rank == 0:
+                        logger.info(f"[Sampler] Using Metadata Fast-Path for Prevalence Scan (Zero-Wait)")
+                    sepsis_flags = torch.tensor([
+                        bool(root_ds.episode_metadata[ep_id]['has_sepsis']) 
+                        for ep_id in self.available_episodes
+                    ])
+            except Exception as e:
+                logger.debug(f"[Sampler] Fast-path skipped: {e}")
+
+        if sepsis_flags is None:
             if self.rank == 0:
-                logger.info(f"[Sampler] Performing Prevalence Scan (Single Transaction)...")
+                logger.info(f"[Sampler] Performing Prevalence Scan (LMDB Fallback)...")
             
             sepsis_flags_list = []
             env_was_none = (getattr(root_ds, '_lmdb_env', None) is None)
