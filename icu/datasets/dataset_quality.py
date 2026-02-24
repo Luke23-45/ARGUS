@@ -51,7 +51,7 @@ from typing import List, Tuple, Optional, Dict
 # CONFIGURATION
 # ==============================================================================
 
-LMDB_MAP_SIZE = 3 * 1024 ** 3  # 10GB (Project Standard)
+LMDB_MAP_SIZE = 10 * 1024 ** 3  # 10GB (Project Standard)
 RESERVOIR_SIZE = 200_000
 SEED = 2026
 MIN_STAY_HOURS = 8   # Minimum ICU stay to include
@@ -411,12 +411,17 @@ class QualityIngestionEngine:
         self.cnt = 0
         self.errors = 0
     
-    def process(self, file_list: List[Path]):
-        """Process all files in the list."""
-        with self.env.begin(write=True) as txn:
-            for fpath in tqdm(file_list, desc=f"Building {self.split}"):
-                try:
-                    df = pd.read_csv(fpath, sep='|')
+    def process(self, file_list: List[Path], commit_every: int = 5000):
+        """Process all files with periodic commits for crash-resilience."""
+        n_total = len(file_list)
+        for start_idx in range(0, n_total, commit_every):
+            end_idx = min(start_idx + commit_every, n_total)
+            batch = file_list[start_idx : end_idx]
+            
+            with self.env.begin(write=True) as txn:
+                for fpath in tqdm(batch, desc=f"Building {self.split} (Chunk {start_idx//commit_every + 1})"):
+                    try:
+                        df = pd.read_csv(fpath, sep='|')
                     
                     # Process patient
                     features, labels, raw_masks, decayed_masks = process_patient(df)
@@ -431,7 +436,7 @@ class QualityIngestionEngine:
                     eid = f"ep_{self.cnt:06d}"
                     txn.put(f"{eid}_v".encode(), features.tobytes())
                     txn.put(f"{eid}_m".encode(), raw_masks.tobytes())
-                    txn.put(f"{eid}_l".encode(), labels.tobytes())
+                    txn.put(f"{eid}_labels".encode(), labels.tobytes())
                     txn.put(f"{eid}_d".encode(), decayed_masks.tobytes())
                     
                     # Static context: demographics from first row
@@ -442,14 +447,16 @@ class QualityIngestionEngine:
                     txn.put(f"{eid}_s".encode(), static_vals.tobytes())
                     
                     # Index entry
+                    has_seps_bool = bool(np.any(labels > 0.5))
                     self.index.append({
                         "episode_id": eid,
                         "patient_id": fpath.stem,
                         "length": T,
+                        "has_sepsis": has_seps_bool,
                         "modalities": {
                             "vitals": {"key": f"{eid}_v", "shape": [T, N_FEATURES], "dtype": "float32"},
                             "masks":  {"key": f"{eid}_m", "shape": [T, N_RAW],      "dtype": "float32"},
-                            "labels": {"key": f"{eid}_l", "shape": [T],              "dtype": "float32"},
+                            "labels": {"key": f"{eid}_labels", "shape": [T],              "dtype": "float32"},
                             "static": {"key": f"{eid}_s", "shape": [N_STATIC],       "dtype": "float32"},
                             "decay":  {"key": f"{eid}_d", "shape": [T, N_RAW],      "dtype": "float32"}
                         }

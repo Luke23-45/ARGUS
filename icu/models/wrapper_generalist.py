@@ -1629,21 +1629,41 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 with torch.no_grad():
                     # 1. Fetch DDP-Synced Global Scale (Shape: [1])
                     adv_scale = self.awr_calculator.adv_std.detach().clamp(min=1e-3)
+                    base_sigma = 0.05 * adv_scale
                     
-                    # 2. Compute 5% Jitter limits
-                    noise_sigma = 0.05 * adv_scale
-                    target_noise = torch.randn_like(target_values) * noise_sigma
+                    # 2. Compute Scale-Invariant Local Volatility (Heteroscedasticity)
+                    # diff() reduces time dimension by 1. Pad front to keep shape [B, T, N].
+                    # Rationale: We detect temporal instability per quantile to scale jitter.
+                    v_diff = torch.cat([torch.zeros_like(target_values[:, :1]), target_values.diff(dim=1)], dim=1)
+                    norm_diff = v_diff / adv_scale
+                    volatility = torch.tanh(torch.abs(norm_diff))
                     
-                    # 3. Apply 2-Sigma Iron Dome (Zero-Sync, Broadcast-Safe)
+                    # Local Sigma scales up to 2x based on patient instability
+                    local_sigma = base_sigma * (1.0 + volatility)
+                    
+                    # 3. Generate Raw Noise
+                    raw_noise = torch.randn_like(target_values) * local_sigma
+                    
+                    # 4. SOTA: Variance-Preserving Causal Smoothing (MA(1) Process)
+                    # Pad with REAL noise to prevent variance collapse at t=0
+                    pre_noise = torch.randn_like(raw_noise[:, :1]) * local_sigma[:, :1]
+                    noise_shifted = torch.cat([pre_noise, raw_noise[:, :-1]], dim=1)
+                    
+                    # Blend factor 0.7071 (sqrt(0.5)) ensures (a^2 + a^2 = 1.0), preserving exact variance
+                    blend_factor = 0.70710678
+                    temporal_noise = blend_factor * raw_noise + blend_factor * noise_shifted
+                    
+                    # 5. Dynamic Symmetric Iron Dome (Zero-Sync, Broadcast-Safe)
                     # We use pure tensor operations to avoid .item() syncs or view_as crashes.
-                    limit = 2.0 * noise_sigma
+                    local_limit = 2.5 * local_sigma
+                    clamped_noise = torch.max(torch.min(temporal_noise, local_limit), -local_limit)
                     
-                    # torch.clamp supports broadcasting in PT 1.9+. 
-                    # Using max/min for absolute backward/forward compatibility.
-                    target_noise = torch.max(torch.min(target_noise, limit), -limit)
+                    # 6. Pessimistic Shift (Conservative RL)
+                    # Applied AFTER clamping to strictly guarantee the downward shift is preserved.
+                    pessimism_penalty = -0.5 * local_sigma * volatility
                     
-                    # 4. Inject
-                    target_values = target_values + target_noise.detach()
+                    # 7. Inject
+                    target_values = target_values + (clamped_noise + pessimism_penalty).detach()
 
                 # B. Run Anchor Head (if applicable)
                 teacher_logits = None
