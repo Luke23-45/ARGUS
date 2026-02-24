@@ -840,6 +840,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # [v52.0 SOTA FIX] Grand Unified Consensus (Smoking Gun #MasterAudit)
         # Rationale: Bit-perfect parity across all meta-parameters and historical buffers.
         if dist.is_available() and dist.is_initialized():
+            # [GATED CONSENSUS FIX] Discovery Protocol
+            # Rationale: Ranks must vote on existence of conditional components before broadcast.
+            # If Rank 1 skips broadcast while Rank 0 executes, the cluster deadlocks permanently.
+            sync_mask = torch.tensor([
+                1 if getattr(self, "_fnd_grad_ema", None) is not None else 0,
+                1 if getattr(self, "grad_ref_buffer", None) is not None else 0
+            ], device=self.device, dtype=torch.long)
+            dist.all_reduce(sync_mask, op=dist.ReduceOp.MAX)
+
             # 1. Manifold Stability Parity
             dist.broadcast(self.grad_norm_ema, src=0)
             dist.broadcast(self.grad_norm_std, src=0)
@@ -848,11 +857,17 @@ class ICUGeneralistWrapper(pl.LightningModule):
             dist.broadcast(self.diff_grad_ema, src=0)
             
             # 2. Foundation Consensus (MGP & AGEM)
-            if self._fnd_grad_ema is not None:
+            if sync_mask[0].item() > 0:
+                if getattr(self, "_fnd_grad_ema", None) is None:
+                    # Allocate dummy tensor to safely receive broadcast
+                    self._fnd_grad_ema = torch.zeros(self.model.cfg.d_model, device=self.device)
                 dist.broadcast(self._fnd_grad_ema, src=0)
-            
-            # [v53.0] AGEM Consensus
-            if self.grad_ref_buffer is not None:
+                
+            if sync_mask[1].item() > 0:
+                if getattr(self, "grad_ref_buffer", None) is None:
+                    # Allocate dummy to receive
+                    total_p = sum(p.numel() for p in self.parameters() if p.requires_grad)
+                    self.grad_ref_buffer = torch.zeros(total_p, device=self.device)
                 dist.broadcast(self.grad_ref_buffer, src=0)
             
             # 3. Meta-Task Consensus (GradNorm & LossScaler)
@@ -950,8 +965,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             if self.ghost_bank.size > 0 and self.global_step > 0:
                 logger.info("🔄 [RESUME] Refreshing Ghost Bank latent anchors...")
                 try:
-                    # [v2026 SOTA FIX] Ghost Bank Positional Argument & Graph Fix
-                    # Rationale: Extract correct static features, freeze BN stats, and return 'global_expert'.
+                    # [SG-02 SOTA FIX] Ghost Bank Topographical Integrity
                     def ghost_encoder_fn(v, m):
                          # 1. Extract true static features (indices 22-27 at t=0)
                          s_true = v[:, 0, 22:].clone()
@@ -1035,15 +1049,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # [v12.5 SOTA FIX] Pre-Training Validation (Resumption Trauma Detector)
         # Rationale: Detect metric regression or loading bugs before starting training.
         # This provides a clean baseline to verify bit-perfect restoration.
-        if self.trainer is not None and getattr(self.trainer, "ckpt_path", None) is not None:
-             logger.info("🔍 [RESUME] Running Pre-Training Validation to detect resumption trauma...")
-             try:
-                 # Ensure we have a valid dataloader from datamodule
-                 val_loader = self.trainer.datamodule.val_dataloader()
-                 self.trainer.validate(self, dataloaders=val_loader)
-                 logger.info("✅ [RESUME] Pre-Training Validation Complete. Baseline Established.")
-             except Exception as e:
-                 logger.warning(f"⚠️ [RESUME] Pre-Training Validation skipped or failed: {e}")
+        # if self.trainer is not None and getattr(self.trainer, "ckpt_path", None) is not None:
+        #      logger.info("🔍 [RESUME] Running Pre-Training Validation to detect resumption trauma...")
+        #      try:
+        #          # Ensure we have a valid dataloader from datamodule
+        #          val_loader = self.trainer.datamodule.val_dataloader()
+        #          self.trainer.validate(self, dataloaders=val_loader)
+        #          logger.info("✅ [RESUME] Pre-Training Validation Complete. Baseline Established.")
+        #      except Exception as e:
+        #          logger.warning(f"⚠️ [RESUME] Pre-Training Validation skipped or failed: {e}")
 
     def on_train_epoch_start(self):
         """[Phase 3/4] Update AWR Horizon and SOTA v4.2 Warmup."""

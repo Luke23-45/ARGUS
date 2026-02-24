@@ -1439,6 +1439,14 @@ class ICUUnifiedPlanner(nn.Module):
         if num_steps is None:
             steps_batch = self.adaptive_sampler.calculate_steps(risk_coef)
             steps = int(steps_batch.max().item())
+            
+            # [SG-03 SOTA FIX] DDP Step Synchronization (Deadlock Prevention)
+            # Rationale: Ranks MUST execute identical iterations to avoid collective desyncs.
+            if torch.distributed.is_initialized():
+                steps_tensor = torch.tensor([steps], device=past.device, dtype=torch.long)
+                torch.distributed.all_reduce(steps_tensor, op=torch.distributed.ReduceOp.MAX)
+                steps = int(steps_tensor.item())
+                
             logger.info(f"[Agentic Sample] Adaptive Horizon: {steps} steps (Risk range: {risk_coef.min():.2f}-{risk_coef.max():.2f})")
         else:
             steps = num_steps
@@ -1480,9 +1488,8 @@ class ICUUnifiedPlanner(nn.Module):
             t = torch.full((B,), i, dtype=torch.long, device=past.device)
             
             # --- A. Physics Guidance Step (Active Steering) ---
-            # [SOTA FIX] Active Steering MUST run during inference/validation. 
-            # Removing `and self.training` to ensure Physics-Guided Sampling enforces 
-            # biological constraints during generation.
+            # [SG-01 SOTA FIX] Medical Inference Integrity
+            # Rationale: Physics guidance must steer the trajectory during inference/evaluation.
             if self.cfg.physics_guidance_scale > 0:
                 with torch.enable_grad():
                     x_t_in = x_t.detach().requires_grad_(True)

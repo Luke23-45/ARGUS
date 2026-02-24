@@ -35,103 +35,66 @@ class SOTA_DistributedGatherer:
 
     @staticmethod
     @torch.no_grad()
-    def gather_asymmetric(tensor: torch.Tensor) -> list:
+    def gather_asymmetric(tensor: torch.Tensor) -> List[torch.Tensor]:
         """
-        [v30.5 SOTA] Asymmetric Collective Engine.
-        Safely gathers tensors of different sizes across ranks with zero-sync shape discovery.
+        Safely gathers tensors of different sizes (and dimensionalities) across ranks.
+        Provides strict Iron Dome protection against Empty-Batch and PyTorch Cat crashes.
+        [v2026 SOTA] Final Bulletproof Patch (from ry.md).
         """
         if not dist.is_initialized():
             return [tensor]
             
         device = tensor.device
         world_size = dist.get_world_size()
-        ndim = tensor.ndim
-        # Use dtype as part of cache key to handle mixed precision (AMP)
-        cache_key = (ndim, tensor.dtype, device.type)
         
-        local_shape = torch.tensor(tensor.shape, device=device, dtype=torch.long)
+        # 1. N-Dimensional Topology Discovery (Consensus)
+        local_ndim = tensor.ndim
+        ndim_max_t = torch.tensor([local_ndim], device=device, dtype=torch.long)
+        dist.all_reduce(ndim_max_t, op=dist.ReduceOp.MAX)
+        ndim_max = int(ndim_max_t.item())
         
-        # 1. Atomic Shape Discovery
-        all_shapes = torch.zeros(world_size, ndim, device=device, dtype=torch.long)
-        dist.all_gather_into_tensor(all_shapes, local_shape)
-        
-        # 2. Cache Lookup / Update
-        # Rationale: Replaced .tolist() and Python looping with a tensor-based lookup.
-        cached_hit = False
-        if cache_key in SOTA_DistributedGatherer._STATIC_ASYM_CACHE:
-             # Unpack safely (handle potential padding/cpu_shapes appended later)
-             cache_val = SOTA_DistributedGatherer._STATIC_ASYM_CACHE[cache_key]
-             c_max_s = cache_val[0]
-             c_all_s = cache_val[1]
-             # Zero-Sync equality check
-             if torch.equal(all_shapes, c_all_s):
-                  max_size_list = cache_val[2]
-                  gathered_tensors = cache_val[3]
-                  cached_hit = True
-        
-        if not cached_hit:
-             max_size = all_shapes.max(dim=0).values
-             max_size_list = [int(s) for s in max_size]
-             # Pre-allocate tensors for all_gather
-             gathered_tensors = [torch.zeros(max_size_list, device=device, dtype=tensor.dtype) for _ in range(world_size)]
-             
-             # [SOTA FIX] Cache CPU shapes to avoid 32x int() syncs in unpadding loop
-             cpu_shapes = all_shapes.cpu().tolist()
-             
-             # Init cache with None padding (populated in step 3)
-             # Structure: (max_size, all_shapes, max_size_list, gathered_tensors, padding, cpu_shapes)
-             SOTA_DistributedGatherer._STATIC_ASYM_CACHE[cache_key] = (max_size, all_shapes.clone(), max_size_list, gathered_tensors, None, cpu_shapes)
-
-        # 3. Vectorized Padding Check
-        # LS (local_shape) vs Max Shape from cache/fresh
-        if not cached_hit:
-             # Fresh calc
-             max_size_tensor = torch.tensor(max_size_list, device=device)
-             pad_size = (max_size_tensor - local_shape)
-             
-             # Pre-calculate padding list
-             padding = []
-             # Rationale: Convert to list ONCE during cache miss
-             pad_list = pad_size.tolist()
-             for p in reversed(pad_list):
-                  padding.extend([0, p])
-             
-             # Update cache with valid padding
-             # Retrieve the just-created tuple components
-             _, _, _, _, _, cpu_shapes = SOTA_DistributedGatherer._STATIC_ASYM_CACHE[cache_key]
-             SOTA_DistributedGatherer._STATIC_ASYM_CACHE[cache_key] = (max_size_tensor, all_shapes.clone(), max_size_list, gathered_tensors, padding, cpu_shapes)
-        else:
-             # Hit: Retrieve cached tensors and padding
-             # Access directly from cache_val we retrieved earlier
-             padding = cache_val[4]
-             cpu_shapes = cache_val[5]
-             
-             # If padding was None (race condition or partial init?), recalc (unlikely but safe)
-             if padding is None:
-                  max_size_tensor = cache_val[0]
-                  pad_size = (max_size_tensor - local_shape)
-                  padding = []
-                  for p in reversed(pad_size.tolist()):
-                       padding.extend([0, p])
-
-        # 3. Apply Padding (Vectorized)
-        # Rationale: If padding list is all zeros, functional.pad is a no-op view.
-        # This avoid host-side 'if' branching on tensor values.
-        padded_tensor = torch.nn.functional.pad(tensor, padding)
+        # 2. NDIM Alignment (Prevents F.pad Dimension Crash)
+        # Rationale: unsqeeze(-1) until matching ndim_max to satisfy F.pad requirements.
+        aligned_tensor = tensor
+        while aligned_tensor.ndim < ndim_max:
+            aligned_tensor = aligned_tensor.unsqueeze(-1)
             
-        # 4. Zero-Copy Bulk Transfer
+        local_shape_t = torch.tensor(list(aligned_tensor.shape), device=device, dtype=torch.long)
+        
+        # 3. Gather Global Shapes
+        all_sizes = [torch.zeros(ndim_max, device=device, dtype=torch.long) for _ in range(world_size)]
+        dist.all_gather(all_sizes, local_shape_t)
+        max_size = torch.stack(all_sizes).max(dim=0).values # [ndim_max]
+        
+        # 4. Safe Padding Algorithm
+        # Bypasses F.pad completely for empty tensors to prevent 0-dim scaling errors
+        if aligned_tensor.numel() == 0:
+            padded_tensor = torch.zeros(max_size.tolist(), dtype=aligned_tensor.dtype, device=device)
+        else:
+            pad_size = (max_size - local_shape_t).tolist()
+            if any(p > 0 for p in pad_size):
+                padding = []
+                for p in reversed(pad_size):
+                    padding.extend([0, p]) # Pad 'back' only
+                padded_tensor = torch.nn.functional.pad(aligned_tensor, padding)
+            else:
+                padded_tensor = aligned_tensor
+                
+        # 5. Gather Uniformly Sized Tensors
+        gathered_tensors = [torch.zeros(max_size.tolist(), device=device, dtype=aligned_tensor.dtype) for _ in range(world_size)]
         dist.all_gather(gathered_tensors, padded_tensor)
         
-        # 5. Semantic Unpacking (View-only where possible)
+        # 6. Un-pad to Exact Original Local Sizes & Handle Empty Tensors for torch.cat
         final_tensors = []
-        for i in range(world_size):
-            # [SOTA FIX] Use cached CPU shapes to avoid int(gpu_tensor) syncs
-            size_list = cpu_shapes[i] 
-            curr = gathered_tensors[i]
-            for d in range(ndim):
-                # size_list[d] is a Python int. No sync.
-                curr = curr.narrow(d, 0, size_list[d])
-            final_tensors.append(curr)
+        for i, size in enumerate(all_sizes):
+            if size[0] == 0:
+                # [CRITICAL FIX] If batch size is 0, construct compatible empty tensor 
+                # for downstream torch.cat. e.g. [0, 24, 512], not [0, 0, 0].
+                empty_shape = [0] + max_size[1:].tolist()
+                final_tensors.append(torch.zeros(empty_shape, dtype=aligned_tensor.dtype, device=device))
+            else:
+                slices = [slice(0, int(s)) for s in size]
+                final_tensors.append(gathered_tensors[i][slices])
             
         return final_tensors
 
