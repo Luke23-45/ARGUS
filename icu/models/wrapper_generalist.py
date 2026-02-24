@@ -637,18 +637,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
              if hasattr(self, "grad_ref_buffer") and self.grad_ref_buffer is not None:
                   self.grad_ref_buffer.zero_()
                   
-             # [v2026 SOTA FIX] Ghost Bank Shadow Sync (Smoking Gun #Desync)
-             if hasattr(self, "ghost_bank") and hasattr(self.ghost_bank, "_shadow_size"):
-                  self.ghost_bank._shadow_size = int(self.ghost_bank.size)
-                  self.ghost_bank._shadow_ptr = int(self.ghost_bank.ptr)
-                  self.ghost_bank._shadow_is_full = bool(self.ghost_bank.is_full)
-                  logger.info("[RESUME] Ghost Bank Shadows Synchronized.")
+             # [v2026 SOTA FIX] Momentum Bank Synchronization (Trauma Trace SG-Bank)
+             if hasattr(self, "ghost_bank") and hasattr(self.ghost_bank, "sync_shadows"):
+                  self.ghost_bank.sync_shadows()
+                  logger.info("✅ [RESUME] Ghost Bank Shadows Synchronized.")
                   
-             # [v2026 SOTA FIX] TCB Shadow Sync (Smoking Gun #Desync)
-             if hasattr(self, "tcb_buffer") and hasattr(self.tcb_buffer, "_shadow_ptr"):
-                  self.tcb_buffer._shadow_ptr = int(self.tcb_buffer.queue_ptr)
-                  self.tcb_buffer._shadow_filled = int(self.tcb_buffer.queue_filled)
-                  logger.info("[RESUME] TCB Shadows Synchronized.")
+             # [v2026 SOTA FIX] Temporal Buffer Synchronization (Trauma Trace SG-TCB)
+             if hasattr(self, "tcb_buffer") and hasattr(self.tcb_buffer, "sync_shadows"):
+                  self.tcb_buffer.sync_shadows()
+                  logger.info("✅ [RESUME] TCB Shadows Synchronized.")
         
         # [v12.0 SOTA] Initialize CPU Shadows
         self._shadow_grad_accum_idx = int(self.grad_accum_idx)
@@ -953,10 +950,32 @@ class ICUGeneralistWrapper(pl.LightningModule):
             if self.ghost_bank.size > 0 and self.global_step > 0:
                 logger.info("🔄 [RESUME] Refreshing Ghost Bank latent anchors...")
                 try:
-                    # Use the model's encoder to re-encode trajectories
+                    # [v2026 SOTA FIX] Ghost Bank Positional Argument & Graph Fix
+                    # Rationale: Extract correct static features, freeze BN stats, and return 'global_expert'.
+                    def ghost_encoder_fn(v, m):
+                         # 1. Extract true static features (indices 22-27 at t=0)
+                         s_true = v[:, 0, 22:].clone()
+                         v_norm, s_norm = self.model.normalize(v, s_true)
+                         
+                         # 2. Derive padding mask (True where all channels are 0)
+                         bool_padding_mask = (m.sum(dim=-1) == 0) if m is not None else None
+                         
+                         # 3. Freeze BN stats to prevent manifold poisoning during bulk re-encoding
+                         with self.frozen_stats():
+                             out_alb = self.model.encoder(
+                                 v_norm, 
+                                 s_norm, 
+                                 imputation_mask=m,
+                                 padding_mask=bool_padding_mask
+                             )
+                         
+                         # 4. Return Expert manifold (matches training_step anchoring)
+                         return out_alb["global_expert"]
+                         
+                    # Use the explicit encoder closure
                     # Soft update (decay=0.5) to blend old manifold with new
                     self.ghost_bank.refresh_anchors(
-                        encoder=lambda v, m: self.model(v, m, static=None)[0],  # Returns cls_token
+                        encoder=ghost_encoder_fn,
                         decay=0.5
                     )
                     logger.info("✅ [RESUME] Ghost Bank anchors refreshed (Manifold Aligned).")
@@ -2484,41 +2503,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             self.log("train/manifold_norm_eff", min(current_grad_pressure, 1.0), on_step=True)
 
             # [v2026 SOTA] Efficient Intra-Epoch CSV Logging
-            # Log every N% (e.g., 5%, 10%, 15%) without syscall latency
-            if self.csv_log_interval > 0:
-                # 1. Initialize Logger on First Step (Rank 0 Only)
-                if self.csv_logger is None and (not dist.is_initialized() or dist.get_rank() == 0):
-                     log_dir = self.trainer.logger.log_dir if self.trainer.logger else "logs/fallback"
-                     self.csv_logger = BufferedCSVLogger(log_dir)
-
-                # 2. Check Interval bucket
-                # e.g., pct = 5, interval = 5 -> bucket 1
-                total_batches = self.trainer.num_training_batches
-                if total_batches > 0:
-                     pct = int(((batch_idx + 1) / total_batches) * 100)
-                     # Only log if we crossed a new interval bucket (5, 10, 15...)
-                     # and haven't logged it yet.
-                     if pct % int(self.csv_log_interval) == 0 and pct > self.last_logged_bucket:
-                         if self.csv_logger:
-                             # [SOTA FIX] Handle Single vs Multi Optimizer safely
-                             current_opt = opt[0] if isinstance(opt, list) else opt
-                             
-                             row = {
-                                 "epoch": self.current_epoch,
-                                 "pct": pct,
-                                 "step": self.global_step,
-                                 "loss": total_loss.item() if (isinstance(total_loss, torch.Tensor) and total_loss.dim() == 0) else float(total_loss),
-                                 "gn": current_grad_pressure,
-                                 "ess": weights_awr_log.get("train/awr_ess", 0.0),
-                                 "ev": self.train_explained_var.compute().item(),
-                                 "lr": current_opt.param_groups[0]['lr'] if current_opt else 0.0
-                             }
-                             # Add component losses
-                             for k, v in loss_dict.items():
-                                 row[f"loss_{k}"] = v.item() if isinstance(v, torch.Tensor) else v
-                                 
-                             self.csv_logger.log(row)
-                             self.last_logged_bucket = pct
+            # Moved to the end of training_step to prevent '.compute() before .update()' warnings.
             self.log("train/manifold_norm_std", self.grad_norm_std, on_step=True)
 
         # Rationale: Manually manage accumulation for precise DDP synchronization
@@ -2906,6 +2891,45 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 "train/weight_aux": task_weights[2],
                 "train/curr_phys_weight": curr_phys_weight,
             }, on_step=True, on_epoch=False, prog_bar=False)
+
+            # [v2026 SOTA] Efficient Intra-Epoch CSV Logging
+            # Log every N% (e.g., 5%, 10%, 15%) without syscall latency
+            if getattr(self, "csv_log_interval", 0) > 0:
+                # 1. Initialize Logger on First Step (Rank 0 Only)
+                if self.csv_logger is None and (not dist.is_initialized() or dist.get_rank() == 0):
+                     log_dir = self.trainer.logger.log_dir if self.trainer.logger else "logs/fallback"
+                     self.csv_logger = BufferedCSVLogger(log_dir)
+
+                # 2. Check Interval bucket
+                # e.g., pct = 5, interval = 5 -> bucket 1
+                total_batches = self.trainer.num_training_batches
+                if total_batches > 0:
+                     pct = int(((batch_idx + 1) / total_batches) * 100)
+                     # Only log if we crossed a new interval bucket (5, 10, 15...)
+                     # and haven't logged it yet.
+                     if pct % int(self.csv_log_interval) == 0 and pct > getattr(self, "last_logged_bucket", -1):
+                         if self.csv_logger:
+                             # [SOTA FIX] Handle Single vs Multi Optimizer safely
+                             current_opt = opt[0] if isinstance(opt, list) else opt
+                             # current_grad_pressure was computed earlier in the step
+                             gn_val = current_grad_pressure if 'current_grad_pressure' in locals() else 0.0
+                             
+                             row = {
+                                 "epoch": getattr(self, "current_epoch", 0),
+                                 "pct": pct,
+                                 "step": self.global_step,
+                                 "loss": total_loss.item() if (isinstance(total_loss, torch.Tensor) and total_loss.dim() == 0) else float(total_loss),
+                                 "gn": float(gn_val),
+                                 "ess": float(weights_awr_log.get("train/awr_ess", 0.0)) if 'weights_awr_log' in locals() else 0.0,
+                                 "ev": float(self.train_explained_var.compute().item()),
+                                 "lr": float(current_opt.param_groups[0]['lr']) if current_opt else 0.0
+                             }
+                             # Add component losses
+                             for k, v in loss_dict.items():
+                                 row[f"loss_{k}"] = float(v.item()) if isinstance(v, torch.Tensor) else float(v)
+                                 
+                             self.csv_logger.log(row)
+                             self.last_logged_bucket = pct
 
         return total_loss
 

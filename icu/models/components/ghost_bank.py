@@ -175,12 +175,26 @@ class SepsisGhostBank(nn.Module):
             self._shadow_is_full = (new_size == new_capacity)
             
         # [v2026 SOTA FIX] Unconditional Shadow Sync (Smoking Gun #Desync)
-        # Rationale: On resumption, registered buffers are loaded but local Python 
-        # shadow variables are 0. We must sync them even if capacity didn't change.
+        # Rationale: Component-level contract for resumption parity.
+        self.sync_shadows()
+
+    def sync_shadows(self):
+        """[SOTA 2026] Hard-syncs Python shadows with registered buffer state."""
+        # [v2026 SOTA FIX] Bulletproof Clamping (Smoking Gun #IndexError)
+        true_capacity = self.raw_vitals.shape[0]
+        self.size.fill_(min(int(self.size), true_capacity))
+        self.ptr.fill_(int(self.ptr) % true_capacity)
+        
         self._shadow_size = int(self.size)
         self._shadow_ptr = int(self.ptr)
-        self._shadow_is_full = bool(self.is_full)
+        self._shadow_is_full = (self._shadow_size == true_capacity)
+        self.is_full.fill_(self._shadow_is_full)
 
+    def load_state_dict(self, state_dict, strict=True):
+        """Ensures shadows are synced immediately after loading from checkpoint."""
+        out = super().load_state_dict(state_dict, strict=strict)
+        self.sync_shadows()
+        return out
 
     @torch.no_grad()
     def update(

@@ -1480,7 +1480,9 @@ class ICUUnifiedPlanner(nn.Module):
             t = torch.full((B,), i, dtype=torch.long, device=past.device)
             
             # --- A. Physics Guidance Step (Active Steering) ---
-            # We temporarily enable gradients for x_t to compute d(Loss)/dx_t
+            # [SOTA FIX] Active Steering MUST run during inference/validation. 
+            # Removing `and self.training` to ensure Physics-Guided Sampling enforces 
+            # biological constraints during generation.
             if self.cfg.physics_guidance_scale > 0:
                 with torch.enable_grad():
                     x_t_in = x_t.detach().requires_grad_(True)

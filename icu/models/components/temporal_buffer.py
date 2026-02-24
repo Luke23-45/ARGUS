@@ -77,7 +77,8 @@ class TemporalContrastiveBuffer(nn.Module):
              new_ids_queue[:num_to_keep] = self.ids_queue[:num_to_keep]
              self.register_buffer("queue", new_queue)
              self.register_buffer("ids_queue", new_ids_queue)
-             # Update pointers
+             
+             # [v2026 SOTA] Atomic Pointer Reset
              new_filled = min(int(self.queue_filled), new_capacity)
              self.queue_filled.fill_(new_filled)
              self.queue_ptr.fill_(new_filled % new_capacity)
@@ -96,10 +97,59 @@ class TemporalContrastiveBuffer(nn.Module):
         self.prototype_momentum.fill_(scaled_mom)
 
         # [v2026 SOTA FIX] Unconditional Shadow Sync (Smoking Gun #Desync)
-        # Rationale: On resumption, registered buffers are loaded but local Python 
-        # shadow variables are 0. We must sync them even if capacity didn't change.
-        self._shadow_filled = int(self.queue_filled)
+        # Rationale: Component-level contract for resumption parity.
+        self.sync_shadows()
+
+    def sync_shadows(self):
+        """[SOTA 2026] Hard-syncs Python shadows with registered buffer state."""
+        # [v2026 SOTA FIX] Bulletproof Clamping (Smoking Gun #IndexError)
+        # Rationale: Prevents stale filled-values from exceeding resized buffers during transients.
+        true_capacity = self.queue.shape[0]
+        self.queue_filled.fill_(min(int(self.queue_filled), true_capacity))
+        self.queue_ptr.fill_(int(self.queue_ptr) % true_capacity)
+        
         self._shadow_ptr = int(self.queue_ptr)
+        self._shadow_filled = int(self.queue_filled)
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Ensures shadows are synced immediately after loading from checkpoint."""
+        out = super().load_state_dict(state_dict, strict=strict)
+        self.sync_shadows()
+        return out
+
+    @torch.no_grad()
+    def _update_prototype(self, new_latents: torch.Tensor):
+        """
+        [v2026 SOTA] Zero-Sync Prototype Consensus
+        Rationale: Ensures all DDP ranks share an identical manifold anchor.
+        """
+        import torch.distributed as dist
+        device = self.prototype_ema.device
+        if dist.is_initialized():
+            # 1. Coalesce local signal
+            local_sum = new_latents.sum(dim=0, keepdim=True) if new_latents.shape[0] > 0 else torch.zeros(1, self.d_model, device=device)
+            local_count = torch.tensor([float(new_latents.shape[0])], device=device)
+            
+            # 2. Synchronize across cluster
+            sync_buffer = torch.cat([local_sum.flatten(), local_count])
+            dist.all_reduce(sync_buffer, op=dist.ReduceOp.SUM)
+            global_sum = sync_buffer[:-1].view(1, -1)
+            global_count = sync_buffer[-1:]
+            
+            # Vectorized gate
+            valid_gate = (global_count > 1e-6)
+            batch_avg = torch.where(valid_gate, global_sum / (global_count + 1e-8), torch.zeros_like(global_sum))
+        else:
+            valid_gate = torch.tensor(new_latents.shape[0] > 0, device=device)
+            batch_avg = new_latents.mean(dim=0, keepdim=True) if valid_gate else torch.zeros(1, self.d_model, device=device)
+            
+        # Atomic Consensus Update
+        is_new = (self.prototype_ema.abs().sum() == 0)
+        mom = float(self.prototype_momentum)
+        
+        new_val = torch.where(is_new, batch_avg, self.prototype_ema.lerp(batch_avg, 1.0 - mom))
+        self.prototype_ema.copy_(torch.where(valid_gate, new_val, self.prototype_ema))
+        self.prototype_ema.copy_(F.normalize(self.prototype_ema, dim=1))
 
     @torch.no_grad()
     def _dequeue_and_enqueue(self, keys: torch.Tensor, ids: Optional[torch.Tensor] = None, scores: Optional[torch.Tensor] = None):
@@ -121,12 +171,13 @@ class TemporalContrastiveBuffer(nn.Module):
             if scores is not None: scores = scores[is_valid]
                 
         # [v2026 SOTA FIX] Batch Size Hard-Cap (Smoking Gun #Overflow)
+        true_capacity = self.queue.shape[0] # [CRITICAL OOD FIX] Use true tensor dimension, not drifting int attribute
         batch_size = keys.shape[0]
-        if batch_size > self.capacity:
-            keys = keys[-self.capacity:]
-            if ids is not None: ids = ids[-self.capacity:]
-            if scores is not None: scores = scores[-self.capacity:]
-            batch_size = self.capacity
+        if batch_size > true_capacity:
+            keys = keys[-true_capacity:]
+            if ids is not None: ids = ids[-true_capacity:]
+            if scores is not None: scores = scores[-true_capacity:]
+            batch_size = true_capacity
 
         if batch_size == 0:
             return
@@ -143,29 +194,42 @@ class TemporalContrastiveBuffer(nn.Module):
         
         # Hard mining selection (if scores provided)
         if scores is not None and keys.shape[0] == scores.shape[0]:
-            _, indices = torch.topk(scores.mean(dim=1), k=min(batch_size, self.capacity)) # [FIX] Mean across bank keys
+            _, indices = torch.topk(scores.mean(dim=1), k=min(batch_size, true_capacity)) # [FIX] Mean across bank keys
             keys = keys[indices]
             if ids is not None: ids = ids[indices]
             batch_size = keys.shape[0]
 
-        # Standard Queue Update
-        if self._shadow_ptr + batch_size > self.capacity:
-            remaining = self.capacity - self._shadow_ptr
-            self.queue.data[self._shadow_ptr:] = keys[:remaining]
-            self.queue.data[:batch_size - remaining] = keys[remaining:]
+        # Standard Queue Update [SOTA HARDENED]
+        ptr = self._shadow_ptr
+        if ptr + batch_size > true_capacity:
+            remaining = true_capacity - ptr
+            
+            # SOTA FIX: Use explicit slice size for target to prevent shape mismatch on resumption transients
+            key_slice_1 = keys[:remaining]
+            self.queue.data[ptr : ptr + key_slice_1.shape[0]] = key_slice_1
+            
+            key_slice_2 = keys[remaining:]
+            if key_slice_2.shape[0] > 0:
+                 self.queue.data[:key_slice_2.shape[0]] = key_slice_2
+                 
             if ids is not None:
-                self.ids_queue.data[self._shadow_ptr:] = ids[:remaining]
-                self.ids_queue.data[:batch_size - remaining] = ids[remaining:]
-            self._shadow_ptr = (batch_size - remaining) % self.capacity
+                ids_slice_1 = ids[:remaining]
+                self.ids_queue.data[ptr : ptr + ids_slice_1.shape[0]] = ids_slice_1
+                
+                ids_slice_2 = ids[remaining:]
+                if ids_slice_2.shape[0] > 0:
+                     self.ids_queue.data[:ids_slice_2.shape[0]] = ids_slice_2
+            
+            self._shadow_ptr = (batch_size - remaining) % true_capacity
             self.queue_ptr.fill_(self._shadow_ptr)
         else:
-            self.queue.data[self._shadow_ptr : self._shadow_ptr + batch_size] = keys
+            self.queue.data[ptr : ptr + batch_size] = keys
             if ids is not None:
-                self.ids_queue.data[self._shadow_ptr : self._shadow_ptr + batch_size] = ids
-            self._shadow_ptr = (self._shadow_ptr + batch_size) % self.capacity
+                self.ids_queue.data[ptr : ptr + batch_size] = ids
+            self._shadow_ptr = (ptr + batch_size) % true_capacity
             self.queue_ptr.fill_(self._shadow_ptr)
         
-        self._shadow_filled = min(self.capacity, self._shadow_filled + batch_size)
+        self._shadow_filled = min(true_capacity, self._shadow_filled + batch_size)
         self.queue_filled.fill_(self._shadow_filled)
 
 
@@ -190,7 +254,9 @@ class TemporalContrastiveBuffer(nn.Module):
         if dist.is_initialized():
              dist.all_reduce(self.queue_filled, op=dist.ReduceOp.MIN)
 
-        filled = int(self.queue_filled)
+        # [v2026 SOTA FIX] Bulletproof Clamping (Smoking Gun #IndexError)
+        true_capacity = self.queue.shape[0]
+        filled = min(int(self.queue_filled), true_capacity)
         if filled < 32:
             # Entry logic
             zero_loss = torch.tensor(0.0, device=q.device, requires_grad=True)
@@ -249,16 +315,8 @@ class TemporalContrastiveBuffer(nn.Module):
         else:
              self._dequeue_and_enqueue(k, ids=ids_k, scores=l_neg.detach())
         
-        # [v29.6] Update TCB Prototype
-        with torch.no_grad():
-             batch_avg = k.mean(dim=0, keepdim=True)
-             if self.prototype_ema.abs().sum() == 0:
-                  self.prototype_ema.copy_(batch_avg)
-             else:
-                  # [v31.0 SOTA FIX] Use scaled momentum for density-invariance
-                  mom = float(self.prototype_momentum)
-                  self.prototype_ema.lerp_(batch_avg, 1.0 - mom)
-             self.prototype_ema.copy_(F.normalize(self.prototype_ema, dim=1))
+        # [v29.6] Update TCB Prototype (Rank-Consistent)
+        self._update_prototype(k)
         
         return {
             "loss": nce_loss + 0.1 * uniformity_loss,
