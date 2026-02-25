@@ -252,6 +252,16 @@ class BayesianProjectedScaler(nn.Module):
         anchor_idx = self.keys.index(anchor_key)
         target_magnitude = raw_losses[anchor_idx].clamp(min=0.01)
         
+        # [POST-PATCH FIX] Sanitize NaN/Inf in raw losses before log computation.
+        # Root Cause: With sort removed from critic (ry.md Fix 1), unsorted quantiles
+        # at the first batch can produce NaN critic loss via extreme crossing penalties.
+        # Fix: Replace any NaN/Inf losses with the anchor magnitude (neutral initialization,
+        # equivalent to log_var=0 → precision=1.0 → equal weight to anchor).
+        nan_mask = ~torch.isfinite(raw_losses)
+        if nan_mask.any():
+            logger.warning(f"[ALI] NaN/Inf detected in raw_losses at indices {nan_mask.nonzero().flatten().tolist()}. Sanitizing to anchor magnitude.")
+            raw_losses = torch.where(nan_mask, target_magnitude, raw_losses)
+        
         # log_var = ln(loss / target) => Weight = target / loss
         # This equalizes the weighted loss magnitudes to EXACTLY match the anchor.
         new_log_vars = torch.log(raw_losses.clamp(min=1e-8) / target_magnitude)

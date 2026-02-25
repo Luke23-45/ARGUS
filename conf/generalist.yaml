@@ -17,7 +17,7 @@ output_dir: "/content/icu/phase1/"           # Main output directory
 checkpoint_dir: "/content/icu/checkpoints/"  # [OK] Large files, infrequent writes
 log_dir: "/content/icu/logs/"         # [CRITICAL] Must be LOCAL for WandB (High freq IO)
 backup_dir: null                        # Remote/backup directory
-resume_from: "/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-02-24_14-43-43/checkpoints/icu_model-epoch=01-val/clinical_auroc=0.782.ckpt"
+resume_from: null
 
 model:
   input_dim: 28

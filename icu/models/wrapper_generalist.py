@@ -1737,13 +1737,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
                     # When the critic is confident (high EV), exploration noise decays.
                     # Note: We use the accumulated EV from previous steps (lagged 1 batch)
                     # because current-batch EV hasn't been computed yet at this point.
-                    # Edge case: At step 0 of epoch 0, the metric is empty → defaults to 0.0
-                    # → sigmoid(3.5) ≈ 0.97 → near-full noise, which is the correct behavior
-                    # for an untrained critic.
-                    try:
-                        prev_ev = self.train_explained_var.compute().detach().clamp(-1.0, 1.0)
-                    except (RuntimeError, ValueError):
+                    # [POST-PATCH FIX] Explicit NaN guard (torchmetrics returns NaN for empty metric,
+                    # not exception — the try/except never triggered, and NaN poisoned the pipeline).
+                    prev_ev = self.train_explained_var.compute().detach()
+                    if not torch.isfinite(prev_ev):
                         prev_ev = torch.tensor(0.0, device=self.device)
+                    prev_ev = prev_ev.clamp(-1.0, 1.0)
                     ev_noise_scale = torch.sigmoid(5.0 * (0.7 - prev_ev))
                     
                     # 7. Inject with exploration-decayed noise
