@@ -203,13 +203,12 @@ class BayesianProjectedScaler(nn.Module):
         self.log_vars.clamp_(min=-5.0, max=8.0)
         # 2. Diffusion Floor
         self.log_vars[0].clamp_(max=1.0)
-        # 3. [FORENSIC FIX #2] Critic Precision Range (Root Cause: Critic Explosion → Total Loss Blowup)
-        # Original: max=0.0 forced precision >= 1.0, preventing the scaler from reducing critic weight
-        # when V exploded from 31→115. This made critic the permanent highest-weighted task.
-        # Fix: max=3.0 allows precision down to exp(-3) ≈ 0.05, giving the Bayesian scaler
-        # 20x dynamic range to naturally suppress critic via its own uncertainty estimation
-        # (Kendall et al.) when the loss magnitude diverges from other tasks.
-        self.log_vars[1].clamp_(max=3.0)
+        # 3. [NaN FIX] Expanded Critic Dynamic Range (Root Cause: V=42 vs D=0.2 at step 640)
+        # Previous: max=3.0 gave precision floor of exp(-3) ≈ 0.05 (20x range).
+        # This was insufficient to suppress the 200x magnitude gap between critic and diffusion.
+        # Fix: max=5.0 allows precision down to exp(-5) ≈ 0.0067 (150x dynamic range),
+        # enabling the Bayesian scaler to deeply suppress critic during magnitude divergence.
+        self.log_vars[1].clamp_(max=5.0)
         # 4. Clinical Gating (Aux/ACL)
         self.log_vars[2].clamp_(max=4.0)
         self.log_vars[3].clamp_(max=4.0)

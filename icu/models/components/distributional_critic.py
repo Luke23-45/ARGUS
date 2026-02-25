@@ -208,14 +208,26 @@ class IQLQuantileLoss(nn.Module):
         else:
             qr_loss = raw_qr_loss.mean()
         
-        # [ry.md FIX 1b] Strengthened Crossing Penalty (Compensates for sort removal)
-        # Simulation showed weight=10.0 insufficient for monotonicity without sort.
-        # weight=50.0 provides sufficient gradient pressure for neuron ordering
-        # while remaining secondary to the primary expectile+quantile objectives.
+        # 3. Structural Crossing Penalty (Monotonicity Guard)
+        # Ensure Q_i <= Q_{i+1}
         diff_q = pred_quantiles[..., 1:] - pred_quantiles[..., :-1]
-        crossing_penalty = torch.relu(-diff_q).mean() * 50.0
         
-        return expectile_loss + qr_loss + crossing_penalty
+        # [SOTA FIX 1] Reduce explosive multiplier (50 -> 10) to balance magnitude
+        # Root Cause: 50x caused V=42 vs D=0.2 (200x gap) leading to NaN at step 649.
+        # The quantile regression loss itself already penalizes out-of-order quantiles
+        # via the |tau - I(e<0)| weighting, so 10x is sufficient gradient pressure.
+        crossing_penalty = torch.relu(-diff_q).mean() * 10.0
+        
+        total = expectile_loss + qr_loss + crossing_penalty
+        
+        # [SOTA FIX 2] Graph-Severing NaN Shield
+        # Rationale: nan_to_num protects the scalar loss but allows the "0 * NaN = NaN" 
+        # trap to poison input gradients during chain-rule propagation. 
+        # By replacing a non-finite loss with a NEW leaf tensor, we physically sever 
+        # the computational graph, guaranteeing that zero gradient reaches the parameters.
+        if not torch.isfinite(total):
+            total = torch.zeros(1, device=pred_quantiles.device, requires_grad=True).squeeze()
+        return total
 
     @staticmethod
     def compute_explained_variance(pred_quantiles: torch.Tensor, target_returns: torch.Tensor, tau: float = 0.5, mask: Optional[torch.Tensor] = None) -> torch.Tensor:

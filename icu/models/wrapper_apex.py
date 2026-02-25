@@ -164,7 +164,9 @@ class ICUSpecialistWrapper(pl.LightningModule):
             # Specialist mode balances [Diffusion, Router] - Critic is detached.
             self.log_var_diff = nn.Parameter(torch.tensor([0.0]))
             self.log_var_router = nn.Parameter(torch.tensor([0.0]))
-            logger.info("Initializing Uncertainty Weighting Parameters (Specialist)...")
+            # [P2 FIX 4] Adaptive critic weight — Phase 1 parity (was static 0.5)
+            self.log_var_critic = nn.Parameter(torch.tensor([0.0]))
+            logger.info("Initializing Uncertainty Weighting Parameters (Specialist w/ Critic)...")
         
         # [v4.2.1] Internal State for Sampler Restoration
         self.pending_sampler_states = None
@@ -914,6 +916,10 @@ class ICUSpecialistWrapper(pl.LightningModule):
             
             # 6. Critic Target (Stop gradient on advantage)
             critic_target = (advantages + pred_values).detach()
+            # [P2 FIX 3] NaN Guard — Phase 1 parity (prevent NaN advantage poisoning critic)
+            critic_target = torch.where(torch.isfinite(critic_target),
+                                        critic_target,
+                                        pred_values.detach())
             if critic_target.shape[1] != future_vitals.shape[1]:
                 critic_target = critic_target[:, :future_vitals.shape[1]]
         
@@ -957,7 +963,8 @@ class ICUSpecialistWrapper(pl.LightningModule):
             else:
                 current_pred_val = current_pred_val.view_as(critic_target)
         
-        critic_loss = F.mse_loss(current_pred_val, critic_target)
+        # [P2 FIX 2] Smooth-L1 (Huber) — Phase 1 parity, robust to outlier targets
+        critic_loss = F.smooth_l1_loss(current_pred_val, critic_target)
         
         # =====================================================================
         # F. PHYSICS REGULARIZATION (Curriculum-Weighted)
@@ -985,7 +992,8 @@ class ICUSpecialistWrapper(pl.LightningModule):
             # SpecialistBalances [Expert, Router]. Critic remains at 0.5 static weight.
             loss_expert_weighted = task_expert / torch.exp(self.log_var_diff) + self.log_var_diff
             loss_router_weighted = task_router / torch.exp(self.log_var_router) + self.log_var_router
-            loss_critic_weighted = task_critic * 0.5
+            # [P2 FIX 4] Adaptive critic weight — Phase 1 parity (was static 0.5)
+            loss_critic_weighted = task_critic / torch.exp(self.log_var_critic) + self.log_var_critic
             
             total_loss = loss_expert_weighted + loss_router_weighted + loss_critic_weighted
             
@@ -995,6 +1003,13 @@ class ICUSpecialistWrapper(pl.LightningModule):
             total_loss += phys_weight * phys_loss_raw
             
             self.manual_backward(total_loss)
+            
+            # [P2 FIX 5] Clamp log_vars to [-1.5, 3.0] — Phase 1 PGD parity
+            with torch.no_grad():
+                self.log_var_diff.clamp_(-1.5, 3.0)
+                self.log_var_router.clamp_(-1.5, 3.0)
+                self.log_var_critic.clamp_(-1.5, 3.0)
+            
             gn_loss = torch.tensor(0.0, device=self.device) # Dummy for telemetry
             task_weights = [torch.exp(-self.log_var_diff), torch.exp(-self.log_var_router)]
             
@@ -1110,6 +1125,10 @@ class ICUSpecialistWrapper(pl.LightningModule):
             "train/awr_beta": awr_diag.get("beta_dynamic", self.awr_calculator.beta),
             "train/awr_max_weight": awr_diag.get("max_weight_dynamic", self.awr_calculator.max_weight)
         }
+        
+        # [P2 FIX 1] Actually LOG the telemetry (was dead code — never called)
+        self.log_dict(log_payload, on_step=True, on_epoch=False,
+                      prog_bar=True, sync_dist=False, batch_size=B)
         
         return None
 

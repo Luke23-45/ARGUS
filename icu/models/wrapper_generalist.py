@@ -1932,12 +1932,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
         if self.balancing_mode == "sota_2025":
             # [SOTA 2025] Single-Pass Uncertainty Weighting
             curr_phys_weight = self._get_curr_physics_weight()
-            # [v20.0 SOTA FIX] Gradient-Isolated Reconstruction (Smoking Gun #175)
-            # Rationale: Denominator 1/sqrt(alpha) acts as a 100,000x gradient amplifier.
-            # Fix: Cap denominator at 1e-2 for gradients to limit amplification to 100x.
-            # This protects the model from physics losses on "hallucinated" x0 at high t.
+            # [NaN FIX] Gradient-Isolated Reconstruction (Diffusion Amplification Limit)
+            # Root Cause: 1/sqrt(alpha) at high timesteps (t>90) amplifies x0 reconstruction
+            # errors into physics loss, contributing to gradient explosion.
+            # Floor raised from 1e-2 (100x magnification) to 0.1 (10x magnification).
+            # Only affects t>87 (sqrt(alpha_bar) < 0.1), preserving >87% of timestep range.
             alpha_t = self.model.scheduler.alphas_cumprod[t][:, None, None]
-            sqrt_alpha_safe = torch.sqrt(alpha_t).clamp(min=1e-2)
+            sqrt_alpha_safe = torch.sqrt(alpha_t).clamp(min=0.1)
             x0_approx = (noisy_fut - torch.sqrt(1 - alpha_t) * pred_noise) / sqrt_alpha_safe
             
             # [v26.3 SOTA FIX] Install Manifold Governance Bridge
@@ -2202,6 +2203,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
             if not self.loss_scaler.is_calibrated:
                 self.loss_scaler.calibrate_log_vars(loss_dict, anchor_key='diffusion')
 
+            # [NaN GUARD] Graph-Severing Lightning Rods
+            # Sanitizes individual components before the Bayesian Scaler mixes them.
+            # Injects safe dummy leaf tensor to preserve execution without poisoning weights.
+            for k in list(loss_dict.keys()):
+                if not torch.isfinite(loss_dict[k]).all():
+                    logger.warning(f"⚠️ [NaN GUARD] Non-finite {k} loss detected. Severing graph connection.")
+                    loss_dict[k] = torch.zeros(1, device=self.device, requires_grad=True).squeeze()
+
             # [SOTA 2025] Exclusive Uncertainty Scaling
             # phys_loss is now a managed task in the conflict loop.
             # [v26.5 FIX] Pass curriculum-based physics multiplier to the scaler.
@@ -2296,6 +2305,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
                             aux_loss.register_hook(throttle_aux_gradient)
 
                     with sync_context:
+                        # [NaN GUARD] Reference Shield
+                        if not torch.isfinite(l_ref_bwd):
+                            logger.warning(f"⚠️ [NaN GUARD] Non-finite reference loss ({l_ref_bwd.item():.4f}). Shielding AGEM.")
+                            l_ref_bwd = torch.zeros_like(l_ref_bwd, requires_grad=True)
+
                         ref_grads = torch.autograd.grad(
                             l_ref_bwd, 
                             [p for p in self.parameters() if p.requires_grad],
@@ -2322,6 +2336,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 # (Legacy all_reduce logic removed from here)
 
                 # B. Batch Pass (Standard Backward - populates .grad)
+                
+                # [NaN GUARD] Prevent NaN loss from corrupting ALL parameters
+                if not torch.isfinite(l_batch_bwd):
+                    logger.warning(f"⚠️ [NaN GUARD] Non-finite batch loss ({l_batch_bwd.item():.4f}). Zeroing backward for batch {batch_idx}.")
+                    l_batch_bwd = torch.zeros_like(l_batch_bwd, requires_grad=True)
+
                 # [Distributed Guard]
                 with sync_context:
                     self.manual_backward(l_batch_bwd)

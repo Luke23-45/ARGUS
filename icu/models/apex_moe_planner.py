@@ -458,7 +458,8 @@ class APEX_MoE_Planner(nn.Module):
             # Loss Computation (Per-sample for AWR weighting)
             # [v1.5 SOTA] Channel Mismatch Repair (Smoking Gun #3)
             # Rationale: All diffusion experts must strictly solve the dynamic subspace.
-            DYNAMIC_CHANNELS = 22
+            # [P2 FIX 8] Config-safe channel count — prevents silent mismatch
+            DYNAMIC_CHANNELS = min(22, noise_eps.shape[-1])
             loss_raw = F.mse_loss(
                 pred_noise[..., :DYNAMIC_CHANNELS], 
                 noise_eps[indices][..., :DYNAMIC_CHANNELS], 
@@ -497,6 +498,9 @@ class APEX_MoE_Planner(nn.Module):
         # Ensures smooth transitions between adjacent experts
         reg_loss = torch.tensor(0.0, device=device)
         smoothness_loss = torch.tensor(0.0, device=device)
+        # [P2 FIX 6] Initialize outputs BEFORE conditional blocks to prevent NameError
+        # when lambda_reg=0 but lambda_diversity>0
+        outputs = []
         
         if self.lambda_reg > 0:
             subset_sz = min(B, 4)  # Small subset to minimize overhead
@@ -512,7 +516,7 @@ class APEX_MoE_Planner(nn.Module):
             reg_self_cond = self_cond[sub_idx]
             
             # Run all experts on this subset
-            outputs = []
+            outputs.clear()
             for expert in self.experts:
                 outputs.append(expert(
                     reg_noisy, t_reg, reg_ctx, reg_glob, reg_mask,
@@ -529,15 +533,19 @@ class APEX_MoE_Planner(nn.Module):
             
             # Severity Continuum (Horizontal)
             # Expert L -> Expert L+1 (within same sub-ensemble)
+            # [P2 FIX 7] Lorentzian gate 1/(1+x²) — Phase 1 parity, prevents
+            #            divergent expert from dominating total_loss
             for i in [0, 1, 3, 4]:
                 if i + 1 < N:
-                    chain_loss = chain_loss + F.mse_loss(outputs[i], outputs[i + 1])
+                    raw_chain = F.mse_loss(outputs[i], outputs[i + 1])
+                    chain_loss = chain_loss + raw_chain / (1.0 + raw_chain.detach().pow(2))
             
             # Expert Pairing (Vertical)
             # Expert i -> Expert i+G (Sub-experts for the same clinical state)
             for i in range(G):
                 if i + G < N:
-                    chain_loss = chain_loss + F.mse_loss(outputs[i], outputs[i + G])
+                    raw_pair = F.mse_loss(outputs[i], outputs[i + G])
+                    chain_loss = chain_loss + raw_pair / (1.0 + raw_pair.detach().pow(2))
             
             # Temporal Smoothness (Self-Regularization)
             # Penalize sudden jumps in predicted vitals over time
