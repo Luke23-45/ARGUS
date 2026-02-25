@@ -12,11 +12,14 @@ class RiskAwareAsymmetricLoss(nn.Module):
     2. Critical Penalty: Multiplies the loss for patients in 'Red Zones'.
     """
     def __init__(self, 
-                 gamma_neg: float = 4.0, 
-                 gamma_pos: float = 1.0, 
-                 clip: float = 0.0,
-                 eps: float = 1e-5, # [SOTA FIX 1] FP16 Hardware Safety (Prevents Tensor-Core 0.0 flush)
-                 critical_multiplier: float = 5.0):
+                 gamma_neg: float = 2.0,  # [ry.md FIX 2a] Reduced from 4.0 to prevent healthy gradient starvation
+                                           # (4.0 caused 16x-123x suppression; 2.0 gives 4x-11x — clinical balance)
+                 gamma_pos: float = 0.5,   # [ry.md FIX 2b] Reduced from 1.0 (0.5 = mild focal, preserves precision)
+                                           # Note: ry.md suggested 0.0 but simulation shows that removes ALL positive
+                                           # modulation, which can hurt precision on well-classified positives.
+                 clip: float = 0.05,       # [ry.md FIX 2c] Asymmetric clipping for noisy negative label robustness
+                 eps: float = 1e-5,
+                 critical_multiplier: float = 2.0):  # [ry.md FIX 2d] Reduced from 5.0 to prevent alarm fatigue
         super().__init__()
         self.gamma_neg = gamma_neg
         self.gamma_pos = gamma_pos

@@ -9,7 +9,7 @@ defaults:
 run_name: "gen_v1_${now:%Y-%m-%d_%H-%M-%S}"
 seed: 42
 compile_model: false
-save_checkpoints: true
+save_checkpoints: false
 debug_save_epochs: []     # [DEBUG] List of epochs to save snapshots (e.g., [5, 10, 50])
 
 # --- Directory Paths ---
@@ -17,7 +17,7 @@ output_dir: "/content/icu/phase1/"           # Main output directory
 checkpoint_dir: "/content/icu/checkpoints/"  # [OK] Large files, infrequent writes
 log_dir: "/content/icu/logs/"         # [CRITICAL] Must be LOCAL for WandB (High freq IO)
 backup_dir: null                        # Remote/backup directory
-resume_from: "/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-02-24_14-43-43/checkpoints/icu_model-epoch=01-val/clinical_auroc=0.782.ckpt"
+resume_from: null
 
 model:
   input_dim: 28
@@ -79,7 +79,7 @@ train:
   horizon_ramp: 40
 
   # Debug Mode (Smoke Test)
-  debug_run: false #true
+  debug_run: true #true
   debug_limit_batches: 200
   debug_limit_val: 500
 
@@ -99,7 +99,7 @@ train:
   # AWR Calibration Speed/Quality (v10.1 Upgrade)
   # - "full": Scans all trajectories (~5-10 min, best for final training)
   # - "sample": Random subset (~10-30 sec, best for testing)
-  awr_calibration_mode: "full" # full for whole population scan or sample
+  awr_calibration_mode: "sample" # full for whole population scan or sample
   awr_max_samples: 10000      # [SOTA FIX] Increased for Batch 2048 / Full Sepsis-3 Population
   
   # [SOTA REMOVED] Redundant batch_size (Defined in train.batch_size)
@@ -124,8 +124,8 @@ train:
   acl_centroid_reg: 0.05      # [v12.5.1] Higher to prevent contrastive collapse
   
   # Risk-Aware Asymmetric Loss
-  asl_gamma_neg: 2.0          # [ry.md FIX 2a] Reduced from 4.0 (4x-11x suppression vs 16x-123x)
-  asl_gamma_pos: 0.5          # [ry.md FIX 2b] Mild focal (preserves precision better than 0.0)
+  asl_gamma_neg: 4.0          # [v1.5 SOTA] Boosted from 1.0 to 4.0 (Fix gradient flooding)
+  asl_gamma_pos: 1.0          # Standard focusing
   risk_multiplier: 2.0        # [TUNING] Boosted from 2.0 to 5.0 (Sepsis Clinical Priority)
   
   # Optimization Groups

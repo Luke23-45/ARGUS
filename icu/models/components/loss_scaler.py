@@ -203,10 +203,13 @@ class BayesianProjectedScaler(nn.Module):
         self.log_vars.clamp_(min=-5.0, max=8.0)
         # 2. Diffusion Floor
         self.log_vars[0].clamp_(max=1.0)
-        # 3. [SOTA v4.1] Critic EV Guard (Fix for EV Regression)
-        # Rationale: Critic loss (~15.0) causes log_vars to skyrocket to 8.0, dropping its precision 
-        # to e^-8 = 0.0003, mathematically starving it of gradient and devastating Explained Variance.
-        self.log_vars[1].clamp_(max=0.0) # Guaranteed minimum 1.0x weight
+        # 3. [FORENSIC FIX #2] Critic Precision Range (Root Cause: Critic Explosion → Total Loss Blowup)
+        # Original: max=0.0 forced precision >= 1.0, preventing the scaler from reducing critic weight
+        # when V exploded from 31→115. This made critic the permanent highest-weighted task.
+        # Fix: max=3.0 allows precision down to exp(-3) ≈ 0.05, giving the Bayesian scaler
+        # 20x dynamic range to naturally suppress critic via its own uncertainty estimation
+        # (Kendall et al.) when the loss magnitude diverges from other tasks.
+        self.log_vars[1].clamp_(max=3.0)
         # 4. Clinical Gating (Aux/ACL)
         self.log_vars[2].clamp_(max=4.0)
         self.log_vars[3].clamp_(max=4.0)

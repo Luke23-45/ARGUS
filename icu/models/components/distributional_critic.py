@@ -79,10 +79,14 @@ class DistributionalValueHead(nn.Module):
         feat = self.pre_block(x)
         out = self.head(feat).view(B, self.pred_len, self.num_quantiles)
         
-        # [v4.1 SOTA] Deterministic Crossing Prevention
-        # Statistical sorting is superior to penalty terms for medical safety.
-        quantiles, _ = torch.sort(out, dim=-1)
-        return quantiles
+        # [ry.md FIX 1] Removed Forward Sorting
+        # Rationale: torch.sort enforces monotonicity mechanically but neurotoxically —
+        # it scrambles neuron-to-quantile assignments across batches, AND it makes the
+        # IQLQuantileLoss.crossing_penalty permanently zero (dead code), removing the only 
+        # gradient signal that teaches neurons their individual quantile roles.
+        # Without sort, the quantile regression loss + crossing_penalty jointly enforce
+        # monotonicity through gradient descent, allowing stable neuron specialization.
+        return out
 
     def get_cvar(self, quantiles: torch.Tensor, alpha: float = 0.1) -> torch.Tensor:
         """
@@ -204,10 +208,12 @@ class IQLQuantileLoss(nn.Module):
         else:
             qr_loss = raw_qr_loss.mean()
         
-        # 3. Structural Crossing Penalty (Monotonicity Guard)
-        # Ensure Q_i <= Q_{i+1}
+        # [ry.md FIX 1b] Strengthened Crossing Penalty (Compensates for sort removal)
+        # Simulation showed weight=10.0 insufficient for monotonicity without sort.
+        # weight=50.0 provides sufficient gradient pressure for neuron ordering
+        # while remaining secondary to the primary expectile+quantile objectives.
         diff_q = pred_quantiles[..., 1:] - pred_quantiles[..., :-1]
-        crossing_penalty = torch.relu(-diff_q).mean() * 10.0
+        crossing_penalty = torch.relu(-diff_q).mean() * 50.0
         
         return expectile_loss + qr_loss + crossing_penalty
 

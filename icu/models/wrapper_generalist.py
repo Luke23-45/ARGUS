@@ -343,8 +343,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # Phase 1: Dynamic Diagnostics
         self.risk_scorer = PhysiologicalRiskScorer()
         self.risk_aware_loss = RiskAwareAsymmetricLoss(
-            gamma_neg=cfg.train.get("asl_gamma_neg", 4.0),
-            gamma_pos=cfg.train.get("asl_gamma_pos", 1.0),
+            gamma_neg=cfg.train.get("asl_gamma_neg", 2.0),
+            gamma_pos=cfg.train.get("asl_gamma_pos", 0.5),
             critical_multiplier=cfg.train.get("risk_multiplier", 2.0)
         )
         
@@ -382,7 +382,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # [v4.0 PERFECT] Advanced Supervision Components
         self.bgsl_loss = BGSLLoss(
             pos_weight=cfg.train.get("pos_weight", 10.0),
-            gamma=cfg.train.get("asl_gamma_neg", 4.0), # Reusing ASL gamma
+            gamma=cfg.train.get("asl_gamma_neg", 2.0), # Reusing ASL gamma
             trend_coef=cfg.train.get("trend_coef", 1.0),
             shock_coef=cfg.train.get("shock_coef", 2.0)
         )
@@ -823,7 +823,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             if hasattr(self, "ghost_bank") and self.ghost_bank is not None:
                 def ghost_encoder_fn(x, m):
                     return self.model.encoder(x, imputation_mask=m)["global_expert"]
-                self.ghost_bank.refresh_anchors(ghost_encoder_fn, decay=0.3)
+                self.ghost_bank.refresh_anchors(ghost_encoder_fn, decay=0.9)
                 logger.info("👻 [RESUME] Ghost Bank anchors refreshed (Manifold Aligned).")
 
         # 2.3 GradNorm Optimizer (The Amnesia Fix #v2026)
@@ -1616,7 +1616,27 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 # [v2026 SOTA] Vectorized Validity Mask
                 # Rationale: Replaced .any() sync with zero-masking for graph safety.
                 v_mask = ghost_batch["valid"].unsqueeze(-1).float()
-                l_cga = (ghost_dist * ghost_uncertainties * v_mask).mean() * cga_mult
+                l_cga_raw = (ghost_dist * ghost_uncertainties * v_mask).mean() * cga_mult
+                
+                # [FORENSIC FIX #5] CGA Ratio Normalization (Principled anchor-drift control)
+                # Root Cause: Stale ghost anchors cause cosine-distance explosion when 
+                # the encoder evolves rapidly (observed: l_cga 0.02→0.72 at E3, exceeding D=0.20).
+                # Principle: CGA is a regularizer — it should never exceed the primary loss.
+                # We normalize CGA so its gradient contribution stays proportional to 
+                # the diffusion anchor via smooth ratio scaling. When CGA >> D, the tanh
+                # saturates and suppresses the excess. When CGA << D, tanh ≈ identity.
+                with torch.no_grad():
+                    # Use the scaler's diffusion EMA as a stable anchor (always in scope,
+                    # smoothed across steps — more robust than current-batch diff_loss).
+                    d_anchor = self.loss_scaler.loss_emas[0].detach().clamp(min=1e-4)
+                    cga_ratio = l_cga_raw.detach() / d_anchor
+                    # Lorentzian gate (Hill function): 1/(1+x²)
+                    # Properties vs tanh(1/(x+1)):
+                    #   ratio=0.1 → gate=0.990 (vs 0.761) — preserves small CGA signals
+                    #   ratio=1.0 → gate=0.500 (vs 0.462) — 50% at parity 
+                    #   ratio=3.6 → gate=0.072 (vs 0.187) — strong suppression when CGA > D
+                    ratio_gate = 1.0 / (1.0 + cga_ratio.pow(2))
+                l_cga = l_cga_raw * ratio_gate
                 
                 # Weighted at base 0.5 to prevent manifold stiffness
                 aux_loss = aux_loss + 0.5 * l_cga
@@ -1708,8 +1728,26 @@ class ICUGeneralistWrapper(pl.LightningModule):
                     # Applied AFTER clamping to strictly guarantee the downward shift is preserved.
                     pessimism_penalty = -0.5 * local_sigma * volatility
                     
-                    # 7. Inject
-                    target_values = target_values + (clamped_noise + pessimism_penalty).detach()
+                    # [FORENSIC FIX #1] Sigmoid Exploration Decay (Breaks memorization feedback loop)
+                    # Root Cause: base_sigma = 0.05 * adv_scale creates a positive feedback loop:
+                    # as the critic memorizes (EV→1.0), advantages sharpen, adv_scale grows,
+                    # noise grows, target jitter grows, V explodes (31→115 at E3).
+                    # Principle: Uncertainty-driven exploration (Thompson Sampling analogy).
+                    # When the critic is uncertain (low EV), we explore heavily.
+                    # When the critic is confident (high EV), exploration noise decays.
+                    # Note: We use the accumulated EV from previous steps (lagged 1 batch)
+                    # because current-batch EV hasn't been computed yet at this point.
+                    # Edge case: At step 0 of epoch 0, the metric is empty → defaults to 0.0
+                    # → sigmoid(3.5) ≈ 0.97 → near-full noise, which is the correct behavior
+                    # for an untrained critic.
+                    try:
+                        prev_ev = self.train_explained_var.compute().detach().clamp(-1.0, 1.0)
+                    except (RuntimeError, ValueError):
+                        prev_ev = torch.tensor(0.0, device=self.device)
+                    ev_noise_scale = torch.sigmoid(5.0 * (0.7 - prev_ev))
+                    
+                    # 7. Inject with exploration-decayed noise
+                    target_values = target_values + (clamped_noise + pessimism_penalty).detach() * ev_noise_scale
 
                 # B. Run Anchor Head (if applicable)
                 teacher_logits = None
@@ -1825,6 +1863,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
         # pred_values (L540) has gradients. returns is detached.
         # [SOTA v4.1] Implicit Distributional Critic Task
         # [v4.1.6 SOTA FIX] Mask-Aware Critic (Smoking Gun #Padding-Bleed)
+        # [FORENSIC FIX #2] Root cause addressed in loss_scaler.py (log_vars[1] constraint relaxed)
+        # The BayesianProjectedScaler now has freedom to reduce critic weight when V explodes,
+        # eliminating the need for any hard cap here. See loss_scaler.py Fix #2.
         critic_loss = self.model.value_loss_fn(pred_values, returns, tau=self.curr_tau.item(), mask=f_mask)
         
         # [v2026 SOTA] Telemetry consolidated at step-end (L2703) to prevent double-counting.
@@ -2045,32 +2086,42 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 self.log("gov/stability_factor", stability_factor, on_step=True)
                 self.log("gov/gamma_effective", 1.0 + (self.risk_aware_loss.gamma_neg - 1.0) * stability_factor, on_step=True)
 
-            # [SOTA RECOVERY v3.2] Configurable Generative Ramping
-            # Rationale: Enables 100x gradient recovery (1e-4 -> 1e-2) without initial shock.
-            # 1. Access stabilized loss scales
-            with torch.no_grad():
-                d_ema = self.loss_scaler.loss_emas[0]
-                a_ema = self.loss_scaler.loss_emas[2]
-            
+
+
             # [SOTA v4.0] Raised Alpha Floor (Gradient Starvation Prevention)
             # Rationale: alpha_min=0.01 allows 100x gradient suppression.
             # [SOTA v10.5] Clinical Gradient Preservation (Grid-Search Proven)
             # Rationale: alpha_min=0.5 caused "Generative Dominance" (60% Diffusion weight).
             # Lowering to 0.1 allows the Clinical task to dominate when sepsis signal is strong.
             alpha_min = getattr(self.cfg, "alpha_min", 0.1)
-            raw_alpha = (a_ema / (d_ema + 1e-8))
-            # [SOTA v4.0.1] Tightened upper bound (SG-2 Divergence Fix)
-            # Rationale: Clamping to 1.2 prevented 'mse_labs' explosion in v26.4 audits.
-            stabilized_alpha = torch.clamp(raw_alpha, min=alpha_min, max=1.2)
             
-            # 2. Apply Warmup Ramp
-            warmup_epochs = max(1, getattr(self.cfg, "alpha_warmup_epochs", 5))
+            # [FORENSIC FIX #3] Decoupled Alpha Curriculum (Eliminates feedback loop)
+            # Root Cause: The original formula `raw_alpha = a_ema / d_ema` creates a positive
+            # feedback loop: aux loss grows → raw_alpha grows → diffusion weight increases →
+            # encoder prioritizes denoising → classification degrades → aux loss grows.
+            # This caused alpha_sota to saturate at 0.76 by E3, flooding the encoder
+            # with 10x diffusion gradient and destroying clinical discrimination.
+            #
+            # Principle: Decouple alpha from loss statistics entirely. The BayesianProjectedScaler
+            # (Kendall et al.) already handles dynamic multi-task balancing via uncertainty
+            # weighting. Alpha_sota should be a PURE CURRICULUM: gradually allow diffusion to
+            # participate more as the clinical signal stabilizes. No feedback, no dynamic ratio.
+            #
+            # Schedule: Cosine ramp from alpha_min(0.1) → alpha_target(0.5) over 20 epochs.
+            # At E3:  ramp≈0.054, α≈0.122 (vs old 0.76 — 6x less diffusion pressure)
+            # At E10: ramp=0.500, α≈0.300 (balanced)
+            # At E20: ramp=1.000, α=0.500 (equal weighting with scaler fine-tuning)
+            alpha_target = getattr(self.cfg, "alpha_target", 0.5)
+            warmup_epochs = max(1, getattr(self.cfg, "alpha_warmup_epochs", 20))
             curr_epoch = float(getattr(self, "current_epoch", 0))
-            ramp = min(1.0, curr_epoch / float(warmup_epochs))
-            alpha_sota = alpha_min * (1.0 - ramp) + stabilized_alpha * ramp
+            ramp = 0.5 * (1.0 - math.cos(math.pi * min(1.0, curr_epoch / float(warmup_epochs))))
+            alpha_sota = alpha_min + (alpha_target - alpha_min) * ramp
             
-            # [SOTA v4.0] Critical Telemetry: Alpha Visibility
-            # Rationale: Removed .item() to stay in the graph.
+            # [TELEMETRY] Retain EMA visibility for diagnostics (scaler still uses them internally)
+            with torch.no_grad():
+                d_ema = self.loss_scaler.loss_emas[0]
+                a_ema = self.loss_scaler.loss_emas[2]
+            
             self.log("train/alpha_sota", alpha_sota, on_step=True, prog_bar=True)
             self.log("train/d_ema", d_ema, on_step=True)
             self.log("train/a_ema", a_ema, on_step=True)
@@ -2102,9 +2153,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
             _warmup_steps = getattr(self.trainer, "global_warmup_steps", ScalingSteward.SOTA_REF_WARMUP)
             warmup_progress = min(1.0, float(self.global_step) / float(_warmup_steps))
             clamp_min = 0.2 - (0.1 * warmup_progress) # 0.2 -> 0.1
-            clamp_max = 5.0 + (5.0 * warmup_progress) # 5.0 -> 10.0
             
-            phys_scale = torch.clamp(phys_scale_raw, min=clamp_min, max=clamp_max)
+            # [FORENSIC FIX #4] Soft Saturation via tanh (Principled phys_scale bounding)
+            # Root Cause: d_ema/p_ema ratio grows unboundedly (0.85→3.58) because physics loss
+            # naturally shrinks 4x faster than diffusion as the model learns constraints.
+            # Principle: tanh(x/k)*k provides smooth saturation approaching k asymptotically.
+            # This preserves gradients for small ratios (tanh ≈ identity near 0) while
+            # smoothly compressing extreme ratios — no discontinuous gradient at a clamp boundary.
+            max_phys_scale = 3.0
+            phys_scale_raw_clamped = torch.clamp(phys_scale_raw, min=clamp_min)
+            phys_scale = max_phys_scale * torch.tanh(phys_scale_raw_clamped / max_phys_scale)
 
             # [SOTA v4.0] Critical Telemetry: Physics Visibility
             # Rationale: Removed .item() to stay in the graph.
@@ -3347,12 +3405,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
                  return out_alb["global_expert"]
 
              if self.trainer.is_global_zero:
-                 logger.info(f"👻 [GHOST REFRESH] Re-encoding {self.ghost_bank.size} anchors (Decay=0.3/Momentum=0.7)...")
+                 logger.info(f"👻 [GHOST REFRESH] Re-encoding {self.ghost_bank.size} anchors (Decay=0.9/Momentum=0.1)...")
                  
-             # [REVERTED] Ghost Refresh: Decay 0.3 (High Update) to prevent Amnesia
-             self.ghost_bank.refresh_anchors(ghost_encoder_fn, decay=0.3)
+             # [ry.md FIX 3] Smooth Manifold Evolution (decay 0.3 → 0.9)
+             # Simulation: decay=0.3 creates 80x more landscape shift than 0.9.
+             # 70% anchor jump causes abrupt gradient mismatch at epoch boundary.
+             # 10% update (decay=0.9) provides smooth manifold evolution.
+             self.ghost_bank.refresh_anchors(ghost_encoder_fn, decay=0.9)
              if self.global_step % 100 == 0:
-                 logger.info(f"[GHOST REFRESH] Bank Size: {self.ghost_bank.size.item()} | Refresh Decay: 0.3 (High Plasticity)")
+                 logger.info(f"[GHOST REFRESH] Bank Size: {self.ghost_bank.size.item()} | Refresh Decay: 0.9 (Smooth Momentum)")
              # [v2026 RAM SPIKE FIX] Memory Clearing (Smoking Gun #RAM-01)
              # Rationale: Ghost Refresh creates ~500MB of activations that must be freed
              # before checkpoint serialization runs to prevent OOM.
@@ -3536,18 +3597,21 @@ class ICUGeneralistWrapper(pl.LightningModule):
         Ramps up weight over 50% of TOTAL steps for resume transparency.
         [v14.9 SOTA Fix] Dynamic Anchor to actual training length.
         """
-        # total_steps = getattr(self.trainer, "estimated_stepping_batches", 50000)
-        # warmup_steps = total_steps * 0.5
+        # [FORENSIC FIX #6] Re-enabled Physics Curriculum
+        # Root Cause: Disabled curriculum meant physics weight was constant at 0.2 from step 0.
+        # Combined with the d_ema/p_ema ratio scaling (phys_scale), this allowed physics 
+        # gradients to compete with clinical signal from the very beginning.
+        # Fix: Ramp from 0.01→base_weight over 50% of training for smooth introduction.
+        total_steps = getattr(self.trainer, "estimated_stepping_batches", 50000)
+        warmup_steps = total_steps * 0.5
         
-        # current_step = float(self.global_step)
+        current_step = float(self.global_step)
         
-        # if current_step < warmup_steps:
-        #     progress = current_step / float(max(1, warmup_steps))
-        #     return 0.01 + (self.base_phys_weight - 0.01) * progress
-        # else:
-        #     return self.base_phys_weight
-
-        return self.base_phys_weight
+        if current_step < warmup_steps:
+            progress = current_step / float(max(1, warmup_steps))
+            return 0.01 + (self.base_phys_weight - 0.01) * progress
+        else:
+            return self.base_phys_weight
 
     @contextlib.contextmanager
     def ema_teacher_context(self):
