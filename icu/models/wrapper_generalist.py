@@ -1720,9 +1720,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
                     temporal_noise = blend_factor * raw_noise + blend_factor * noise_shifted
                     
                     # 5. Dynamic Symmetric Iron Dome (Zero-Sync, Broadcast-Safe)
+                    # [SOTA TITANIUM FIX] Jitter Iron Dome
+                    # Rationale: Strictly clamp noise to 3 sigma to prevent label-derived ghosts.
                     # We use pure tensor operations to avoid .item() syncs or view_as crashes.
-                    local_limit = 2.5 * local_sigma
-                    clamped_noise = torch.max(torch.min(temporal_noise, local_limit), -local_limit)
+                    clamped_noise = torch.clamp(temporal_noise, min=-3.0 * local_sigma, max=3.0 * local_sigma)
                     
                     # 6. Pessimistic Shift (Conservative RL)
                     # Applied AFTER clamping to strictly guarantee the downward shift is preserved.
@@ -2674,9 +2675,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
             if should_apply and not is_init_period and grace_val <= 0:
                 current_p = current_grad_pressure.item()
                 
-                # Check for "Manifold Shock" (5-Sigma Outlier)
+                # [SOTA TITANIUM FIX] Instant Delta-Threshold Factor
+                # Rationale: EMA-based Z-score reacts too slowly to single-batch shocks.
+                # Delta check catches 10x magnitude shifts instantly.
+                delta_shock = (current_p / self.grad_norm_ema.item()) if self.grad_norm_ema.item() > 1e-4 else 1.0
                 z_score = TrendSentinel.calculate_z_score(current_p, self.grad_norm_ema, self.grad_norm_std)
-                if z_score > 5.0:
+                
+                # Check for "Manifold Shock" (5-Sigma OR 10x Magnitude Sudden Drift)
+                if z_score > 5.0 or delta_shock > 10.0:
                     # [v2026.1 STABILITY FIX] Enhanced Diagnostics
                     logger.warning(
                         f"☄️ [IRON DOME] Blocked 5-Sigma Gradient Spike "
@@ -2783,7 +2789,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
             active_decay = 0.90 if self.grad_norm_step_count < ada_decay_threshold else self.grad_ema_decay
             active_decay_scaled = active_decay ** (self._shadow_grad_accum_idx if self._shadow_grad_accum_idx > 0 else 1)
             
-            if grace_val <= 0 and not is_init_period:
+            # [SOTA TITANIUM FIX] Sentinel NaN-Gate
+            # Rationale: The TrendSentinel MUST see every gradient norm to maintain a fresh EMA,
+            # BUT we MUST reject the update if current_grad_pressure is NaN
+            # to prevent poisoning the EMA memory (0.99*A + 0.01*NaN = NaN).
+            if grace_val <= 0 and not is_init_period and torch.isfinite(current_grad_pressure):
                 TrendSentinel.update_stats(
                     current_grad_pressure, 
                     self.grad_norm_ema, 

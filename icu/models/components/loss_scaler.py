@@ -105,13 +105,19 @@ class BayesianProjectedScaler(nn.Module):
             avg_losses_all = global_sum_losses / (global_task_counts + 1e-8)
             avg_losses = avg_losses_all[indices] if has_losses else torch.tensor([], device=device)
             
+            # [SOTA TITANIUM FIX] Loss NaN-Gate
+            # Rationale: All-reduce results in NaN if any rank had an Inf.
+            # We MUST reject the step to prevent poisoning EMA memory.
+            is_finite = torch.isfinite(avg_losses_all).all()
+            
             # Momentum-Based Update
             self.step_count += 1
             is_warmup = (self.step_count < self.warmup_steps)
             curr_decay_t = torch.where(is_warmup, torch.as_tensor([0.95], device=device), self.decay)
             
-            # Atomic EMA Update
-            self.loss_emas.lerp_(avg_losses_all, 1.0 - curr_decay_t)
+            # Atomic EMA Update (Protected)
+            if is_finite:
+                self.loss_emas.lerp_(avg_losses_all, 1.0 - curr_decay_t)
             
             # Reset Cycle
             self.loss_accumulator.zero_()
@@ -123,13 +129,13 @@ class BayesianProjectedScaler(nn.Module):
                 avg_losses_all = self.loss_accumulator / (self.task_counters + 1e-8)
                 avg_losses = avg_losses_all[indices] if has_losses else torch.tensor([], device=device)
                 
-                # [SG-4 FIX] Increment step_count in non-DDP path
-                # Without this, step_count stays at 0 forever, permanently
-                # locking EMA decay at the warmup value (0.95 instead of 0.99).
+                # [SOTA TITANIUM FIX] Local NaN-Gate
+                is_finite = torch.isfinite(avg_losses_all).all()
                 self.step_count += 1
                 is_warmup = (self.step_count < self.warmup_steps)
                 curr_decay = torch.where(is_warmup, torch.as_tensor([0.95], device=device), self.decay)
-                self.loss_emas.lerp_(avg_losses_all, 1.0 - curr_decay)
+                if is_finite:
+                    self.loss_emas.lerp_(avg_losses_all, 1.0 - curr_decay)
                 
                 self.loss_accumulator.zero_()
                 self.task_counters.zero_()
@@ -178,8 +184,12 @@ class BayesianProjectedScaler(nn.Module):
         # Component 2: Uncertainty Updates (Sigma)
         # We use the smoothed EMA loss to update the log_vars (Sigma), preventing batch-to-batch
         # thrashing and ensuring stable loss landscape calibration.
-        log_ema_losses = torch.log(F.softplus(avg_losses) + 1.0)
-        sigma_loss = (0.5 * precision * log_ema_losses.detach() * uw_weights + 0.5 * log_vars_clamped).sum()
+        # [SOTA TITANIUM FIX] Linear Magnitude Response
+        # Rationale: log(avg_losses) muted the signal for runaway components.
+        # Using raw EMA loss ensures the Bayesian scaler reacts instantly to divergence.
+        # F.softplus(avg_losses) provides C1-continuity near zero while remaining 
+        # linear for magnitudes encountered in clinical RL (L > 1.0).
+        sigma_loss = (0.5 * precision * F.softplus(avg_losses).detach() * uw_weights + 0.5 * log_vars_clamped).sum()
         
         # Fused AutoGrad Root
         total_loss = theta_loss + sigma_loss

@@ -183,7 +183,11 @@ class IQLQuantileLoss(nn.Module):
         
         # 1. Expectile Loss (The "Selector" - Component 1)
         weight_iql = torch.where(diff < 0, 1.0 - tau_t, tau_t)
-        raw_expectile_loss = weight_iql * (diff**2)
+        # [SOTA TITANIUM FIX] Huber Expectile Loss
+        # Rationale: Squared Error (diff**2) amplifies outlier gradients 25x.
+        # Huber regression (delta=1.0) linearizes gradients for large errors,
+        # breaking the 'Cybernetic Echo Chamber' loop.
+        raw_expectile_loss = weight_iql * F.huber_loss(v_pred_safe, target_returns, reduction='none', delta=1.0)
         
         if mask is not None:
             mask_f = mask.float()

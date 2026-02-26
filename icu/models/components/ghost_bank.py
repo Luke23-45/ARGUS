@@ -374,10 +374,11 @@ class SepsisGhostBank(nn.Module):
                     # Re-encode using CURRENT encoder weights
                     new_anchors = encoder(v_batch, m_batch)
                     
-                    # [SOTA FIX]: Clamp Latents to Prevent Poisoning
-                    # Rationale: Probe 1 showed outliers > 3.0 can poison the bank.
-                    # Normalizer headroom is [-2.0, 2.0], so we clamp to this range.
-                    new_anchors = torch.clamp(new_anchors, min=-2.0, max=2.0)
+                    # [SOTA TITANIUM FIX] NaN-Proof Sanitization
+                    # Rationale: torch.clamp is a no-op for NaN. nan_to_num + isfinite
+                    # ensures toxicity is physically purged from the bank.
+                    new_anchors = torch.nan_to_num(new_anchors, nan=0.0, posinf=2.0, neginf=-2.0)
+                    new_anchors = new_anchors.clamp(min=-2.0, max=2.0)
                     
                     new_norm = F.normalize(new_anchors, dim=1)
                     
