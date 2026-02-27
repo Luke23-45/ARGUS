@@ -260,11 +260,16 @@ class BayesianProjectedScaler(nn.Module):
             return
             
         anchor_idx = self.keys.index(anchor_key)
-        target_magnitude = raw_losses[anchor_idx].clamp(min=0.01)
+        # [NASA-Tier v1.1] Numerical Shielding (Smoking Gun #2)
+        # Rationale: If target_magnitude is 0, the division produces Inf, and log(Inf) = Inf.
+        # This permanently poisons the scaler. Clamp minimum to a safe numerical lower bound.
+        target_magnitude = raw_losses[anchor_idx].clamp(min=1e-4)
         
         # log_var = ln(loss / target) => Weight = target / loss
         # This equalizes the weighted loss magnitudes to EXACTLY match the anchor.
-        new_log_vars = torch.log(raw_losses.clamp(min=1e-8) / target_magnitude)
+        # [NASA-Tier v1.1] Double-sided clamp to prevent log(0) [NaN] and log(Inf) [Inf].
+        safe_ratio = (raw_losses / target_magnitude).clamp(min=1e-8, max=1e8)
+        new_log_vars = torch.log(safe_ratio)
         
         # 4. Expert Clinical Priors
         # Physics and TCB start with lower priority to allow the generative manifold to settle.

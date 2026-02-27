@@ -1463,12 +1463,13 @@ class ICUAdvantageCalculator(nn.Module):
                 
                 if valid_weights.numel() > 10:
                     try:
-                        p95_t.fill_(torch.quantile(valid_weights.detach().float(), 0.95).item())
-                    except:
-                        pass 
-                
-                if not torch.isfinite(p95_t):
-                    p95_t.fill_(-10000.0)
+                        # Add detach().cpu().float() for deterministic quantile calculation
+                        # to avoid CUDA precision inconsistencies across ranks.
+                        p95_val = torch.quantile(valid_weights.detach().cpu().float(), 0.95).item()
+                        if math.isfinite(p95_val):
+                            p95_t.fill_(p95_val)
+                    except Exception:
+                        pass
 
                 if dist.is_initialized():
                     dist.all_reduce(p95_t, op=dist.ReduceOp.MAX)
@@ -1503,7 +1504,8 @@ class ICUAdvantageCalculator(nn.Module):
         values: Optional[torch.Tensor] = None,
         rewards: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
-        turbo_mode: bool = False
+        turbo_mode: bool = False,
+        ev_ema: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Dict[str, Any]]: # Changed return type for diagnostics
         """
         Full AWR weight calculation with explained variance diagnostic.
@@ -1511,7 +1513,15 @@ class ICUAdvantageCalculator(nn.Module):
         Args:
             turbo_mode: [SOTA 2026] If True, activates rapid adaptation (0.50 momentum)
                         to recover from resumption trauma or distribution shifts.
+            ev_ema: Extracted Explained Variance (EMA). Used to damp turbo mode
+                    if the manifold is highly unstable (e.g. noise shock on legacy resume).
         """
+        # [NASA-Tier v1.0] AWR Turbo-Damping (Resumption Trauma Fix)
+        # Rationale: If ev_ema is below 0.3 (huge noise spike), we MUST NOT allow turbo_mode 
+        # to hard-reset the advantage statistics to the noise distribution.
+        if turbo_mode and ev_ema is not None and ev_ema.item() < 0.3:
+            turbo_mode = False
+
         # Core AWR weight calculation
         weights, diagnostics = self.calculate_awr_weights(advantages, mask=mask, turbo_mode=turbo_mode)
         

@@ -216,7 +216,9 @@ class SepsisGhostBank(nn.Module):
             masks = masks[active_mask]
             labels = labels[active_mask]
             latents = latents[active_mask]
-            if uncertainties is not None: uncertainties = uncertainties[active_mask]
+            if uncertainties is not None: uncertainties = uncertainties[active_mask].detach()
+        elif uncertainties is not None:
+            uncertainties = uncertainties.detach()
         
         # Guard against NaNs/Infs (Zero-Sync)
         is_finite = torch.isfinite(latents).all(dim=1)

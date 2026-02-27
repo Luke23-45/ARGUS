@@ -427,6 +427,11 @@ class ICUGeneralistWrapper(pl.LightningModule):
         self.train_awr_ess = MeanMetric()
         self.train_explained_var = MeanMetric()
         
+        # [NASA-Tier v1.0] Persistent Manifold Feedback (Source Fix)
+        # Rationale: Replaces the epoch-local MeanMetric for control logic to prevent 
+        # NaN-poisoning at Step 0. Initialized to 0.5 (Neutral).
+        self.register_buffer("ev_ema", torch.tensor(0.5))
+        
         # =====================================================================
         # 6. VALIDATION TELEMETRY (Global Aggregation)
         # =====================================================================
@@ -570,6 +575,14 @@ class ICUGeneralistWrapper(pl.LightningModule):
             if mismatched_keys:
                 logger.info(f"[PMS] Skipped {len(mismatched_keys)} mismatched keys (likely timesteps change). Model will reinitialize these.")
 
+            # [NASA-Tier] Legacy Checkpoint Buffer Bridge (Trauma Trace Fix)
+            # Rationale: If an older checkpoint didn't save `ev_ema`, it defaults to 0.5 
+            # causing a 10x noise explosion on the first batch. We inject a safe 
+            # settled prior of 0.15 (equivalent to 0.85 variance).
+            if "ev_ema" not in new_state_dict:
+                logger.warning("🚨 [RESUME] `ev_ema` not found in legacy checkpoint. Injecting safe prior (0.15) to prevent Manifold Trauma.")
+                new_state_dict["ev_ema"] = torch.tensor(0.15)
+
             return super().load_state_dict(new_state_dict, strict=False)
             
         return super().load_state_dict(state_dict, strict=strict)
@@ -611,10 +624,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
             self.horizon_scheduler.scale_dynamics(n_curr)
         
         # [SOTA FIX v9.0] Unconditional Grace Period
-        # Rationale: Whether fresh start OR resumption, we must allow 50 steps
-        # for TrendSentinel buffers (grad_norm_ema) to align with current dynamics.
+        # Rationale: Whether fresh start OR resumption, we must allow 100 steps
+        # for TrendSentinel buffers (grad_norm_ema) and AWR stats to align with current dynamics.
         # This prevents "False Shock" detection from freezing the curriculum.
-        self.resumption_grace_steps.fill_(50)
+        self.resumption_grace_steps.fill_(100)
 
         # [v48.1 SOTA FIX] Resumption Accumulation Reset (Smoking Gun #90)
         # Rationale: PyTorch/Lightning does NOT restore .grad buffers or 
@@ -1449,12 +1462,15 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # [v21.1 SOTA FIX] Global Consensus Trust Factor (Smoking Gun #178)
             # Rationale: Foundation trust must be identical across ranks.
             if dist.is_initialized():
-                 u_sum = uncertainty.detach().sum()
+                 # [v2026 SOTA TITANIUM FIX] Shape Matching (Smoking Gun #DDP-Stack)
+                 # Rationale: `u_sum` is 0D scalar, `b_count` is 1D tensor. torch.stack requires equal shapes.
+                 # Added `.unsqueeze(0)` to u_sum for DDP safety.
+                 u_sum = uncertainty.detach().sum().unsqueeze(0)
                  b_count = torch.tensor([float(B)], device=self.device)
                  
                  sync_data = torch.stack([u_sum, b_count])
                  dist.all_reduce(sync_data, op=dist.ReduceOp.SUM)
-                 u_avg = (sync_data[0] / sync_data[1]) # Removed .item()
+                 u_avg = (sync_data[0] / sync_data[1]).squeeze(0) # Keep 0D for downstream operations
             else:
                  u_avg = uncertainty.detach().mean()
             
@@ -1736,15 +1752,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
                     # Principle: Uncertainty-driven exploration (Thompson Sampling analogy).
                     # When the critic is uncertain (low EV), we explore heavily.
                     # When the critic is confident (high EV), exploration noise decays.
-                    # Note: We use the accumulated EV from previous steps (lagged 1 batch)
-                    # because current-batch EV hasn't been computed yet at this point.
-                    # Edge case: At step 0 of epoch 0, the metric is empty → defaults to 0.0
-                    # → sigmoid(3.5) ≈ 0.97 → near-full noise, which is the correct behavior
-                    # for an untrained critic.
-                    try:
-                        prev_ev = self.train_explained_var.compute().detach().clamp(-1.0, 1.0)
-                    except (RuntimeError, ValueError):
-                        prev_ev = torch.tensor(0.0, device=self.device)
+                    # [v2.0 NASA-Tier] Use Persistent EMA instead of epoch-local metric
+                    # to prevent NaN poisoning at Step 0.
+                    prev_ev = self.ev_ema.detach().clamp(-1.0, 1.0)
                     ev_noise_scale = torch.sigmoid(5.0 * (0.7 - prev_ev))
                     
                     # 7. Inject with exploration-decayed noise
@@ -1824,7 +1834,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 values=target_values, 
                 rewards=returns, 
                 mask=f_mask,
-                turbo_mode=(self._shadow_resumption_grace_steps > 0)
+                turbo_mode=(self._shadow_resumption_grace_steps > 0),
+                ev_ema=self.ev_ema.detach()
             )
             
             # [v7.3 SOTA FIX] AWR Warmup (The "Cognitive Settle")
@@ -2845,6 +2856,19 @@ class ICUGeneralistWrapper(pl.LightningModule):
             self.train_awr_ess.update(diag["ess"])
             self.train_explained_var.update(ev)
             
+            # [v2.0 NASA-Tier] Persistent Manifold Update (DDP-Synced)
+            # Rationale: All ranks must use the same exploration pressure to prevent 
+            # manifold divergence. We filter NaNs to protect the state.
+            with torch.no_grad():
+                ev_sync = ev.detach().clone()
+                if dist.is_initialized():
+                    dist.all_reduce(ev_sync, op=dist.ReduceOp.SUM)
+                    ev_sync /= dist.get_world_size()
+                
+                if torch.isfinite(ev_sync):
+                    # Smoothing factor 0.05 (matches ScaleSteward v2026 reference)
+                    self.ev_ema.lerp_(ev_sync.to(self.ev_ema.dtype), 0.05)
+
             # [v2026 SOTA] Vectorized DAB Transfer (Zero-Sync)
             # Rationale: Replaced if sepsis_mask.any() with atomic fused gather.
             # Empty tensors participate in the handshake to maintain DDP consensus.
@@ -2972,6 +2996,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 "train/weight_critic": task_weights[1],
                 "train/weight_aux": task_weights[2],
                 "train/curr_phys_weight": curr_phys_weight,
+                "train/ev_ema": self.ev_ema.detach(),
+                "train/awr_mu": diag["mu"],
+                "train/awr_sigma": diag["sigma"]
             }, on_step=True, on_epoch=False, prog_bar=False)
 
             # [v2026 SOTA] Efficient Intra-Epoch CSV Logging
