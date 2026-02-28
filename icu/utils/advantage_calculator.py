@@ -1042,7 +1042,8 @@ class ICUAdvantageCalculator(nn.Module):
                 # Rationale: If a single rank has a NaN/Inf in the batch (rare but possible), 
                 # dist.all_reduce(SUM) poisons the entire global state. 
                 # We only update persistent stats if the global aggregate is healthy.
-                mask_update = (g_b_count > 1) and torch.isfinite(stats).all()
+                # [FIX] Use individual variables for finite check (stats only exists in DDP path)
+                mask_update = (g_b_count > 1) and torch.isfinite(g_b_sum) and torch.isfinite(g_b_sq_sum)
                 if mask_update:
                     curr_mu = g_b_sum / g_b_count
                     curr_var = (g_b_sq_sum / g_b_count) - (curr_mu ** 2)

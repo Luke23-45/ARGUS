@@ -1409,7 +1409,16 @@ class ICUGeneralistWrapper(pl.LightningModule):
                     # Manifold Constraint (Dynamic Thresholding)
                     # Prevents outlier conditioning from exploding the search space
                     # [v21.5 SOTA] Accumulation Guard: Only update on stepping batches.
-                    self_cond = self.model.governance(guess_x0, update_ema=should_step).detach()
+                    self_cond_b = self.model.governance(guess_x0, update_ema=should_step).detach()
+                    
+                    # [v28.0 SOTA FIX] Ghost Expansion for Pass 2 (Smoking Gun #TensorMismatch)
+                    # Rationale: Pass 2 expects B+G tensors for noisy_fut, t, ctx_seq, etc.
+                    # self_cond must also be expanded to B+G to match noisy_fut dimension.
+                    if num_ghosts > 0:
+                        self_cond_ghosts = torch.zeros((num_ghosts, self.cfg.model.pred_len, self.model.cfg.input_dim), device=self.device)
+                        self_cond = torch.cat([self_cond_b, self_cond_ghosts], dim=0)
+                    else:
+                        self_cond = self_cond_b
 
         # Pass 2: Final Denoising with Conditioning (Gradient Path)
         # [v13.0 SOTA] B+G pass ensures backbone parameters receive sepsis signal
@@ -1440,13 +1449,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
         weights_awr_log = {}
         
         # C. Critic Task (SOTA IDC-25)
-        # Replaced scalar MSE with Distributional Implicit Q-Learning (IQL-QR)
-        # We compute predictions here (Student Pass), but loss is deferred until
-        # after the Fused Teacher Block provides the 'returns' (targets).
-        # C. Critic Task (SOTA IDC-25)
-        # [v12.2 SOTA] Use UNIFIED context for value prediction (Clinical Awareness)
+        # [RESTORED] Global Context Value Prediction (Correct Temporal Resolution)
+        # Rationale: The value head in global mode (dim==2) produces [B, pred_len, N]
+        # which after get_expectile_summary yields [B, pred_len] = [B, 6].
+        # This MUST match rewards [B, 6] for the SAW advantage formula.
+        # The v13.5 sequential approach was architecturally wrong: it produced [B, T_src=25]
+        # from encoder history, but rewards are over T_pred=6 (future vitals).
         # [v17.3 Surgical Mask] Critic only for main batch [0:B]
-        # Prevents selection pressure poisoning from historical extremes.
         pred_values = self.model.value_head(global_ctx_unified[:B])
         
         # D. Task-Specific Component Computation (Initialization)
@@ -1735,12 +1744,13 @@ class ICUGeneralistWrapper(pl.LightningModule):
                     imputation_mask=src_mask, 
                     padding_mask=bool_padding_mask[:B] if bool_padding_mask is not None else None
                 )
-                # [v13.5 SOTA] Sequential Value Resolution (Teacher)
-                # Use full temporal sequences instead of pooled summaries
-                teacher_seq_unified = (out_teacher["ctx_planner"] + out_teacher["ctx_expert"]).mul(0.5)
-                # Slice logic stays same, get_expectile_summary handles [B, T, N]
+                # [RESTORED] Global Context Value Resolution (Teacher)
+                # Rationale: Teacher values must have shape [B, pred_len] = [B, 6]
+                # to match rewards [B, 6] in the SAW advantage formula.
+                # Global context (2D) naturally produces [B, pred_len, num_quantiles].
+                teacher_global_unified = (out_teacher["global_planner"] + out_teacher["global_expert"]).mul(0.5)
                 target_values = self.model.value_head.get_expectile_summary(
-                     self.model.value_head(teacher_seq_unified),
+                     self.model.value_head(teacher_global_unified),
                      tau=self.curr_tau
                 )
 
@@ -1845,10 +1855,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 bootstrap_value = target_values[:, -1:] * is_truncated.float().unsqueeze(-1)
 
             # Student Values for SAW (Detached for Target generation)
-            # [v13.5 SOTA] Sequential Value Resolution (Student)
-            student_seq_unified = (out_alb["ctx_planner"][:B] + out_alb["ctx_expert"][:B]).mul(0.5)
+            # [RESTORED] Global Context Value Resolution (Student)
+            # pred_values is [B, pred_len, N], get_expectile_summary → [B, pred_len]
             student_values = self.model.value_head.get_expectile_summary(
-                self.model.value_head(student_seq_unified),
+                pred_values, # [B, pred_len, N] from global_ctx_unified
                 tau=self.curr_tau
             ).detach()
 
@@ -2008,7 +2018,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Rationale: Denominator 1/sqrt(alpha) acts as a 100,000x gradient amplifier.
             # Fix: Cap denominator at 1e-2 for gradients to limit amplification to 100x.
             # This protects the model from physics losses on "hallucinated" x0 at high t.
-            alpha_t = self.model.scheduler.alphas_cumprod[t][:, None, None]
+            alpha_t = self.model.scheduler.alphas_cumprod[t[:B]][:, None, None]
             # [v14.1 NASA-TIER] Bayesian Straight-Through Estimator (Structural Recovery)
             # Rationale: Denominator x/0.01 suppresses 90% of gradients compared to x/0.001.
             # Fix: Forward pass uses stable 1e-2 cap; Gradient pass uses true 1e-3 scale.
@@ -2016,8 +2026,10 @@ class ICUGeneralistWrapper(pl.LightningModule):
             den_fwd = sqrt_alpha_real.clamp(min=1e-2)
             k_t = torch.sqrt(1 - alpha_t)
             
-            x0_fwd = (noisy_fut - k_t * pred_noise) / (den_fwd + 1e-8)
-            x0_bwd = (noisy_fut - k_t * pred_noise) / (sqrt_alpha_real + 1e-8)
+            # [FIX] Use noisy_fut[:B] to match pred_noise [B] (ghosts excluded from reconstruction)
+            noisy_fut_real = noisy_fut[:B]
+            x0_fwd = (noisy_fut_real - k_t * pred_noise) / (den_fwd + 1e-8)
+            x0_bwd = (noisy_fut_real - k_t * pred_noise) / (sqrt_alpha_real + 1e-8)
             x0_approx = x0_bwd + (x0_fwd - x0_bwd).detach()
             
             # [v26.3 SOTA FIX] Install Manifold Governance Bridge
@@ -2102,7 +2114,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # We gather expert latents across all ranks to provide a massive 
             # negative pool for every GPU.
             tcb_q = torch.cat([global_ctx[:B], global_ctx_expert[B:]], dim=0)
-            tcb_k = torch.cat([teacher_global, ghost_batch["anchors"]], dim=0)
+            tcb_k = torch.cat([teacher_global_unified, ghost_batch["anchors"]], dim=0)
 
             # [SOTA 2026] Patient-Aware Negative Gating (PANG)
             # [v14.5 FIX] 64-bit SHA-256 Hash Recovery (Smoking Gun #125)
@@ -2114,7 +2126,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
             p_ids_h = []
             for s in p_ids_raw:
                 h_str = hashlib.sha256(str(s).encode()).hexdigest()[:16]
-                p_ids_h.append(int(h_str, 16))
+                # [FIX] Clamp to int64 range: 16 hex chars = 64 bits, but torch.long is signed 63-bit
+                p_ids_h.append(int(h_str, 16) % (2**63))
             p_ids_h = torch.tensor(p_ids_h, device=self.device, dtype=torch.long)
             
             ghost_ids_h = torch.zeros(num_ghosts, dtype=torch.long, device=self.device)

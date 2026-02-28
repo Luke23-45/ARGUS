@@ -104,7 +104,12 @@ class DistributionalValueHead(nn.Module):
             # smears clinical volatility. Sequential processing allows the head to 
             # use the exact latent state at time 't' for V(s_t).
             feat = self.pre_block(x) # [B, T, D]
-            out = self.head(feat).view(*x.shape[:2], self.num_quantiles)
+            # [v28.5 SOTA FIX] Multi-Horizon Sequential View (Structural Alignment)
+            # Rationale: Linear head produces [B, T, P*N]. We must view as [B, T, P, N]
+            # and extract the first horizon (P=0) for immediate state-value estimation.
+            # This fixes the 'shape invalid for input of size 1440000' crash (where 1.44M = B*T*P*N).
+            out_all = self.head(feat).view(*x.shape[:2], self.pred_len, self.num_quantiles)
+            out = out_all[:, :, 0, :] # [B, T, N]
             
         return out
 

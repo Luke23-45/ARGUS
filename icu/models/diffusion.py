@@ -1353,18 +1353,14 @@ class ICUUnifiedPlanner(nn.Module):
             diff_loss = weighted_diff.mean(dim=2)
             
             if self.cfg.use_auxiliary_head and "phase_label" in batch:
-                # [SOTA Upgrade] SequenceAuxHead takes (x_seq, mask, targets)
-                # We use ctx_seq from Encoder (result of TemporalSampler + NTH)
-                # ctx_seq: [B, T', D] 
-                # ctx_mask: [B, T']
-                # Targets: phase_label [B]
-                
-                # Note: SequenceAuxHead returns (logits, loss).
-                # [SOTA 2025] Evidential aux_head returns a Dict
-                # [v13.0 SOTA] Expert-Backbone Sync: Use backbone-refined features
+                # [v2026 DEFINITIVE FIX] Dimension Mismatch (Smoking Gun #812)
+                # backbone_features: [B, T_pred=6, D] (Future sequence from DiffusionActionHead)
+                # ctx_mask: [B, T_hist+1=25] (History mask from AsymmetricLatentBottleneck)
+                # SequenceAuxHead prepends CLS token → mask must match features.
+                # Future sequence is fixed-length and unmasked → pass None.
                 aux_out = self.aux_head(
-                    backbone_features, # Use refined features instead of out_alb["ctx_expert"]
-                    mask=ctx_mask, 
+                    backbone_features,
+                    mask=None,
                     targets=batch["phase_label"].long() if batch["phase_label"] is not None else None,
                     reduction=reduction # Forensic Fix
                 )
@@ -1391,9 +1387,18 @@ class ICUUnifiedPlanner(nn.Module):
             weighted_diff = diff_sq * self.importance_weights[:DYNAMIC_CHANNELS].view(1, 1, -1)
             diff_loss = weighted_diff.mean()
             if self.cfg.use_auxiliary_head and "phase_label" in batch:
+                # [v25.2 FIX] aux_head expects 2D mask [B, T]. 
+                # backbone_features has length T_pred=6. We MUST use ctx_mask (length 6).
+                # Convert ctx_mask to boolean format for the attention layer.
+                # [v2026 SOTA FIX] Dimension Mismatch (Smoking Gun #812)
+                # Rationale: backbone_features represents the *FUTURE* sequence (T_pred=6).
+                # ctx_mask represents the *HISTORY* sequence (T_hist+1 = 25).
+                # NTH Attention concatenates a CLS token, making it 26 vs 7, causing a crash.
+                # Since the Future Sequence (noisy_fut) is fixed length and unmasked during training,
+                # we must pass `None` or a `T_pred` sized mask to `aux_head`.
                 aux_out = self.aux_head(
-                    backbone_features, # Sync refined features
-                    mask=ctx_mask, 
+                    backbone_features, # Sync refined features [B, 6, D]
+                    mask=None,         # [FIX] Future sequence does not use the history mask
                     targets=batch["phase_label"].long(),
                     reduction=reduction # Forensic Fix
                 )
