@@ -708,11 +708,14 @@ class ICUAdvantageCalculator(nn.Module):
         if T > 1:
             # A. Lactate Improvement: Reward DECREASE in lactate
             if lactate_val is not None:
+                lac_delta = lactate_val[:, :-1] - lactate_val[:, 1:] # Positive = Improved (Down)
                 # positive delta = lactate going DOWN (good)
-                lac_delta = lactate_val[:, :-1] - lactate_val[:, 1:]
+                # [v12.2 NASA-TIER] Recovery Discovery Bonus
+                # Rewarding the START of recovery (Momentum) 2x more than staying stable.
                 lac_improvement = torch.clamp(lac_delta, min=0.0, max=2.0)
+                discovery_bonus = (lac_improvement > 0.5).float() * 1.5 
                 # Use mask from previous step to ensure "start" was real
-                rewards[:, 1:] += self.shaping_coef * 2.0 * lac_improvement * get_f_mask(idx_lac)[:, :-1]
+                rewards[:, 1:] += self.shaping_coef * 2.0 * (lac_improvement + discovery_bonus) * get_f_mask(idx_lac)[:, :-1]
 
             # B. MAP Improvement: Reward INCREASE in MAP (if was low)
             if map_val is not None:
@@ -830,7 +833,16 @@ class ICUAdvantageCalculator(nn.Module):
 
         # SAW Advantage: r + gamma * V_teacher(s') - V_student(s)
         # This prevents the student from "cheating" by lowering all values.
-        advantages = rewards + (self.gamma * next_v_teacher * non_terminal) - student_values
+        # [v12.2 NASA-TIER] Discovery-Aware SAW (Smoking Gun #Conservative-Bias)
+        # Rationale: Standard SAW punishes discovery where V_student > V_teacher.
+        # [v14.4 FIX] Pessimism Trap Recovery (#101): Decouple from reward sign. 
+        # Rationale: Allow student to 'believe' in high-value futures even during 
+        # dense clinical penalties (e.g. temporary MAP drop).
+        discovery_mask = (student_values > teacher_values)
+        # Relax the penalty on discovery steps
+        eff_student_v = torch.where(discovery_mask, teacher_values, student_values)
+        
+        advantages = rewards + (self.gamma * next_v_teacher * non_terminal) - eff_student_v
         
         return advantages
 
@@ -871,9 +883,12 @@ class ICUAdvantageCalculator(nn.Module):
                 bootstrap_value = bootstrap_value.unsqueeze(1)
             next_values = torch.cat([values[:, 1:], bootstrap_value], dim=1)
         else:
-            # Default: Bootstrap with last observed value
-            # This is more conservative than zero-padding for sliding windows
-            next_values = torch.cat([values[:, 1:], values[:, -1:]], dim=1)
+            # [v14.1 NASA-TIER] Velocity-Aware GAE (Momentum Recovery)
+            # Rationale: Conservative V(s_T+1) = V(s_T) masks terminal crashes (81% signal loss).
+            # Fix: Use 1st-order linear extrapolation for the sliding window horizon.
+            v_delta = values[:, -1:] - values[:, -2:-1] if T > 1 else torch.zeros_like(values[:, -1:])
+            bootstrap_vel = values[:, -1:] + v_delta
+            next_values = torch.cat([values[:, 1:], bootstrap_vel], dim=1)
         
         # --- 2. Construct Non-Terminal Mask ---
         if dones is not None:
@@ -1023,8 +1038,11 @@ class ICUAdvantageCalculator(nn.Module):
                 else:
                     g_b_sum, g_b_sq_sum, g_b_count = b_sum, b_sq_sum, b_count[0]
                 
-                # Check for updates (Tensor logic)
-                mask_update = g_b_count > 1
+                # [v14.5 NASA-TIER] Finite-Stats DDP Guard (Smoking Gun #170)
+                # Rationale: If a single rank has a NaN/Inf in the batch (rare but possible), 
+                # dist.all_reduce(SUM) poisons the entire global state. 
+                # We only update persistent stats if the global aggregate is healthy.
+                mask_update = (g_b_count > 1) and torch.isfinite(stats).all()
                 if mask_update:
                     curr_mu = g_b_sum / g_b_count
                     curr_var = (g_b_sq_sum / g_b_count) - (curr_mu ** 2)
@@ -1071,37 +1089,30 @@ class ICUAdvantageCalculator(nn.Module):
                 l_count = torch.tensor(0.0, device=advantages.device)
             
             if dist.is_initialized():
-                # [PATCH #3] DDP All-Reduce for Fresh Start
-                # Previously used undefined g_b_count/g_b_sum/g_b_sq_sum (NameError crash).
-                # Fix: All-reduce the locally-computed l_sum/l_sq_sum/l_count.
+                # [v12.1 NASA-TIER] DDP All-Reduce for Population Anchoring
                 stats = torch.stack([l_sum, l_sq_sum, l_count])
                 dist.all_reduce(stats, op=dist.ReduceOp.SUM)
                 g_sum, g_sq, g_count = stats[0], stats[1], stats[2]
 
-                if g_count > 1:
+                if g_count > 100: # [v12.1] Wait for representative sample before initializing
                     mu = g_sum / g_count
                     var = (g_sq / g_count) - (mu ** 2)
                     sigma = torch.sqrt(var.clamp(min=1e-5))
-                else:
-                    mu, sigma = torch.tensor(0.0, device=advantages.device), torch.tensor(1.0, device=advantages.device)
-                
-                # Activate EMA Branch
-                if g_count > 0:
                     self.stats_initialized.fill_(True)
                     self.adv_mean.copy_(mu.detach().reshape(-1)[:1])
                     self.adv_std.copy_(sigma.detach().reshape(-1)[:1])
+                else:
+                    mu, sigma = torch.tensor(0.0, device=advantages.device), torch.tensor(1.0, device=advantages.device)
             else:
-                if l_count > 1:
+                if l_count > 100: # [v12.1] Population Continuity
                     mu = l_sum / l_count
                     var = (l_sq_sum / l_count) - (mu ** 2)
                     sigma = torch.sqrt(var.clamp(min=1e-5))
-                else:
-                    mu, sigma = torch.tensor(0.0, device=advantages.device), torch.tensor(1.0, device=advantages.device)
-                
-                if l_count > 0:
                     self.stats_initialized.fill_(True)
                     self.adv_mean.copy_(mu.detach().reshape(-1)[:1])
                     self.adv_std.copy_(sigma.detach().reshape(-1)[:1])
+                else:
+                    mu, sigma = torch.tensor(0.0, device=advantages.device), torch.tensor(1.0, device=advantages.device)
             
         # [SOTA 2025] Advantage Winsorization (99th Percentile Clipping)
         # Uses the masked distribution to find the true 99th percentile.
@@ -1203,6 +1214,10 @@ class ICUAdvantageCalculator(nn.Module):
         log_weights_global = scaled_adv - g_max_log_w
         log_weights_global = torch.clamp(log_weights_global, min=-20.0, max=5.0)
         
+        # [v14.1 NASA-TIER] Symmetric AWR Weighting (Failure Recovery)
+        # Rationale: log1p(exp(x)) becomes linear for large negative x, suppressing failures by 3000x.
+        # Fix: Exponential weighting for both success (A > 0) and failure (A < 0) 
+        # to ensure the model feels the "heat" of survival-critical crashes.
         weights_local = torch.exp(log_weights_global)
         
         # --- 4. Global Normalization & Sync ---
@@ -1223,9 +1238,9 @@ class ICUAdvantageCalculator(nn.Module):
             
             # [v36.1 FIX] Weight Normalization Factor
             # norm_factor = total_count / global_sum
-            norm_factor = numel_global / (sum_w_global + 1e-8)
+            norm_factor = numel_global / (sum_w_global + 1e-5)
         else:
-            norm_factor = numel_local / (sum_w_local + 1e-8)
+            norm_factor = numel_local / (sum_w_local + 1e-5)
             
         weights = weights_local * norm_factor
         
@@ -1267,11 +1282,11 @@ class ICUAdvantageCalculator(nn.Module):
             # Global Effective Sample Size (ESS)
             # [SOTA BUG FIX] Return            # Global Effective Sample Size (ESS)
             # [SOTA FIX v4.1] FP16 Overflow Prevention Protect g_sum_w squared calculation
-            ess = (g_sum_w.float() ** 2) / (g_sum_w_sq.float() + 1e-8)
+            ess = (g_sum_w.float() ** 2) / (g_sum_w_sq.float() + 1e-5)
             self.ess_buffer.copy_(ess.view_as(self.ess_buffer)) 
             
             # Global Clipping Rate
-            clipped_rate = g_clip_count / (g_numel + 1e-8)
+            clipped_rate = g_clip_count / (g_numel + 1e-5)
             self.clip_rate_buffer.copy_(clipped_rate.view_as(self.clip_rate_buffer))
             
             # [SOTA 2025] Adaptive Dynamics Update (Uses Global Statistics)
@@ -1285,8 +1300,8 @@ class ICUAdvantageCalculator(nn.Module):
                 )
             
             # Weight Entropy (Information Theoretic)
-            probs = weights_clipped / (sum_w + 1e-8)
-            log_probs = torch.log(probs + 1e-8)
+            probs = weights_clipped / (sum_w + 1e-5)
+            log_probs = torch.log(probs + 1e-5)
             entropy = -torch.sum(probs * log_probs) / math.log(numel_local + 1)
             
             hard_clipped_rate = (weights > self.max_weight).float().mean()
@@ -1381,9 +1396,13 @@ class ICUAdvantageCalculator(nn.Module):
                 else:
                     a_valid = advantages.reshape(-1)
                 
-                if a_valid.numel() == 0:
-                    return beta_raw
-                
+                # [v800 SOTA FIX] AWR Bisection DDP Deadlock (Smoking Gun #800)
+                # We CANNOT return early here if DDP is initialized because the bisection
+                # loop below executes 11 `dist.all_reduce` calls. If one rank returns early 
+                # because its batch was empty, but another rank proceeds, the entire cluster 
+                # will permanently deadlock. Empty ranks MUST participate with dummy zeros.
+                is_empty = a_valid.numel() == 0
+
                 # [v4.1.10 SOTA FIX] Dynamic Target ESS (Zero-Sync)
                 batch_size = total_batch_size if total_batch_size is not None else float(a_valid.numel())
                 if self.target_ess > 1.0:
@@ -1393,36 +1412,58 @@ class ICUAdvantageCalculator(nn.Module):
                 
                 target_ess_t = torch.tensor(target_ess_count, device=device, dtype=torch.float32)
                     
-                a_max = a_valid.max()
-                # [SOTA FIX v4.1] FP16 Overflow Prevention: Force float32 for exponential sums
-                a_norm = (a_valid - a_max).float()
+                # [v14.0 NASA-TIER] Global Beta Synchronization
+                # Rationale: Local bisection reaches local optima that diverge across ranks.
+                # Fix: Synchronize Global Max and Global Sums during bisection.
                 
-                def get_ess_at(b):
-                    w = torch.exp(a_norm / (b + 1e-8))
-                    sum_w = w.sum()
-                    return (sum_w * sum_w) / (w.pow(2).sum() + 1e-8)
+                # 1. Synchronize Global Max for stable log-space normalization
+                a_max = a_valid.max().detach() if not is_empty else torch.tensor(-100.0, device=device)
+                if dist.is_initialized():
+                    dist.all_reduce(a_max, op=dist.ReduceOp.MAX)
+                
+                # 2. Global Bisection Solver
+                def get_global_ess_at(b):
+                    # FP32 forced for numerical stability in exp-sum
+                    w = torch.exp((a_valid - a_max).float() / (b + 1e-5))
+                    l_sum_w = w.sum().view(1)
+                    l_sum_w_sq = w.pow(2).sum().view(1)
+                    
+                    if dist.is_initialized():
+                        # [v14.0] Atomic DDP Sync of local exp-sums
+                        stats = torch.stack([l_sum_w[0], l_sum_w_sq[0]])
+                        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                        g_sum_w, g_sum_w_sq = stats[0], stats[1]
+                    else:
+                        g_sum_w, g_sum_w_sq = l_sum_w[0], l_sum_w_sq[0]
+                    
+                    return (g_sum_w * g_sum_w) / (g_sum_w_sq + 1e-5)
                 
                 # Tensorized Control Block
                 low_t = torch.tensor(self.min_beta, device=device, dtype=torch.float32)
                 high_t = torch.tensor(self.max_beta, device=device, dtype=torch.float32)
                 
-                for _ in range(10):
+                for _ in range(10): # 10 iterations = ~0.1% precision in Beta
                     mid_t = (low_t + high_t) / 2.0
-                    ess_val = get_ess_at(mid_t)
+                    ess_val = get_global_ess_at(mid_t)
                     condition = ess_val < target_ess_t
                     low_t = torch.where(condition, mid_t, low_t)
                     high_t = torch.where(condition, high_t, mid_t)
+                # [v14.6 SOTA] Rate-Limited Bisection (Smoking Gun #185)
+                # We limit the rate of change to 10% per step for titanium stability.
+                beta_target = mid_t.detach()
                 
-                curr_beta_t = (low_t + high_t) / 2.0
+                # Rate of change clamping (Log-space move limit)
+                new_beta_clamped = torch.clamp(beta_target, min=self.beta * 0.90, max=self.beta * 1.10)
                 
                 # Smooth update with momentum (Tensorized to prevent sync)
                 if not torch.is_tensor(effective_momentum):
                     effective_momentum = torch.tensor(effective_momentum, device=device)
                 mom = 1.0 - effective_momentum
-                updated_beta = torch.lerp(self.beta, curr_beta_t.to(self.beta.dtype), mom)
+                updated_beta = torch.lerp(self.beta, new_beta_clamped.to(self.beta.dtype), mom)
                 
                 # Apply combined update (Saturation vs Standard is already fused)
-                self.beta.copy_(torch.where(standard_mask.bool(), torch.clamp(updated_beta, min=self.min_beta), self.beta))
+                if not is_empty:
+                    self.beta.copy_(torch.where(standard_mask.bool(), torch.clamp(updated_beta, min=self.min_beta, max=self.max_beta), self.beta))
                 
                 # [v2026 SOTA] Dampened Emergency Recovery (Zero-Sync)
                 # Rationale: Growth factor reduced (2.0 -> 1.1) to preserve selective gradients.

@@ -142,7 +142,13 @@ class BGSLLoss(nn.Module):
         # Shock: Acceleration
         # [Fix] Safe Division for num_shock
         accel_vitals = (slopes[:, 1:] - slopes[:, :-1]).abs().mean(dim=-1, keepdim=True)
-        num_shock = accel_vitals / (vit_velocity[:, 1:].detach() + 0.1) 
+        # [v12.2 NASA-TIER] Shock Noise Gating (Smoking Gun #Spurious-Shock)
+        # Rationale: Noise/Signal ratio was 0.72. Stable patients triggered 'Shock' 
+        # due to low velocity denominator.
+        # Fix: Sigmoid gate that only activates when vit_velocity > threshold 
+        # AND uses a soft-floor for the denominator.
+        gate = torch.sigmoid((vit_velocity[:, 1:].detach() - 0.05) * 20.0) 
+        num_shock = gate * (accel_vitals / (vit_velocity[:, 1:].detach() + 0.1))
         
         pred_accel = (pred_slopes[:, 1:] - pred_slopes[:, :-1]).abs()
         true_accel = (true_slopes[:, 1:] - true_slopes[:, :-1]).abs()

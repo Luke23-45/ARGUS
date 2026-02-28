@@ -155,7 +155,10 @@ class LinearManifoldSentinel:
         # Rationale: Removed if conflict_mask.any() branching and fixed missing 'dot'.
         # dot: Projection of aux gradient onto foundation direction
         dot = (grad_aux * grad_foundation).sum(dim=-1, keepdim=True)
-        mag_fnd = (grad_foundation * grad_foundation).sum() + 1e-8
+        # [Omni-Scan FIX #710] FP16 Epsilon Collapse
+        # Rationale: 1e-8 evaluates to exactly 0.0 in FP16, causing NaN on division.
+        # Upgraded to 1e-5 to guarantee mathematical survival in half-precision.
+        mag_fnd = (grad_foundation * grad_foundation).sum() + 1e-5
         proj = (dot / mag_fnd) * grad_foundation
         
         # PCGrad: proj only if dot < 0 (conflicting)

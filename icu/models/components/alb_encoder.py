@@ -48,13 +48,21 @@ class RotaryEmbedding(nn.Module):
         self.cached_cos = None
         self.cached_sin = None
 
-    def forward(self, x: torch.Tensor, seq_len: int):
+    def forward(self, x: torch.Tensor, seq_len: int, position_ids: Optional[torch.Tensor] = None):
         if self.cached_cos is None or self.cached_cos.size(2) < seq_len or self.cached_cos.device != x.device:
-            t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
+            max_p = position_ids.max().item() + 1 if position_ids is not None else seq_len
+            t = torch.arange(max(seq_len, max_p), device=x.device, dtype=self.inv_freq.dtype)
             freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1) # [seq_len, d_model]
-            self.cached_cos = emb.cos().unsqueeze(0).unsqueeze(0) # [1, 1, T, D]
+            emb = torch.cat((freqs, freqs), dim=-1) # [max_len, d_model]
+            self.cached_cos = emb.cos().unsqueeze(0).unsqueeze(0) # [1, 1, max_len, d_model]
             self.cached_sin = emb.sin().unsqueeze(0).unsqueeze(0)
+            
+        if position_ids is not None:
+             # [B, T] -> [B, 1, T, D]
+             cos = self.cached_cos.squeeze(1).index_select(1, position_ids.reshape(-1)).view(position_ids.shape[0], 1, position_ids.shape[1], -1)
+             sin = self.cached_sin.squeeze(1).index_select(1, position_ids.reshape(-1)).view(position_ids.shape[0], 1, position_ids.shape[1], -1)
+             return cos, sin
+             
         return self.cached_cos[:, :, :seq_len, :], self.cached_sin[:, :, :seq_len, :]
 
 class RoPEMultiheadAttention(nn.Module):
@@ -75,7 +83,7 @@ class RoPEMultiheadAttention(nn.Module):
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat((-x2, x1), dim=-1)
 
-    def forward(self, q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def forward(self, q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, mask: Optional[torch.Tensor] = None, position_ids: Optional[torch.Tensor] = None):
         B, Tq, D = q_in.shape
         Tk = k_in.shape[1]
         
@@ -83,7 +91,7 @@ class RoPEMultiheadAttention(nn.Module):
         k = self.k_proj(k_in).reshape(B, Tk, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(v_in).reshape(B, Tk, self.n_heads, self.head_dim).transpose(1, 2)
         
-        cos, sin = self.rope(q, Tq)
+        cos, sin = self.rope(q, Tq, position_ids=position_ids)
         q = (q * cos) + (self._rotate_half(q) * sin)
         k = (k * cos) + (self._rotate_half(k) * sin)
         
@@ -176,7 +184,16 @@ class AsymmetricLatentBottleneck(nn.Module):
         # We allow the Expert Manifold to self-organize without being forced
         # to align with the Smooth Planner manifold.
         # ctx_sharp has length T+1 (Static + Temporal)
-        ctx_synced = self.sync(ctx_sharp, ctx_sharp, ctx_sharp, mask=full_mask) 
+        # [v13.0 Titanium Bedrock] Temporal Realignment (Expert Sync)
+        # Rationale: Static token shifts Vitals 0 to Index 1.
+        # Fix: Sync with clinical position_ids [0, 0, 1, ..., T-1].
+        B, T_full, _ = ctx_sharp.shape
+        T_vitals = T_full - 1
+        vitals_pos = torch.arange(T_vitals, device=ctx_sharp.device)
+        static_pos = torch.zeros(1, device=ctx_sharp.device, dtype=torch.long)
+        position_ids = torch.cat([static_pos, vitals_pos], dim=0).unsqueeze(0).expand(B, -1)
+        
+        ctx_synced = self.sync(ctx_sharp, ctx_sharp, ctx_sharp, mask=full_mask, position_ids=position_ids) 
         ctx_expert = self.expert_proj(ctx_synced)
         
         if full_mask is not None:

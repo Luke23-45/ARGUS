@@ -190,7 +190,8 @@ class TimeAttentionPooling(nn.Module):
         # Learnable query vector (the "What to summarize" expert)
         self.summary_query = nn.Parameter(torch.randn(1, 1, d_model))
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.norm = nn.LayerNorm(d_model)
+        # [v14.5 SOTA] Scale-Aware Pooled Norm (Deep Hijacking Fix #111)
+        self.norm = RMSNorm(d_model, eps=0.5)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -273,11 +274,18 @@ class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.scale = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        norm_x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return norm_x * self.weight
+        # [v14.5 SOTA] Precision-Stable RMS (NASA-Tier)
+        # Rationale: Large activation spikes in FP16 can causing overflow in x.pow(2).
+        # We perform the norm extraction in float32 for safety.
+        # eps=0.5 ensures clinical suppression is preserved (Smoking Gun #97).
+        orig_dtype = x.dtype
+        x_f32 = x.float()
+        variance = x_f32.pow(2).mean(-1, keepdim=True)
+        x_norm = x_f32 * torch.rsqrt(variance + self.eps)
+        return (self.scale * x_norm).to(orig_dtype)
 
 
 class SwiGLU(nn.Module):
@@ -382,7 +390,8 @@ def robust_flash_attention(
     cos_q: Optional[torch.Tensor] = None, sin_q: Optional[torch.Tensor] = None,
     cos_k: Optional[torch.Tensor] = None, sin_k: Optional[torch.Tensor] = None,
     # Masking
-    key_padding_mask: Optional[torch.Tensor] = None  # [B, L_k] True=Pad
+    key_padding_mask: Optional[torch.Tensor] = None,  # [B, L_k] True=Pad
+    is_causal: bool = False
 ) -> torch.Tensor:
     """
     Robust SDPA Wrapper. Handles RoPE injection + Padding Masks correctly.
@@ -426,12 +435,34 @@ def robust_flash_attention(
         # Note: Adding explicit bias may disable Flash kernel in some versions,
         # but correctness > speed for safety-critical applications
 
+    # [v14.6 SOTA] Causal Mask Injection
+    # Rationale: For time-series diffusion, x_t should ideally not attend to x_>t
+    # during denoising to learn true causal dynamics (Smoking Gun #190).
+    if is_causal:
+        # Create causal mask (0 for keep, -inf for mask)
+        causal_mask = torch.triu(torch.full((L_q, L_k), float("-inf"), device=q.device), diagonal=1)
+        if attn_bias is not None:
+            attn_bias = attn_bias + causal_mask.view(1, 1, L_q, L_k)
+        else:
+            attn_bias = causal_mask.view(1, 1, L_q, L_k)
+
+    # [v14.5 SOTA] Sink-Aware Attention (Smoking Gun #81)
+    # Rationale: If a row is fully masked, Softmax(-inf) yields NaN. 
+    # We bypass these "empty rows" to preserve the residual identity.
+    if key_padding_mask is not None:
+        all_masked = key_padding_mask.unsqueeze(1).unsqueeze(2).expand(B, n_heads, L_q, L_k).all(dim=-1, keepdim=True)
+    
     # 3. Scaled Dot Product Attention
     out = F.scaled_dot_product_attention(
         q, k, v, 
         attn_mask=attn_bias, 
         dropout_p=dropout if dropout > 0 else 0.0
     )
+    
+    # Re-apply sink mask + NaN guard
+    if key_padding_mask is not None:
+        out = out.masked_fill(all_masked, 0.0)
+    out = out.nan_to_num(0.0)
 
     # Reshape back: [B, H, L, D_h] -> [B, L, D]
     return out.transpose(1, 2).contiguous().view(B, L_q, D)
@@ -662,10 +693,18 @@ class TemporalFusionEncoder(nn.Module):
             valid_seq = torch.zeros(B, T, dtype=torch.bool, device=x.device)
             full_mask = torch.cat([valid_static, valid_seq], dim=1)
 
+        # 4c. [v13.0 Titanium Bedrock] Temporal Realignment (Smoking Gun #66)
+        # Rationale: Static token at Index 0 shifts Vitals 0 to Index 1 (RoPE 1).
+        # Fix: Assign Index 0 to both Static AND Vitals 0 to preserve clinical Time 0.
+        # Sequence: [Static(0), Vitals_0(0), Vitals_1(1), ..., Vitals_T-1(T-1)]
+        vitals_pos = torch.arange(T, device=x.device)
+        static_pos = torch.zeros(1, device=x.device, dtype=torch.long)
+        position_ids = torch.cat([static_pos, vitals_pos], dim=0).unsqueeze(0).expand(B, -1)
+        
         # 5. Encoding (NTH-Attention)
         for layer in self.layers:
-            # NTHEncoderBlock signature: (x, mask=None)
-            x = layer(x, mask=full_mask) 
+            # NTHEncoderBlock signature: (x, mask=None, position_ids=None)
+            x = layer(x, mask=full_mask, position_ids=position_ids) 
             # Note: We ignore 'cos', 'sin' here as NTHEncoderBlock has internal RoPE.
             # If we wanted to use global RoPE, we'd need to modify NTHEncoder.
             
@@ -773,7 +812,8 @@ class DiTBlock1D(nn.Module):
         qkv = self.qkv_self(h).chunk(3, dim=-1)
         attn = robust_flash_attention(
             qkv[0], qkv[1], qkv[2], self.cfg.n_heads, self.cfg.dropout,
-            cos_q=cos_q, sin_q=sin_q, cos_k=cos_q, sin_k=sin_q
+            cos_q=cos_q, sin_q=sin_q, cos_k=cos_q, sin_k=sin_q,
+            is_causal=True # [v14.6 SOTA FIX] Temporal Causality
         )
         x = x + self.drop_path(self.dropout(gate_msa.unsqueeze(1) * self.proj_self(attn)))
         
@@ -909,7 +949,10 @@ class DiffusionActionHead(nn.Module):
                     cos_fut, sin_fut, cos_hist, sin_hist, ctx_mask
                 )
         
-        return self.out_head(self.final_norm(x))
+        final_features = self.final_norm(x)
+        pred_noise = self.out_head(final_features)
+        
+        return pred_noise, final_features
 
 
 # =============================================================================
@@ -931,6 +974,10 @@ class NoiseScheduler(nn.Module):
         # Squared Cosine Cap v2 Schedule (OpenAI Improved DDPM)
         steps = torch.arange(timesteps + 1, dtype=torch.float64) / timesteps
         alpha_bar = torch.cos((steps + 0.008) / 1.008 * math.pi / 2) ** 2
+        # [v13.5 SOTA FIX] Terminal SNR Stabilization (Smoking Gun #103)
+        # Rationale: true alpha=0 causes 1/0 explosion in x0 reconstruction.
+        # Adding 1e-4 epsilon preserves the noise floor while maintaining numerical stability.
+        alpha_bar = (alpha_bar + 1e-4) / (1.0 + 1e-4) 
         betas = torch.minimum(1 - alpha_bar[1:] / alpha_bar[:-1], torch.tensor(0.999))
         betas = betas.float()
         
@@ -1204,7 +1251,7 @@ class ICUUnifiedPlanner(nn.Module):
         norm_ts, norm_static = self.normalizer.normalize(x_ts, x_static)
         return norm_ts, norm_static
 
-    def unnormalize(self, x: torch.Tensor) -> torch.Tensor:
+    def denormalize(self, x: torch.Tensor) -> torch.Tensor:
         """Convert model output back to clinical units."""
         return self.normalizer.denormalize(x)
 
@@ -1273,7 +1320,8 @@ class ICUUnifiedPlanner(nn.Module):
             if self.training and (roll < 0.5):
                 with torch.no_grad():
                     # Pass 1: "Guess" noisy epsilon
-                    guess_eps = self.backbone(
+                    # [v13.0] Synchronized Backbone Pass
+                    guess_eps, _ = self.backbone(
                         noisy_fut, t, ctx_seq, global_ctx, ctx_mask, self_cond=self_cond_tensor
                     )
                     # Reconstruct x0 estimate
@@ -1288,7 +1336,7 @@ class ICUUnifiedPlanner(nn.Module):
                     self_cond_tensor = self.governance(guess_x0).detach()
 
         # Pass 2: Final Denoising with Conditioning
-        pred_noise = self.backbone(noisy_fut, t, ctx_seq, global_ctx, ctx_mask, self_cond=self_cond_tensor)
+        pred_noise, backbone_features = self.backbone(noisy_fut, t, ctx_seq, global_ctx, ctx_mask, self_cond=self_cond_tensor)
         
         # 4. Loss Computation
         if reduction == 'none':
@@ -1313,8 +1361,9 @@ class ICUUnifiedPlanner(nn.Module):
                 
                 # Note: SequenceAuxHead returns (logits, loss).
                 # [SOTA 2025] Evidential aux_head returns a Dict
+                # [v13.0 SOTA] Expert-Backbone Sync: Use backbone-refined features
                 aux_out = self.aux_head(
-                    out_alb["ctx_expert"], 
+                    backbone_features, # Use refined features instead of out_alb["ctx_expert"]
                     mask=ctx_mask, 
                     targets=batch["phase_label"].long() if batch["phase_label"] is not None else None,
                     reduction=reduction # Forensic Fix
@@ -1343,7 +1392,7 @@ class ICUUnifiedPlanner(nn.Module):
             diff_loss = weighted_diff.mean()
             if self.cfg.use_auxiliary_head and "phase_label" in batch:
                 aux_out = self.aux_head(
-                    out_alb["ctx_expert"], 
+                    backbone_features, # Sync refined features
                     mask=ctx_mask, 
                     targets=batch["phase_label"].long(),
                     reduction=reduction # Forensic Fix
@@ -1358,9 +1407,11 @@ class ICUUnifiedPlanner(nn.Module):
                 aux_loss = torch.tensor(0.0, device=past.device)
                 uncertainty = torch.tensor(0.0, device=past.device)
             
-        # [v4.1 SOTA] Implicit Distributional Critic Pass
+        # [v13.5 SOTA] Sequential Context Resolution
+        # Rationale: Replaced global_ctx (pooled bottleneck) with backbone_features (refined sequence).
+        # This restores the temporal resolution required for GAE/SAW bootstrapping.
         # pred_val shape: [B, T_pred, N_quantiles]
-        pred_val = self.value_head(global_ctx)
+        pred_val = self.value_head(backbone_features)
         value_loss = torch.tensor(0.0, device=past.device)
         
         if "clinical_reward" in batch:
@@ -1563,4 +1614,4 @@ class ICUUnifiedPlanner(nn.Module):
             x_t = self.governance(x_t).detach()
 
         # Final denormalization with one last safety check
-        return self.unnormalize(self.governance(x_t))
+        return self.denormalize(self.governance(x_t))

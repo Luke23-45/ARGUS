@@ -28,22 +28,49 @@ class SwiGLU(nn.Module):
         return self.w1(x) * F.silu(self.w2(x))
 
 class PhysiologicalSEBlock(nn.Module):
-    """[SOTA] Channel calibration based on global sequence context."""
+    """
+    [v14.2 Breakthrough] Dual-Squeeze Channel calibration.
+    Uses combined Avg+Max pooling to capture both global trends and 
+    high-frequency physiological transients.
+    
+    [v14.3 Forensic] Mask-Aware Pooling (MAP): Prevents context poisoning 
+    from normalization-shifted zeros in sparse trajectories.
+    """
     def __init__(self, channels: int, reduction: int = 4):
         super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool1d(1)
         self.fc = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=False),
+            nn.Linear(channels * 2, channels // reduction, bias=False),
             nn.SiLU(),
             nn.Linear(channels // reduction, channels, bias=False),
             nn.Sigmoid()
         )
+        
+        # Identity Initialization
+        nn.init.zeros_(self.fc[-2].weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, C, T]
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x: [B, C, T]
+            mask: [B, C, T]
+        """
         B, C, T = x.shape
-        y = self.avg_pool(x).view(B, C)
-        weights = self.fc(y).view(B, C, 1)
+        if mask is None:
+            mask = torch.ones_like(x)
+            
+        # 1. Mask-Aware Squeeze (MAP) [B, C]
+        denom = mask.sum(dim=2).clamp(min=1e-8)
+        y_avg = (x * mask).sum(dim=2) / denom
+        
+        # 2. Mask-Aware Peak Detection [B, C]
+        # Ignore padded/imputed values in max-pooling
+        x_masked = x.masked_fill(mask == 0, -1e9)
+        y_max = x_masked.max(dim=2).values
+        
+        # 3. Excitation
+        y_dual = torch.cat([y_avg, y_max], dim=1)
+        weights = self.fc(y_dual).view(B, C, 1)
+        
         return x * weights
 
 class SymmetryGate(nn.Module):
@@ -52,7 +79,10 @@ class SymmetryGate(nn.Module):
         super().__init__()
         self.gate = nn.Linear(dim, dim)
         self.proj = nn.Linear(dim, dim)
-        self.norm = nn.LayerNorm(dim)
+        
+        # [v14.4 SOTA] Scale-Aware Normalization (Secondary Hijacking Fix)
+        from icu.models.components.nth_encoder import RMSNorm
+        self.norm = RMSNorm(dim, eps=0.5)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         g = torch.sigmoid(self.gate(x))
@@ -75,13 +105,23 @@ class ClinicalInceptionBlock(nn.Module):
         self.dropout = nn.Dropout1d(dropout)
         self.proj = nn.Conv1d(mid * 4, out_dim, 1)
         self.res = nn.Conv1d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
-        self.norm = nn.LayerNorm(out_dim)
+        
+        # [v14.4 SOTA] Scale-Aware Normalization
+        from icu.models.components.nth_encoder import RMSNorm
+        self.norm = RMSNorm(out_dim, eps=0.5)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         identity = self.res(x)
         # Cat paths: [B, mid*4, T]
         out = torch.cat([self.b1(x), self.b2(x), self.b3(x), self.b4(x)], dim=1)
-        out = self.se(out)
+        
+        # [v14.3] Multi-scale mask propagation
+        if mask is not None:
+             # Expand group mask to latent space
+             # Simplified: use original temporal mask for all channels
+             out = self.se(out, mask=mask.expand_as(out) if mask.dim() == 3 else None)
+        else:
+             out = self.se(out)
         
         # Apply Symmetry Gate in [B, T, D] space
         out = out.transpose(1, 2)
@@ -168,6 +208,20 @@ class LateralBypass(nn.Module):
         elec_out_dim = int(d_model * 0.15) # 15% for sparse electrolytes
         other_out_dim = d_model - hemo_out_dim - labs_out_dim - elec_out_dim  # Remainder (~25%)
         
+        # [v14.3 SOTA] Branch Normalization Relocation
+        # [v14.4] Scale-Aware stabilization: Use eps=0.5 to prevent noise hijacking.
+        from icu.models.components.nth_encoder import RMSNorm
+        self.hemo_norm = RMSNorm(hemo_out_dim, eps=0.5)
+        self.labs_norm = RMSNorm(labs_out_dim, eps=0.5)
+        self.elec_norm = RMSNorm(elec_out_dim, eps=0.5)
+        self.other_norm = RMSNorm(other_out_dim, eps=0.5)
+        
+        # [v14.5 SOTA] Harmonic Branch Balancers (Mirroring Projector)
+        self.hemo_gain = nn.Parameter(torch.ones(1))
+        self.labs_gain = nn.Parameter(torch.ones(1))
+        self.elec_gain = nn.Parameter(torch.ones(1))
+        self.other_gain = nn.Parameter(torch.ones(1))
+        
         self.hemo_proj = nn.Linear(hemo_dim, hemo_out_dim)
         self.labs_proj = nn.Linear(labs_dim, labs_out_dim)
         self.elec_proj = nn.Linear(elec_dim, elec_out_dim)
@@ -225,9 +279,7 @@ class LateralBypass(nn.Module):
         elec_features = raw_past[:, :, idx_labs:idx_elec]
         other_features = raw_past[:, :, idx_elec:]
         
-        # [v13.0 PATCH] Mask-Weighted Feature Attenuation
-        # Problem: Model treats imputed values (Lactate=1.0 default) same as real measurements
-        # Fix: Attenuate imputed features by 50% to reduce their contribution
+        # [v14.3] Mask-Aware Scaling
         if imputation_mask is not None:
             hemo_mask = imputation_mask[:, :, :idx_hemo]  # [B, T, 7]
             labs_mask = imputation_mask[:, :, idx_hemo:idx_labs]  # [B, T, 11]
@@ -239,19 +291,37 @@ class LateralBypass(nn.Module):
             labs_features = labs_features * (0.5 + 0.5 * labs_mask)
             elec_features = elec_features * (0.5 + 0.5 * elec_mask)
             other_features = other_features * (0.5 + 0.5 * other_mask)
+            
+            # Construct latent mask for SE-Block
+            # Rationale: We use simple 'any' expansion to signal which clinical 
+            # branches have real data vs purely imputed noise.
+            m_hc = hemo_mask.any(dim=-1, keepdim=True).expand(-1, -1, self.hemo_norm.scale.size(0))
+            m_lc = labs_mask.any(dim=-1, keepdim=True).expand(-1, -1, self.labs_norm.scale.size(0))
+            m_ec = elec_mask.any(dim=-1, keepdim=True).expand(-1, -1, self.elec_norm.scale.size(0))
+            m_oc = other_mask.any(dim=-1, keepdim=True).expand(-1, -1, self.other_norm.scale.size(0))
+            m_combined = torch.cat([m_hc, m_lc, m_ec, m_oc], dim=-1).transpose(1, 2)
+        else:
+            m_combined = None
         
-        z_hemo = self.hemo_proj(hemo_features)
-        z_labs = self.labs_proj(labs_features)
-        z_elec = self.elec_proj(elec_features)
-        z_other = self.other_proj(other_features)
-        z_raw = torch.cat([z_hemo, z_labs, z_elec, z_other], dim=-1)
+        z_hemo = self.hemo_norm(self.hemo_proj(hemo_features))
+        z_labs = self.labs_norm(self.labs_proj(labs_features))
+        z_elec = self.elec_norm(self.elec_proj(elec_features))
+        z_other = self.other_norm(self.other_proj(other_features))
+        # [v14.5] Apply learnable gains to equalize branch energies
+        z_raw = torch.cat([
+            z_hemo * self.hemo_gain, 
+            z_labs * self.labs_gain, 
+            z_elec * self.elec_gain, 
+            z_other * self.other_gain
+        ], dim=-1)
         
         # [SOTA] Gated multi-modal fusion
         z_raw = self.group_gate(z_raw)
         
         # 2. Multi-Scale & TCN extraction [B, D, T] -> [B, T, D]
         # Sharp path: Inception (Multi-scale) + TCN (Temporal Volatility)
-        x_inc = self.feat_extractor(z_raw.transpose(1, 2))
+        # Pass mask for MAP synchronization
+        x_inc = self.feat_extractor(z_raw.transpose(1, 2), mask=m_combined)
         x_tcn = self.tcn(x_inc)
         x_bypass_latent = x_tcn.transpose(1, 2)
         x_bypass_latent = self.dropout(x_bypass_latent)

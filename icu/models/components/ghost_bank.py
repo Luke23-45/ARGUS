@@ -361,7 +361,12 @@ class SepsisGhostBank(nn.Module):
              encoder.eval()
         
         # [v42.1 SOTA Optimization] Single-Source Truth
-        # Only Rank 0 performs the refresh. Others wait for broadcast.
+        # Rationale: Only Rank 0 performs the refresh. Others wait for broadcast.
+        # [v14.2] DDP Barrier: Ensure all ranks are synchronized before Rank 0 starts
+        # to prevent reading partially updated buffers.
+        if torch.distributed.is_initialized():
+             torch.distributed.barrier()
+        
         is_rank_zero = (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0)
         
         if is_rank_zero:
@@ -399,9 +404,11 @@ class SepsisGhostBank(nn.Module):
                     # the 24+ iterations, which can cause ~500MB RAM spike.
                     del new_anchors, new_norm, v_batch, m_batch
             finally:
-                # Restore training state
-                if was_training is not None:
-                    encoder.train(was_training)
+                pass
+        
+        # Restore training state (All Ranks must do this!)
+        if was_training is not None:
+            encoder.train(was_training)
                 
         # Re-initialize prototype to match new latent space
         if self.size > 0:
@@ -501,7 +508,8 @@ class SepsisGhostBank(nn.Module):
                 lam = dist.sample((num_ghosts, 1))
             
             out["anchors"] = lam * self.latent_anchors[idx1] + (1 - lam) * self.latent_anchors[idx2]
-            out["labels"] = lam.squeeze(-1) * self.raw_labels[idx1].float() + (1 - lam).squeeze(-1) * self.raw_labels[idx2].float()
+            # [NASA-Tier v1.2 FIX] Avoid [N, 1] x [N] -> [N, N] broadcasting catastrophe (Smoking Gun #5)
+            out["labels"] = lam.flatten() * self.raw_labels[idx1].float() + (1 - lam).flatten() * self.raw_labels[idx2].float()
             out["uncertainties"] = lam * self.uncertainties[idx1] + (1 - lam) * self.uncertainties[idx2]
 
         # Soft-Align sampled anchors toward the current prototype EMA

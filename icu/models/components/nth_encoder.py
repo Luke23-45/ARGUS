@@ -48,7 +48,9 @@ class GatedResidualNetwork(nn.Module):
         self.linear2 = nn.Linear(hidden_dim, d_model)
         self.dropout = nn.Dropout(dropout)
         self.glu = SwiGLU(d_model, d_model) # Upgraded to SwiGLU
-        self.norm = nn.LayerNorm(d_model)
+        
+        # [v14.4 SOTA] Scale-Aware Normalization (Deep Hijacking Fix #111)
+        self.norm = RMSNorm(d_model, eps=0.5)
 
     def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         # 1. Processing
@@ -67,19 +69,30 @@ class GatedResidualNetwork(nn.Module):
 class RotaryEmbedding(nn.Module):
     def __init__(self, d_model: int, max_seq_len: int = 5000):
         super().__init__()
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, d_model, 2).float() / d_model))
+        # [v14.0 SOTA] High-Resolution RoPE base (10k -> 500)
+        # Rationale: Standard 10k base is for long-context LLMs. 
+        # For short clinical sequences (T=24), 500 provides much crisper temporal resolution.
+        inv_freq = 1.0 / (500 ** (torch.arange(0, d_model, 2).float() / d_model))
         self.register_buffer("inv_freq", inv_freq)
         self.max_seq_len = max_seq_len
         self.cached_cos = None
         self.cached_sin = None
 
-    def forward(self, x: torch.Tensor, seq_len: int):
+    def forward(self, x: torch.Tensor, seq_len: int, position_ids: Optional[torch.Tensor] = None):
         if self.cached_cos is None or self.cached_cos.size(2) < seq_len:
-            t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
+            # [SOTA FIX] Dynamic indexing support
+            max_p = position_ids.max().item() + 1 if position_ids is not None else seq_len
+            t = torch.arange(max(seq_len, max_p), device=x.device, dtype=self.inv_freq.dtype)
             freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1) # [seq_len, d_model]
-            self.cached_cos = emb.cos().unsqueeze(0).unsqueeze(0) # [1, 1, seq_len, d_model]
+            emb = torch.cat((freqs, freqs), dim=-1) # [max_len, d_model]
+            self.cached_cos = emb.cos().unsqueeze(0).unsqueeze(0) # [1, 1, max_len, d_model]
             self.cached_sin = emb.sin().unsqueeze(0).unsqueeze(0)
+            
+        if position_ids is not None:
+            # [B, T] -> [B, 1, T, D]
+            cos = self.cached_cos.squeeze(1).index_select(1, position_ids.reshape(-1)).view(position_ids.shape[0], 1, position_ids.shape[1], -1)
+            sin = self.cached_sin.squeeze(1).index_select(1, position_ids.reshape(-1)).view(position_ids.shape[0], 1, position_ids.shape[1], -1)
+            return cos, sin
             
         return self.cached_cos[:, :, :seq_len, :], self.cached_sin[:, :, :seq_len, :]
 
@@ -119,7 +132,8 @@ class RoPEMultiheadAttention(nn.Module):
         
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, 
                 key_padding_mask: Optional[torch.Tensor] = None, 
-                attn_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+                attn_mask: Optional[torch.Tensor] = None,
+                position_ids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         
         B, T, _ = query.shape
         
@@ -134,7 +148,7 @@ class RoPEMultiheadAttention(nn.Module):
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         
         # RoPE
-        cos, sin = self.rope(q, T)
+        cos, sin = self.rope(q, T, position_ids=position_ids)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
         
         # Attention
@@ -149,13 +163,23 @@ class RoPEMultiheadAttention(nn.Module):
         if key_padding_mask is not None:
             # [SOTA FIX 1] Strict boolean mask expansion
             mask_expanded = key_padding_mask.unsqueeze(1).unsqueeze(2).bool()
+            
+            # [PHASE 1.5 SOTA] Attention Zero-Sink (Smoking Gun #81)
+            # Rationale: If all keys are masked, Softmax(-inf) yields NaN.
+            # We must detect 'Empty Rows' and bypass them to preserve the residual signal.
+            all_masked = mask_expanded.all(dim=-1, keepdim=True)
+            
             # [SOTA FIX 2] Use -torch.inf for exact 0.0 softmax probability
             scores = scores.masked_fill(mask_expanded, -torch.inf)
             
         weights = F.softmax(scores, dim=-1)
         
-        # [SOTA FIX 3] Iron Dome: If an entire row is masked, Softmax(-inf) yields NaN.
-        # We MUST flush these NaNs to 0.0 to prevent the V-projection from corrupting.
+        # [PHASE 1.5 SOTA] Sink-Aware Re-weighting
+        # If a row was fully masked, the attention output should be 0.0 (no mixing)
+        if key_padding_mask is not None:
+            weights = weights.masked_fill(all_masked, 0.0)
+            
+        # [SOTA FIX 3] Atomic NaN Guard
         weights = weights.nan_to_num(0.0)
         
         output = torch.matmul(weights, v) # [B, H, T, D_h]
@@ -182,9 +206,11 @@ class NTHAttention(nn.Module):
         
         self.local_window = local_window
         self.out_proj = nn.Linear(d_model, d_model)
-        self.norm = nn.LayerNorm(d_model)
+        
+        # [v14.4 SOTA] Scale-Aware Normalization (Deep Hijacking Fix #111)
+        self.norm = RMSNorm(d_model, eps=0.5)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, position_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         residual = x
         B, T, D = x.shape
         
@@ -203,11 +229,12 @@ class NTHAttention(nn.Module):
         local_mask_float = local_mask_float.masked_fill(local_mask_2d, -1e9)
         
         # Local Branch
-        h_local, _ = self.local_attn(x, x, x, key_padding_mask=mask, attn_mask=local_mask_float)
+        # Pass position_ids to the RoPE-MHA
+        h_local, _ = self.local_attn(x, x, x, key_padding_mask=mask, attn_mask=local_mask_float, position_ids=position_ids)
         
         # --- 2. Global Trend Attention ---
         # Global Branch (Full Context, no extra mask)
-        h_global, _ = self.global_attn(x, x, x, key_padding_mask=mask)
+        h_global, _ = self.global_attn(x, x, x, key_padding_mask=mask, position_ids=position_ids)
         
         # --- 3. Fuse ---
         h_fused = (h_local + h_global) / 2.0
@@ -225,10 +252,15 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.scale = nn.Parameter(torch.ones(d_model))
 
-    def forward(self, x):
-        norm_x = x.norm(2, dim=-1, keepdim=True)
-        rms_x = norm_x * (x.size(-1) ** -0.5)
-        return self.scale * x / (rms_x + self.eps)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [v14.5 SOTA] Precision-Stable RMS (NASA-Tier)
+        # Rationale: Large activation spikes in FP16 can causing overflow in x.pow(2).
+        # We perform the norm extraction in float32 for safety.
+        orig_dtype = x.dtype
+        x_f32 = x.float()
+        variance = x_f32.pow(2).mean(-1, keepdim=True)
+        x_norm = x_f32 * torch.rsqrt(variance + self.eps)
+        return (self.scale * x_norm).to(orig_dtype)
 
 class SotaTransformerBlock(nn.Module):
     """
@@ -247,10 +279,10 @@ class SotaTransformerBlock(nn.Module):
         self.dropout = nn.Dropout(0.1)
         self.drop_path = DropPath(drop_path_prob) if drop_path_prob > 0 else nn.Identity()
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, position_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         # 1. Pre-Norm Attention
         x_norm = self.norm1(x)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm, key_padding_mask=mask)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm, key_padding_mask=mask, position_ids=position_ids)
         x = x + self.drop_path(self.dropout(attn_out))
         
         # 2. Pre-Norm FFN (SwiGLU)
@@ -274,11 +306,11 @@ class NTHEncoderBlock(nn.Module):
         # [v166.0 SOTA FIX] Removed unused norm. Sub-blocks have internal norms.
         # self.norm = nn.LayerNorm(d_model) <-- DEAD PARAM REMOVED
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, position_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         # 1. Feature Processing (Residual handled inside GRN, but we add DropPath for layer-level)
         x = x + self.drop_path(self.grn(x) - x)
         
         # 2. Temporal Mixing
-        x = x + self.drop_path(self.attn(x, mask=mask) - x)
+        x = x + self.drop_path(self.attn(x, mask=mask, position_ids=position_ids) - x)
         
         return x

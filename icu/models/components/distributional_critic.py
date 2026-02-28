@@ -19,6 +19,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple, Optional, Union
+import math
+
+class RMSNorm(nn.Module):
+    """
+    [v14.5 SOTA] Precision-Stable RMS (NASA-Tier)
+    """
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x_f32 = x.float()
+        variance = x_f32.pow(2).mean(-1, keepdim=True)
+        x_norm = x_f32 * torch.rsqrt(variance + self.eps)
+        return (self.weight * x_norm).to(orig_dtype)
 
 class GatedValueBlock(nn.Module):
     """
@@ -32,7 +49,8 @@ class GatedValueBlock(nn.Module):
             nn.GLU(dim=-1),
             nn.Dropout(dropout)
         )
-        self.ln = nn.LayerNorm(d_model)
+        # [v14.5 SOTA] Scale-Aware Norm (Deep Hijacking Fix #111)
+        self.ln = RMSNorm(d_model, eps=0.5)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.ln(x + self.net(x))
@@ -71,21 +89,23 @@ class DistributionalValueHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: [Batch, D_model] Global context
+            x: [Batch, D_model] or [Batch, T, D_model]
         Returns:
             quantiles: [Batch, T_pred, NumQuantiles]
         """
-        B = x.shape[0]
-        feat = self.pre_block(x)
-        out = self.head(feat).view(B, self.pred_len, self.num_quantiles)
-        
-        # [ry.md FIX 1] Removed Forward Sorting
-        # Rationale: torch.sort enforces monotonicity mechanically but neurotoxically —
-        # it scrambles neuron-to-quantile assignments across batches, AND it makes the
-        # IQLQuantileLoss.crossing_penalty permanently zero (dead code), removing the only 
-        # gradient signal that teaches neurons their individual quantile roles.
-        # Without sort, the quantile regression loss + crossing_penalty jointly enforce
-        # monotonicity through gradient descent, allowing stable neuron specialization.
+        if x.dim() == 2:
+            # Global Context case (Legacy/Summary)
+            B = x.shape[0]
+            feat = self.pre_block(x)
+            out = self.head(feat).view(B, self.pred_len, self.num_quantiles)
+        else:
+            # [v13.5] Sequential Context case (Restores Temporal Resolution)
+            # Rationale: Predicting a sequence from a single summary vector (bottleneck) 
+            # smears clinical volatility. Sequential processing allows the head to 
+            # use the exact latent state at time 't' for V(s_t).
+            feat = self.pre_block(x) # [B, T, D]
+            out = self.head(feat).view(*x.shape[:2], self.num_quantiles)
+            
         return out
 
     def get_cvar(self, quantiles: torch.Tensor, alpha: float = 0.1) -> torch.Tensor:

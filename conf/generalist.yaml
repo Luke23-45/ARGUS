@@ -9,7 +9,7 @@ defaults:
 run_name: "gen_v1_${now:%Y-%m-%d_%H-%M-%S}"
 seed: 42
 compile_model: false
-save_checkpoints: true
+save_checkpoints: false
 debug_save_epochs: []     # [DEBUG] List of epochs to save snapshots (e.g., [5, 10, 50])
 
 # --- Directory Paths ---
@@ -17,7 +17,7 @@ output_dir: "/content/icu/phase1/"           # Main output directory
 checkpoint_dir: "/content/icu/checkpoints/"  # [OK] Large files, infrequent writes
 log_dir: "/content/icu/logs/"         # [CRITICAL] Must be LOCAL for WandB (High freq IO)
 backup_dir: null                        # Remote/backup directory
-resume_from: "/content/drive/MyDrive/pda/icu/checkpoints/gen_v1_2026-02-25_08-27-55/checkpoints/icu_model-epoch=01-val/clinical_auroc=0.807.ckpt"
+resume_from: null
 
 model:
   input_dim: 28
@@ -79,27 +79,27 @@ train:
   horizon_ramp: 40
 
   # Debug Mode (Smoke Test)
-  debug_run: false #true
+  debug_run: true #true
   debug_limit_batches: 200
   debug_limit_val: 500
 
   
-  # AWR (Advantage Weighted Regression) v2.0
-  awr_beta: 1.0               # [v38.0] Selection Smoking Gun Smoothing (Start higher)
+  # AWR (Advantage Weighted Regression) v2.1 [NASA-Tier v12.1 Patch]
+  awr_beta: 1.0               
   awr_max_weight: 20.0        
-  awr_lambda: 0.95            # [SOTA] GAE-Lambda for credit assignment
-  awr_gamma: 0.99             # [v25.9 SOTA] Standardized for clinical horizons
+  awr_lambda: 0.95            
+  awr_gamma: 0.99             
   adaptive_beta: true
   adaptive_clipping: true
-  target_ess: 0.30            # [v1.5 SOTA] Target 30% Batch Selection (Relaxed from 12%)
-  awr_momentum: 0.98          # [v38.0] Selection Smoothing Momentum (was 0.95)
-  beta_min: 0.5               # [v38.0] Selection Floor (Recovered to 0.5 for high sensitivity)
-  alpha_min: 0.1              # [SOTA SG-2] Prevents minority task starvation;
+  target_ess: 0.30            # [v12.1] Increased from 0.10 for nuance recovery
+  awr_momentum: 0.98          
+  beta_min: 0.5               
+  alpha_min: 0.1              
   
   # AWR Calibration Speed/Quality (v10.1 Upgrade)
   # - "full": Scans all trajectories (~5-10 min, best for final training)
   # - "sample": Random subset (~10-30 sec, best for testing)
-  awr_calibration_mode: "full" # full for whole population scan or sample
+  awr_calibration_mode: "sample" # full for whole population scan or sample
   awr_max_samples: 10000      # [SOTA FIX] Increased for Batch 2048 / Full Sepsis-3 Population
   
   # [SOTA REMOVED] Redundant batch_size (Defined in train.batch_size)
