@@ -423,45 +423,40 @@ def robust_flash_attention(
 
     # 2. Prepare Mask for SDPA
     # We use an additive attention bias: 0 for keep, -inf for drop
-    # This is the most robust approach across PyTorch versions
     attn_bias = None
     if key_padding_mask is not None:
         # key_padding_mask is [B, L_k] where True is BAD (Pad).
-        # We need to broadcast to [B, 1, 1, L_k] for attention scores
-        attn_bias = torch.zeros_like(key_padding_mask, dtype=q.dtype).masked_fill(
-            key_padding_mask, float("-inf")
-        )
-        attn_bias = attn_bias.view(B, 1, 1, L_k)
-        # Note: Adding explicit bias may disable Flash kernel in some versions,
-        # but correctness > speed for safety-critical applications
+        # [OPT-3] Use in-place masked_fill_ to avoid temporary allocation
+        attn_bias = torch.zeros(B, 1, 1, L_k, device=q.device, dtype=q.dtype)
+        attn_bias.masked_fill_(key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf"))
+        
+        # [OPT-3] Pre-compute all-masked check on 2D mask directly
+        # instead of expanding to [B, H, L_q, L_k] (saves massive allocation)
+        all_masked_2d = key_padding_mask.all(dim=-1)  # [B] bool
 
     # [v14.6 SOTA] Causal Mask Injection
-    # Rationale: For time-series diffusion, x_t should ideally not attend to x_>t
-    # during denoising to learn true causal dynamics (Smoking Gun #190).
+    use_native_causal = False
     if is_causal:
-        # Create causal mask (0 for keep, -inf for mask)
-        causal_mask = torch.triu(torch.full((L_q, L_k), float("-inf"), device=q.device), diagonal=1)
-        if attn_bias is not None:
-            attn_bias = attn_bias + causal_mask.view(1, 1, L_q, L_k)
+        if attn_bias is None:
+            # [OPT-3] No padding mask → use SDPA's native is_causal flag (enables Flash kernel)
+            use_native_causal = True
         else:
-            attn_bias = causal_mask.view(1, 1, L_q, L_k)
+            # Must combine with padding bias → build explicit causal mask
+            causal_mask = torch.triu(torch.full((L_q, L_k), float("-inf"), device=q.device), diagonal=1)
+            attn_bias = attn_bias + causal_mask.view(1, 1, L_q, L_k)
 
-    # [v14.5 SOTA] Sink-Aware Attention (Smoking Gun #81)
-    # Rationale: If a row is fully masked, Softmax(-inf) yields NaN. 
-    # We bypass these "empty rows" to preserve the residual identity.
-    if key_padding_mask is not None:
-        all_masked = key_padding_mask.unsqueeze(1).unsqueeze(2).expand(B, n_heads, L_q, L_k).all(dim=-1, keepdim=True)
-    
     # 3. Scaled Dot Product Attention
     out = F.scaled_dot_product_attention(
         q, k, v, 
         attn_mask=attn_bias, 
-        dropout_p=dropout if dropout > 0 else 0.0
+        dropout_p=dropout if dropout > 0 else 0.0,
+        is_causal=use_native_causal
     )
     
-    # Re-apply sink mask + NaN guard
+    # [OPT-3] Sink-Aware NaN guard: zero out rows where all keys were masked
     if key_padding_mask is not None:
-        out = out.masked_fill(all_masked, 0.0)
+        # Broadcast [B] → [B, 1, 1, 1] for the output [B, H, L_q, D_h]
+        out = out.masked_fill(all_masked_2d.view(B, 1, 1, 1), 0.0)
     out = out.nan_to_num(0.0)
 
     # Reshape back: [B, H, L, D_h] -> [B, L, D]
@@ -616,45 +611,31 @@ class TemporalFusionEncoder(nn.Module):
             if imputation_mask is not None:
                 # Slice mask to dynamic features only
                 mask_dynamic = imputation_mask[..., :self.cfg.idx_static_start]
-                
-                # [CRITICAL FIX v12.1] Geometric Group Alignment
-                # GeometricProjector expects: [Hemo_V, Hemo_M, Lab_V, Lab_M, Elec_V, Elec_M]
-                # Default "cat" produces: [All_V, All_M] which misaligns the groups.
-                
-                # 1. Hemodynamics (Indices 0-6)
-                hemo_v = past_vitals_dynamic[..., 0:self.cfg.idx_hemo_end]
-                hemo_m = mask_dynamic[..., 0:self.cfg.idx_hemo_end]
-                hemo_grp = torch.cat([hemo_v, hemo_m], dim=-1) # 14 channels
-                
-                # 2. Labs (Indices idx_hemo_end-idx_labs_end)
-                labs_v = past_vitals_dynamic[..., self.cfg.idx_hemo_end:self.cfg.idx_labs_end]
-                labs_m = mask_dynamic[..., self.cfg.idx_hemo_end:self.cfg.idx_labs_end]
-                labs_grp = torch.cat([labs_v, labs_m], dim=-1) # 22 channels
-                
-                # 3. Electrolytes (Indices idx_labs_end-idx_elec_end)
-                elec_v = past_vitals_dynamic[..., self.cfg.idx_labs_end:self.cfg.idx_elec_end]
-                elec_m = mask_dynamic[..., self.cfg.idx_labs_end:self.cfg.idx_elec_end]
-                elec_grp = torch.cat([elec_v, elec_m], dim=-1) # 8 channels
-                
-                # Final Interleaved Input
-                network_input = torch.cat([hemo_grp, labs_grp, elec_grp], dim=-1)
             else:
                 # Fallback: Assume all real (ones) if no mask provided but expected
                 mask_dynamic = torch.ones_like(past_vitals_dynamic)
-                # Apply same interleaving fallback
-                hemo_v = past_vitals_dynamic[..., 0:self.cfg.idx_hemo_end]
-                hemo_m = mask_dynamic[..., 0:self.cfg.idx_hemo_end]
-                hemo_grp = torch.cat([hemo_v, hemo_m], dim=-1)
-                
-                labs_v = past_vitals_dynamic[..., self.cfg.idx_hemo_end:self.cfg.idx_labs_end]
-                labs_m = mask_dynamic[..., self.cfg.idx_hemo_end:self.cfg.idx_labs_end]
-                labs_grp = torch.cat([labs_v, labs_m], dim=-1)
-                
-                elec_v = past_vitals_dynamic[..., self.cfg.idx_labs_end:self.cfg.idx_elec_end]
-                elec_m = mask_dynamic[..., self.cfg.idx_labs_end:self.cfg.idx_elec_end]
-                elec_grp = torch.cat([elec_v, elec_m], dim=-1)
-                
-                network_input = torch.cat([hemo_grp, labs_grp, elec_grp], dim=-1)
+
+            # [CRITICAL FIX v12.1] Geometric Group Alignment
+            # GeometricProjector expects: [Hemo_V, Hemo_M, Lab_V, Lab_M, Elec_V, Elec_M]
+            # Default "cat" produces: [All_V, All_M] which misaligns the groups.
+            
+            # 1. Hemodynamics (Indices 0-6)
+            hemo_v = past_vitals_dynamic[..., 0:self.cfg.idx_hemo_end]
+            hemo_m = mask_dynamic[..., 0:self.cfg.idx_hemo_end]
+            hemo_grp = torch.cat([hemo_v, hemo_m], dim=-1) # 14 channels
+            
+            # 2. Labs (Indices idx_hemo_end-idx_labs_end)
+            labs_v = past_vitals_dynamic[..., self.cfg.idx_hemo_end:self.cfg.idx_labs_end]
+            labs_m = mask_dynamic[..., self.cfg.idx_hemo_end:self.cfg.idx_labs_end]
+            labs_grp = torch.cat([labs_v, labs_m], dim=-1) # 22 channels
+            
+            # 3. Electrolytes (Indices idx_labs_end-idx_elec_end)
+            elec_v = past_vitals_dynamic[..., self.cfg.idx_labs_end:self.cfg.idx_elec_end]
+            elec_m = mask_dynamic[..., self.cfg.idx_labs_end:self.cfg.idx_elec_end]
+            elec_grp = torch.cat([elec_v, elec_m], dim=-1) # 8 channels
+            
+            # Final Interleaved Input
+            network_input = torch.cat([hemo_grp, labs_grp, elec_grp], dim=-1)
         else:
             network_input = past_vitals_dynamic
 
@@ -697,9 +678,13 @@ class TemporalFusionEncoder(nn.Module):
         # Rationale: Static token at Index 0 shifts Vitals 0 to Index 1 (RoPE 1).
         # Fix: Assign Index 0 to both Static AND Vitals 0 to preserve clinical Time 0.
         # Sequence: [Static(0), Vitals_0(0), Vitals_1(1), ..., Vitals_T-1(T-1)]
-        vitals_pos = torch.arange(T, device=x.device)
-        static_pos = torch.zeros(1, device=x.device, dtype=torch.long)
-        position_ids = torch.cat([static_pos, vitals_pos], dim=0).unsqueeze(0).expand(B, -1)
+        # [OPT-7] Cache position_ids to avoid recomputation
+        if not hasattr(self, '_cached_pos_ids') or self._cached_pos_ids is None or self._cached_pos_ids.shape[-1] != (T + 1) or self._cached_pos_ids.device != x.device:
+            vitals_pos = torch.arange(T, device=x.device)
+            static_pos = torch.zeros(1, device=x.device, dtype=torch.long)
+            self._cached_pos_ids = torch.cat([static_pos, vitals_pos], dim=0).unsqueeze(0)
+        
+        position_ids = self._cached_pos_ids.expand(B, -1)
         
         # 5. Encoding (NTH-Attention)
         for layer in self.layers:
@@ -877,14 +862,16 @@ class DiffusionActionHead(nn.Module):
         # Zero-init output layer for training stability
         nn.init.zeros_(self.out_head.weight)
         nn.init.zeros_(self.out_head.bias)
+        
+        # [OPT-4] Pre-compute sinusoidal frequency tensor (depends only on d_model)
+        half_dim = cfg.d_model // 2
+        time_freqs = torch.exp(-math.log(10000) * torch.arange(0, half_dim, dtype=torch.float32) / half_dim)
+        self.register_buffer("time_freqs", time_freqs)
 
     def get_time_emb(self, t: torch.Tensor) -> torch.Tensor:
         """Sinusoidal timestep embeddings (standard in diffusion models)."""
-        half_dim = self.cfg.d_model // 2
-        freqs = torch.exp(
-            -math.log(10000) * torch.arange(0, half_dim, dtype=torch.float32, device=t.device) / half_dim
-        )
-        args = t[:, None].float() * freqs[None]
+        # [OPT-4] Use pre-computed frequency buffer instead of rebuilding every call
+        args = t[:, None].float() * self.time_freqs[None]
         emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         return emb
 
@@ -1551,7 +1538,7 @@ class ICUUnifiedPlanner(nn.Module):
                     x_t_in = x_t.detach().requires_grad_(True)
                     
                     # Estimate x0 (approx) with current self_cond
-                    out_eps = self.backbone(x_t_in, t, ctx_seq, global_ctx, ctx_mask, self_cond=x_self_cond)
+                    out_eps, _ = self.backbone(x_t_in, t, ctx_seq, global_ctx, ctx_mask, self_cond=x_self_cond)
                     
                     # Reconstruct x0 (DDIM equation)
                     alpha_bar = self.scheduler.alphas_cumprod[t][:, None, None]
@@ -1583,14 +1570,14 @@ class ICUUnifiedPlanner(nn.Module):
 
 
             # --- B. Standard Diffusion Step ---
-            out_student = self.backbone(x_t, t, ctx_seq, global_ctx, ctx_mask, self_cond=x_self_cond)
+            out_student, _ = self.backbone(x_t, t, ctx_seq, global_ctx, ctx_mask, self_cond=x_self_cond)
             
             # [PHASE 5] Teacher Governance (Audit)
             distrust = None
             if teacher_model is not None:
                 # Use teacher's encoder or just the backbone if encoders are shared
                 _, t_global_ctx, _ = teacher_model.encoder(past_norm, static_norm, padding_mask=padding_mask)
-                out_teacher = teacher_model.backbone(x_t, t, ctx_seq, t_global_ctx, ctx_mask, self_cond=x_self_cond)
+                out_teacher, _ = teacher_model.backbone(x_t, t, ctx_seq, t_global_ctx, ctx_mask, self_cond=x_self_cond)
                 
                 distrust = self.clinical_governor.calculate_distrust(out_student, out_teacher, risk_coef)
                 p_eff = self.clinical_governor.get_dynamic_percentile(distrust)

@@ -151,43 +151,32 @@ class RoPEMultiheadAttention(nn.Module):
         cos, sin = self.rope(q, T, position_ids=position_ids)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
         
-        # Attention
-        # scores: [B, H, T, T]
-        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        # [OPT-1] Build unified attention bias for SDPA
+        # Combine key_padding_mask and attn_mask into a single additive bias
+        attn_bias = None
+        if key_padding_mask is not None:
+            # key_padding_mask: [B, T] where True = PAD (should be ignored)
+            attn_bias = torch.zeros(B, 1, 1, T, device=q.device, dtype=q.dtype)
+            attn_bias.masked_fill_(key_padding_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
         
         if attn_mask is not None:
-             # attn_mask [T, T] or [B*H, T, T]
-             # Simplify: expect inputs to handle dimensions or broadcast
-             scores = scores + attn_mask
-             
-        if key_padding_mask is not None:
-            # [SOTA FIX 1] Strict boolean mask expansion
-            mask_expanded = key_padding_mask.unsqueeze(1).unsqueeze(2).bool()
-            
-            # [PHASE 1.5 SOTA] Attention Zero-Sink (Smoking Gun #81)
-            # Rationale: If all keys are masked, Softmax(-inf) yields NaN.
-            # We must detect 'Empty Rows' and bypass them to preserve the residual signal.
-            all_masked = mask_expanded.all(dim=-1, keepdim=True)
-            
-            # [SOTA FIX 2] Use -torch.inf for exact 0.0 softmax probability
-            scores = scores.masked_fill(mask_expanded, -torch.inf)
-            
-        weights = F.softmax(scores, dim=-1)
+            # attn_mask: [T, T] additive mask (0 = keep, -1e9 = mask)
+            am = attn_mask.to(dtype=q.dtype)
+            if attn_bias is not None:
+                attn_bias = attn_bias + am
+            else:
+                attn_bias = am
         
-        # [PHASE 1.5 SOTA] Sink-Aware Re-weighting
-        # If a row was fully masked, the attention output should be 0.0 (no mixing)
-        if key_padding_mask is not None:
-            weights = weights.masked_fill(all_masked, 0.0)
-            
-        # [SOTA FIX 3] Atomic NaN Guard
-        weights = weights.nan_to_num(0.0)
+        # [OPT-1] Use F.scaled_dot_product_attention (enables Flash/Memory-Efficient kernels)
+        output = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
         
-        output = torch.matmul(weights, v) # [B, H, T, D_h]
+        # [PHASE 1.5 SOTA] NaN Guard (all-masked rows produce NaN from softmax(-inf))
+        output = output.nan_to_num(0.0)
         
-        # Reassemble
+        # Reassemble [B, H, T, D_h] -> [B, T, D]
         output = output.transpose(1, 2).contiguous().view(B, T, self.d_model)
         
-        return self.out_proj(output), weights
+        return self.out_proj(output), None
 
 class NTHAttention(nn.Module):
     """
@@ -215,22 +204,19 @@ class NTHAttention(nn.Module):
         B, T, D = x.shape
         
         # --- 1. Local Neighborhood Attention ---
-        # Create Local Mask [T, T]
-        indices = torch.arange(T, device=x.device)
-        dist = indices.unsqueeze(0) - indices.unsqueeze(1)
-        # 0 for keep, -inf for mask
-        local_mask_2d = (dist.abs() > self.local_window) # True to mask
-        
-        # [v4.2.1 SOTA FIX] Unstall Static Token
-        # Always allow attention to index 0 (Static Context) regardless of distance
-        local_mask_2d[:, 0] = False
-        
-        local_mask_float = torch.zeros((T, T), device=x.device)
-        local_mask_float = local_mask_float.masked_fill(local_mask_2d, -1e9)
+        # [OPT-2] Cache the local mask (depends only on T and local_window, both fixed)
+        if not hasattr(self, '_cached_local_mask') or self._cached_local_mask is None or self._cached_local_mask.shape[0] != T or self._cached_local_mask.device != x.device:
+            indices = torch.arange(T, device=x.device)
+            dist = indices.unsqueeze(0) - indices.unsqueeze(1)
+            local_mask_2d = (dist.abs() > self.local_window)
+            # [v4.2.1 SOTA FIX] Unstall Static Token
+            local_mask_2d[:, 0] = False
+            local_mask_float = torch.zeros((T, T), device=x.device)
+            local_mask_float = local_mask_float.masked_fill(local_mask_2d, -1e9)
+            self._cached_local_mask = local_mask_float
         
         # Local Branch
-        # Pass position_ids to the RoPE-MHA
-        h_local, _ = self.local_attn(x, x, x, key_padding_mask=mask, attn_mask=local_mask_float, position_ids=position_ids)
+        h_local, _ = self.local_attn(x, x, x, key_padding_mask=mask, attn_mask=self._cached_local_mask, position_ids=position_ids)
         
         # --- 2. Global Trend Attention ---
         # Global Branch (Full Context, no extra mask)

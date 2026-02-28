@@ -95,13 +95,19 @@ class RoPEMultiheadAttention(nn.Module):
         q = (q * cos) + (self._rotate_half(q) * sin)
         k = (k * cos) + (self._rotate_half(k) * sin)
         
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+        # [OPT-6] Build attention bias for SDPA
+        attn_bias = None
         if mask is not None:
-             attn = attn.masked_fill(mask.unsqueeze(1).unsqueeze(2), -1e9)
+            attn_bias = torch.zeros(B, 1, 1, Tk, device=q.device, dtype=q.dtype)
+            attn_bias.masked_fill_(mask.unsqueeze(1).unsqueeze(2), float('-inf'))
         
-        weights = F.softmax(attn, dim=-1)
-        weights = self.attn_dropout(weights)
-        out = (weights @ v).transpose(1, 2).reshape(B, Tq, D)
+        # [OPT-6] Use F.scaled_dot_product_attention (enables Flash/Memory-Efficient kernels)
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_bias,
+            dropout_p=self.attn_dropout.p if self.training else 0.0
+        )
+        out = out.nan_to_num(0.0)
+        out = out.transpose(1, 2).reshape(B, Tq, D)
         return self.out(out)
 
 class SinusoidalPositionalEncoding(nn.Module):
@@ -187,11 +193,16 @@ class AsymmetricLatentBottleneck(nn.Module):
         # [v13.0 Titanium Bedrock] Temporal Realignment (Expert Sync)
         # Rationale: Static token shifts Vitals 0 to Index 1.
         # Fix: Sync with clinical position_ids [0, 0, 1, ..., T-1].
+        # [OPT-7] Cache position_ids to avoid recomputation
         B, T_full, _ = ctx_sharp.shape
         T_vitals = T_full - 1
-        vitals_pos = torch.arange(T_vitals, device=ctx_sharp.device)
-        static_pos = torch.zeros(1, device=ctx_sharp.device, dtype=torch.long)
-        position_ids = torch.cat([static_pos, vitals_pos], dim=0).unsqueeze(0).expand(B, -1)
+        
+        if not hasattr(self, '_cached_pos_ids') or self._cached_pos_ids is None or self._cached_pos_ids.shape[-1] != T_full or self._cached_pos_ids.device != ctx_sharp.device:
+            vitals_pos = torch.arange(T_vitals, device=ctx_sharp.device)
+            static_pos = torch.zeros(1, device=ctx_sharp.device, dtype=torch.long)
+            self._cached_pos_ids = torch.cat([static_pos, vitals_pos], dim=0).unsqueeze(0)
+        
+        position_ids = self._cached_pos_ids.expand(B, -1)
         
         ctx_synced = self.sync(ctx_sharp, ctx_sharp, ctx_sharp, mask=full_mask, position_ids=position_ids) 
         ctx_expert = self.expert_proj(ctx_synced)
