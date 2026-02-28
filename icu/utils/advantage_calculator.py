@@ -711,9 +711,10 @@ class ICUAdvantageCalculator(nn.Module):
                 lac_delta = lactate_val[:, :-1] - lactate_val[:, 1:] # Positive = Improved (Down)
                 # positive delta = lactate going DOWN (good)
                 # [v12.2 NASA-TIER] Recovery Discovery Bonus
-                # Rewarding the START of recovery (Momentum) 2x more than staying stable.
+                # Rewarding the START of recovery (Momentum) mildly.
+                # [v14-FINAL] Reduced from 1.5 to 0.5 to prevent reward signal distortion.
                 lac_improvement = torch.clamp(lac_delta, min=0.0, max=2.0)
-                discovery_bonus = (lac_improvement > 0.5).float() * 1.5 
+                discovery_bonus = (lac_improvement > 0.5).float() * 0.5 
                 # Use mask from previous step to ensure "start" was real
                 rewards[:, 1:] += self.shaping_coef * 2.0 * (lac_improvement + discovery_bonus) * get_f_mask(idx_lac)[:, :-1]
 
@@ -833,16 +834,11 @@ class ICUAdvantageCalculator(nn.Module):
 
         # SAW Advantage: r + gamma * V_teacher(s') - V_student(s)
         # This prevents the student from "cheating" by lowering all values.
-        # [v12.2 NASA-TIER] Discovery-Aware SAW (Smoking Gun #Conservative-Bias)
-        # Rationale: Standard SAW punishes discovery where V_student > V_teacher.
-        # [v14.4 FIX] Pessimism Trap Recovery (#101): Decouple from reward sign. 
-        # Rationale: Allow student to 'believe' in high-value futures even during 
-        # dense clinical penalties (e.g. temporary MAP drop).
-        discovery_mask = (student_values > teacher_values)
-        # Relax the penalty on discovery steps
-        eff_student_v = torch.where(discovery_mask, teacher_values, student_values)
-        
-        advantages = rewards + (self.gamma * next_v_teacher * non_terminal) - eff_student_v
+        # [v14-FINAL] Standard SAW (Reverted Discovery-Aware SAW)
+        # Rationale: Discovery-Aware SAW removed conservative bias by using
+        # eff_student_v = where(student>teacher, teacher, student), which caused
+        # over-optimism and negative train_ev. Standard TD error is safer for clinical RL.
+        advantages = rewards + (self.gamma * next_v_teacher * non_terminal) - student_values
         
         return advantages
 
@@ -883,12 +879,11 @@ class ICUAdvantageCalculator(nn.Module):
                 bootstrap_value = bootstrap_value.unsqueeze(1)
             next_values = torch.cat([values[:, 1:], bootstrap_value], dim=1)
         else:
-            # [v14.1 NASA-TIER] Velocity-Aware GAE (Momentum Recovery)
-            # Rationale: Conservative V(s_T+1) = V(s_T) masks terminal crashes (81% signal loss).
-            # Fix: Use 1st-order linear extrapolation for the sliding window horizon.
-            v_delta = values[:, -1:] - values[:, -2:-1] if T > 1 else torch.zeros_like(values[:, -1:])
-            bootstrap_vel = values[:, -1:] + v_delta
-            next_values = torch.cat([values[:, 1:], bootstrap_vel], dim=1)
+            # [v14-FINAL] Conservative Bootstrap (Reverted Velocity-Aware GAE)
+            # Rationale: Linear extrapolation (v_delta) amplifies noise at episode
+            # boundaries. Combined with LSE, this doubled the variance.
+            # Conservative V(s_T+1) = V(s_T) is safer for sliding windows.
+            next_values = torch.cat([values[:, 1:], values[:, -1:]], dim=1)
         
         # --- 2. Construct Non-Terminal Mask ---
         if dones is not None:
@@ -1095,7 +1090,7 @@ class ICUAdvantageCalculator(nn.Module):
                 dist.all_reduce(stats, op=dist.ReduceOp.SUM)
                 g_sum, g_sq, g_count = stats[0], stats[1], stats[2]
 
-                if g_count > 100: # [v12.1] Wait for representative sample before initializing
+                if g_count > 10: # [v14-FINAL] Reduced from 100 to enable faster AWR initialization
                     mu = g_sum / g_count
                     var = (g_sq / g_count) - (mu ** 2)
                     sigma = torch.sqrt(var.clamp(min=1e-5))
@@ -1105,7 +1100,7 @@ class ICUAdvantageCalculator(nn.Module):
                 else:
                     mu, sigma = torch.tensor(0.0, device=advantages.device), torch.tensor(1.0, device=advantages.device)
             else:
-                if l_count > 100: # [v12.1] Population Continuity
+                if l_count > 10: # [v14-FINAL] Reduced from 100 to enable faster AWR initialization
                     mu = l_sum / l_count
                     var = (l_sq_sum / l_count) - (mu ** 2)
                     sigma = torch.sqrt(var.clamp(min=1e-5))

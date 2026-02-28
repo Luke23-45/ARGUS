@@ -1700,12 +1700,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
                     ratio_gate = 1.0 / (1.0 + cga_ratio.pow(2))
                 l_cga = l_cga_raw * ratio_gate
                 
-                # [v12.1 NASA-TIER BREAKTHROUGH] Manifold Liberation (CGA Annealing)
-                # Rationale: Forensic simulation proved that 'High Stiffness' (0.5) 
-                # traps the student in the legacy teacher's 0.80 AUROC zone.
-                # Fix: Anneal CGA weight from 0.5 down to 0.1 to let the student 
-                # explore the non-linear physiological manifold.
-                cga_stiffness = 0.5 * (1.0 - (min(1.0, self.global_step / 5000) * 0.8))
+                # [v14-FINAL NASA-TIER] Manifold Liberation (CGA Annealing — Calibrated)
+                # Rationale: v13 annealed too aggressively (5000 steps, floor 0.1).
+                # This caused premature teacher detachment before the student could generalize.
+                # Fix: Anneal CGA weight from 0.5 down to 0.15 over 10000 steps (2x slower).
+                # 0.5 * (1 - min(1, step/10000) * 0.7) → 0.5 @ step=0, 0.15 @ step=10000
+                cga_stiffness = 0.5 * (1.0 - (min(1.0, self.global_step / 10000) * 0.7))
                 
                 # Weighted at base 0.5 to prevent manifold stiffness
                 aux_loss = aux_loss + cga_stiffness * l_cga
@@ -1886,11 +1886,12 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
             advant_masked = advantages * f_mask
             
-            # [v14.5 SOTA] Log-Sum-Exp (LSE) Pooling (Smoking Gun #135)
-            # Rationale: hard max() is sensitive to outliers. LSE provides a smooth 
-            # selection manifold that considers the "density" of critical events.
-            # T=1.0 provides a balanced "Soft-Max" profile.
-            traj_adv = torch.logsumexp(advant_masked, dim=1) # [B]
+            # [v14-FINAL] Tempered Log-Sum-Exp (LSE) Pooling
+            # Rationale: v13 used implicit T=1.0 (hard-max), collapsing ESS to ~300
+            # and pushing wa_max to the 2.0 ceiling. T=5.0 provides soft selection
+            # that still prioritizes crash events without gradient variance explosion.
+            _lse_temp = 5.0
+            traj_adv = _lse_temp * torch.logsumexp(advant_masked / _lse_temp, dim=1) # [B]
             
             # [v17.3 Surgical Mask] Returns restricted to fresh batch [0:B]
             returns = (advantages + student_values[:B]).detach()
@@ -2019,17 +2020,21 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Fix: Cap denominator at 1e-2 for gradients to limit amplification to 100x.
             # This protects the model from physics losses on "hallucinated" x0 at high t.
             alpha_t = self.model.scheduler.alphas_cumprod[t[:B]][:, None, None]
-            # [v14.1 NASA-TIER] Bayesian Straight-Through Estimator (Structural Recovery)
-            # Rationale: Denominator x/0.01 suppresses 90% of gradients compared to x/0.001.
-            # Fix: Forward pass uses stable 1e-2 cap; Gradient pass uses true 1e-3 scale.
+            # [v14-FINAL] Bayesian Straight-Through Estimator (Gradient-Clamped)
+            # Rationale: v13 left backward denominator unclamped (sqrt_alpha_real + 1e-8),
+            # allowing gradient amplification up to ~1e8x at high noise levels (t→T).
+            # This contributed to the GN=79.6 spike at Epoch 3.
+            # Fix: Forward uses 1e-2 cap (100x). Backward uses 1e-3 cap (1000x).
+            # 10x more gradient signal than Run 12, but 100000x safer than unclamped v13.
             sqrt_alpha_real = torch.sqrt(alpha_t)
             den_fwd = sqrt_alpha_real.clamp(min=1e-2)
+            den_bwd = sqrt_alpha_real.clamp(min=1e-3)  # [v14-FINAL] Gradient safety clamp
             k_t = torch.sqrt(1 - alpha_t)
             
             # [FIX] Use noisy_fut[:B] to match pred_noise [B] (ghosts excluded from reconstruction)
             noisy_fut_real = noisy_fut[:B]
             x0_fwd = (noisy_fut_real - k_t * pred_noise) / (den_fwd + 1e-8)
-            x0_bwd = (noisy_fut_real - k_t * pred_noise) / (sqrt_alpha_real + 1e-8)
+            x0_bwd = (noisy_fut_real - k_t * pred_noise) / (den_bwd + 1e-8)
             x0_approx = x0_bwd + (x0_fwd - x0_bwd).detach()
             
             # [v26.3 SOTA FIX] Install Manifold Governance Bridge
@@ -2493,26 +2498,21 @@ class ICUGeneralistWrapper(pl.LightningModule):
                             proj_refs.append(g_ref_accum[name])
                     
                     if proj_params:
-                        # [v5.0 SOTA] Global PCGrad Mathematical Projection
-                        # Rationale: Layer-wise PCGrad applies identical rotational operations to all 
-                        # layers regardless of magnitude, violently tearing Adam/LAMB momentum spaces. 
-                        # Projecting the gradients globally across the entire vector space preserves the 
-                        # geometric magnitude relationships while fusing 2000 kernels down to 2.
+                        # [v53.1 SOTA] Memory-Efficient Global Projection (OOM Fix)
+                        # Rationale: The previous approach used torch.cat to flatten ALL gradients
+                        # into two massive 1D vectors (~800MB each), creating a 2.4GB VRAM spike.
+                        # This iterative approach computes the EXACT same dot product and norms
+                        # by accumulating per-parameter contributions, using O(1) extra memory.
                         
-                        # 1. Fuse total gradients into 1D vectors for Global Projection
-                        flat_p = torch.cat([p.view(-1) for p in proj_params])
-                        flat_r = torch.cat([r.view(-1) for r in proj_refs])
+                        # Accumulate dot product and squared norms iteratively
+                        dot_pr = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+                        sq_p = torch.tensor(1e-5, device=self.device, dtype=torch.float32)
+                        sq_r = torch.tensor(1e-5, device=self.device, dtype=torch.float32)
                         
-                        # 2. Global Dot Product
-                        dot_pr = torch.sum(flat_p * flat_r, dtype=torch.float32)
-                        
-                        # 3. Soft Margin Check
-                        # We only project if they are actively fighting (cos_sim < -0.05)
-                        # [Omni-Scan FIX #710] FP16 Epsilon Collapse
-                        # Rationale: 1e-8 evaluates to exactly 0.0 in FP16, causing NaN on division.
-                        # Upgraded to 1e-5 to guarantee mathematical survival in half-precision.
-                        sq_p = torch.sum(flat_p * flat_p, dtype=torch.float32) + 1e-5
-                        sq_r = torch.sum(flat_r * flat_r, dtype=torch.float32) + 1e-5
+                        for p_grad, r_grad in zip(proj_params, proj_refs):
+                            dot_pr += torch.sum(p_grad * r_grad, dtype=torch.float32)
+                            sq_p += torch.sum(p_grad * p_grad, dtype=torch.float32)
+                            sq_r += torch.sum(r_grad * r_grad, dtype=torch.float32)
                         
                         norm_p = torch.sqrt(sq_p)
                         norm_r = torch.sqrt(sq_r)
