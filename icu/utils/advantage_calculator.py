@@ -1016,12 +1016,11 @@ class ICUAdvantageCalculator(nn.Module):
                 b_sq_sum = (adv_flat ** 2).sum()
                 b_count = torch.tensor([float(adv_flat.numel())], device=adv_flat.device)
                 
+                stats = torch.stack([b_sum, b_sq_sum, b_count[0]])
                 if dist.is_initialized():
-                    stats = torch.stack([b_sum, b_sq_sum, b_count[0]])
                     dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-                    g_b_sum, g_b_sq_sum, g_b_count = stats[0], stats[1], stats[2]
-                else:
-                    g_b_sum, g_b_sq_sum, g_b_count = b_sum, b_sq_sum, b_count[0]
+                
+                g_b_sum, g_b_sq_sum, g_b_count = stats[0], stats[1], stats[2]
                 
                 # [v14.5 NASA-TIER] Finite-Stats DDP Guard
                 mask_update = (g_b_count > 1) and torch.isfinite(stats).all()
@@ -1555,6 +1554,8 @@ class ICUAdvantageCalculator(nn.Module):
         
         diagnostics["explained_variance"] = exp_var
         diagnostics["max_weight"] = diagnostics["weights_max"]  # Alias
+        diagnostics["mu"] = diagnostics["adv_mean"]             # Alias for wrapper compatibility
+        diagnostics["sigma"] = diagnostics["adv_std"]          # Alias for wrapper compatibility
         
         return weights, diagnostics
 

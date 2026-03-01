@@ -2998,8 +2998,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 "train/weight_aux": task_weights[2],
                 "train/curr_phys_weight": curr_phys_weight,
                 "train/ev_ema": self.ev_ema.detach(),
-                "train/awr_mu": diag["mu"],
-                "train/awr_sigma": diag["sigma"]
+                "train/awr_mu": diag.get("mu", 0.0),
+                "train/awr_sigma": diag.get("sigma", 0.0)
             }, on_step=True, on_epoch=False, prog_bar=False)
 
             # [v2026 SOTA] Efficient Intra-Epoch CSV Logging

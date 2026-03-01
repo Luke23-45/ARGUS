@@ -31,6 +31,7 @@ class BayesianProjectedScaler(nn.Module):
         
         # EMA tracking for UW-SO stability
         self.register_buffer("loss_emas", torch.ones(num_tasks))
+        self.register_buffer("decay", torch.tensor([decay]))
         
         # Accumulation Buffers
         self.register_buffer("loss_accumulator", torch.zeros(num_tasks))
