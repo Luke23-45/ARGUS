@@ -2112,7 +2112,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
             l_tcb = l_tcb * lorentzian_w
 
             # Hard Safety Ceiling: TCB contribution cannot exceed 15% of clinical loss budget
-            max_tcb = (l_bgsl + l_acl + l_diff).detach() * (0.15 / 0.85)
+            max_tcb = (l_bgsl + acl_loss + diff_loss).detach() * (0.15 / 0.85)
             if l_tcb.detach() > max_tcb:
                 l_tcb = l_tcb * (max_tcb / (l_tcb.detach() + 1e-8))
 

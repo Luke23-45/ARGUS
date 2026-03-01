@@ -9,7 +9,7 @@ defaults:
 run_name: "gen_v1_${now:%Y-%m-%d_%H-%M-%S}"
 seed: 42
 compile_model: false
-save_checkpoints: false
+save_checkpoints: true
 debug_save_epochs: []     # [DEBUG] List of epochs to save snapshots (e.g., [5, 10, 50])
 
 # --- Directory Paths ---
@@ -79,7 +79,7 @@ train:
   horizon_ramp: 40
 
   # Debug Mode (Smoke Test)
-  debug_run: true #true
+  debug_run: false #true
   debug_limit_batches: 200
   debug_limit_val: 500
 
@@ -99,7 +99,7 @@ train:
   # AWR Calibration Speed/Quality (v10.1 Upgrade)
   # - "full": Scans all trajectories (~5-10 min, best for final training)
   # - "sample": Random subset (~10-30 sec, best for testing)
-  awr_calibration_mode: "sample" # full for whole population scan or sample
+  awr_calibration_mode: "full" # full for whole population scan or sample
   awr_max_samples: 10000      # [SOTA FIX] Increased for Batch 2048 / Full Sepsis-3 Population
   
   # [SOTA REMOVED] Redundant batch_size (Defined in train.batch_size)

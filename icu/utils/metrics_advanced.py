@@ -101,13 +101,15 @@ def compute_ece(
         bin_indices = (bin_indices - 1).clamp(0, n_bins - 1)
         
         # Scatter add to get sums
-        bin_counts = torch.zeros(n_bins, device=probs.device)
-        bin_conf_sum = torch.zeros(n_bins, device=probs.device)
-        bin_acc_sum = torch.zeros(n_bins, device=probs.device)
+        # [SOTA FIX] Dtype Alignment for AMP (Smoking Gun #663)
+        # Rationale: Default float32 causes scatter_add mismatch if probs are fp16/bf16.
+        bin_counts = torch.zeros(n_bins, device=probs.device, dtype=probs.dtype)
+        bin_conf_sum = torch.zeros(n_bins, device=probs.device, dtype=probs.dtype)
+        bin_acc_sum = torch.zeros(n_bins, device=probs.device, dtype=probs.dtype)
         
-        bin_counts.scatter_add_(0, bin_indices, torch.ones_like(confidences))
+        bin_counts.scatter_add_(0, bin_indices, torch.ones_like(confidences, dtype=probs.dtype))
         bin_conf_sum.scatter_add_(0, bin_indices, confidences)
-        bin_acc_sum.scatter_add_(0, bin_indices, accuracies)
+        bin_acc_sum.scatter_add_(0, bin_indices, accuracies.to(probs.dtype))
         
         # Mask empty bins
         mask = bin_counts > 0
@@ -165,13 +167,14 @@ def compute_overconfidence_error(
     bin_indices = torch.bucketize(confidences, bin_boundaries)
     bin_indices = (bin_indices - 1).clamp(0, n_bins - 1)
     
-    bin_counts = torch.zeros(n_bins, device=probs.device)
-    bin_conf_sum = torch.zeros(n_bins, device=probs.device)
-    bin_acc_sum = torch.zeros(n_bins, device=probs.device)
+    # [SOTA FIX] Dtype Alignment for AMP (Smoking Gun #663)
+    bin_counts = torch.zeros(n_bins, device=probs.device, dtype=probs.dtype)
+    bin_conf_sum = torch.zeros(n_bins, device=probs.device, dtype=probs.dtype)
+    bin_acc_sum = torch.zeros(n_bins, device=probs.device, dtype=probs.dtype)
     
-    bin_counts.scatter_add_(0, bin_indices, torch.ones_like(confidences))
+    bin_counts.scatter_add_(0, bin_indices, torch.ones_like(confidences, dtype=probs.dtype))
     bin_conf_sum.scatter_add_(0, bin_indices, confidences)
-    bin_acc_sum.scatter_add_(0, bin_indices, accuracies)
+    bin_acc_sum.scatter_add_(0, bin_indices, accuracies.to(probs.dtype))
     
     mask = bin_counts > 0
     oe = torch.tensor(0.0, device=probs.device)
