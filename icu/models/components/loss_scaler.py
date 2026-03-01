@@ -23,10 +23,15 @@ class BayesianProjectedScaler(nn.Module):
         self.num_tasks = num_tasks
         
         # [v110.0 SOTA FIX] Safe-Start Initialization
+        # [Iteration 10 SOTA] Kendall MTL Task Initializations (forensic_report_v10)
+        # 0:diff, 1:critic, 2:aux, 3:acl, 4:bgsl, 5:tcb, 6:phys
+        # Values bit-perfect with clinical research (Reference: Patch 3)
         log_vars_init = torch.zeros(num_tasks)
-        if num_tasks > 4: log_vars_init[4] = 0.5  # bgsl starts cautious
-        if num_tasks > 5: log_vars_init[5] = 1.0  # tcb starts suppressed
-        if num_tasks > 6: log_vars_init[6] = 2.0  # phys starts heavily suppressed
+        log_vars_init[0] = 4.3   # diff (Report Index 1)
+        log_vars_init[3] = 0.0   # acl (Report Index 3)
+        log_vars_init[4] = 0.0   # bgsl (Report Index 0)
+        log_vars_init[5] = 0.5   # tcb (Report Index 2)
+        log_vars_init[6] = 2.0   # phys (Safety Guard)
         self.log_vars = nn.Parameter(log_vars_init)
         
         # EMA tracking for UW-SO stability
@@ -210,13 +215,12 @@ class BayesianProjectedScaler(nn.Module):
         self.log_vars.clamp_(min=-5.0, max=8.0)
         # 2. Diffusion Floor
         self.log_vars[0].clamp_(max=1.0)
-        # 3. [FORENSIC FIX #2] Critic Precision Range (Root Cause: Critic Explosion → Total Loss Blowup)
+        # 3. [FORENSIC FIX #2] Critic Precision Range (Root Cause: Critic Explosion -> Total Loss Blowup)
         # Original: max=0.0 forced precision >= 1.0, preventing the scaler from reducing critic weight
-        # when V exploded from 31→115. This made critic the permanent highest-weighted task.
-        # Fix: max=3.0 allows precision down to exp(-3) ≈ 0.05, giving the Bayesian scaler
-        # 20x dynamic range to naturally suppress critic via its own uncertainty estimation
-        # (Kendall et al.) when the loss magnitude diverges from other tasks.
-        self.log_vars[1].clamp_(max=3.0)
+        # when V exploded from 31->115. This made critic the permanent highest-weighted task.
+        # Fix: clamp(min=-3.0, max=3.0) allows precision down to exp(-3) approx 0.05, 
+        # giving the Bayesian scaler dynamic range to mute the critic (Kendall et al.).
+        self.log_vars[1].clamp_(min=-3.0, max=3.0)
         # 4. Clinical Gating (Aux/ACL)
         self.log_vars[2].clamp_(max=4.0)
         self.log_vars[3].clamp_(max=4.0)

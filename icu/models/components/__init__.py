@@ -7,3 +7,4 @@ from .bypass_context import LateralBypass
 from .alb_encoder import AsymmetricLatentBottleneck
 from .temporal_buffer import TemporalContrastiveBuffer
 from .bgsl_loss import BGSLLoss
+from .temperature_scaler import calibrate_temperature

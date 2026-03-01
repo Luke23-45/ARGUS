@@ -39,50 +39,40 @@ class BGSLLoss(nn.Module):
         self.trend_coef = trend_coef
         self.shock_coef = shock_coef
         
+        # [v14.9 SOTA] Unified Focal Core
+        # Uses forensic alpha=0.85 for sepsis boost
+        from icu.models.components.focal_loss import FocalLoss
+        self.focal_core = FocalLoss(alpha=0.85, gamma=gamma, reduction='none')
+        
         # [v4.0 PERFECT] Dynamic Balancing Buffers
         self.register_buffer("w_t", torch.tensor([trend_coef]))
         self.register_buffer("w_h", torch.tensor([shock_coef]))
 
     def state_loss_fn(self, logits: torch.Tensor, targets: torch.Tensor, stability_factor: float = 1.0) -> torch.Tensor:
         """
-        [v4.5 PERFECT] Robust ASL with Logit Clamping and Configurable Gamma.
+        [v5.2 SOTA] Unified Focal Loss for Clinical State tracking.
         """
-        # [v5.1 SOTA] Removed hard-clamping to restore signal integrity. 
-        # Analytical stability is handled by BCEWithLogitsLoss.
-        
-        # 2. Use Configured Gamma with Stability Damping
-        # Adaptive Focal Relaxation: gamma_neg drops to 1.0 (Neutral CE) during shocks
-        gamma_neg = 1.0 + (self.gamma - 1.0) * stability_factor
-        gamma_pos = 1.0        # Constant for positive class focus
-        clip = 0.05
-        
-        # 3. Compute Probabilities
-        probs = torch.sigmoid(logits)
-        
-        # 4. Asymmetric Probability Shifting
-        # xs_pos: prob of being positive (when target=1)
-        # xs_neg: prob of being negative (when target=0)
-        xs_pos = probs
-        xs_neg = (1.0 - probs + clip).clamp(max=1.0)
-        
-        # 5. Weight Calculation
-        # ASL Weight = (1 - p_target) ^ gamma
-        # We handle both pos/neg cases in one tensor operation
-        # p_target = xs_pos * targets + xs_neg * (1 - targets)
-        p_target = xs_pos * targets + xs_neg * (1.0 - targets)
-        gamma_weight = gamma_pos * targets + gamma_neg * (1.0 - targets)
-        
-        asl_w = torch.pow(1.0 - p_target, gamma_weight)
-        
-        # 6. Base Loss
-        # [SOTA FIX] Alarm Fatigue Prevention: ASL inherently handles imbalance.
-        # Multiplying by pos_weight here causes catastrophic gradient explosion.
-        bce = F.binary_cross_entropy_with_logits(
-            logits, targets, 
-            reduction='none'
-        )
-        
-        return asl_w * bce
+        # [RY.MD FIX] Restore Forensic Alpha/Gamma alignment
+        # Adaptive Focal Relaxation: gamma_neg drops to 1.0 during shocks
+        # We manually handle the relaxation to preserve BGSLLoss specific dynamics
+        with torch.no_grad():
+            gamma_neg_eff = 1.0 + (self.gamma - 1.0) * stability_factor
+            p = torch.sigmoid(logits)
+            
+            # [v14.9.1 SURGICAL PATCH] ASL Probability Shifting
+            # Rationale: Shift negative probabilities up by 0.05 clip margin 
+            # to hard-threshold trivially easy negatives to zero gradient.
+            p_neg_shifted = (1.0 - p + 0.05).clamp(max=1.0)
+            pt = p * targets + p_neg_shifted * (1.0 - targets)
+            
+            # Asymmetrical focusing
+            gamma_t = 1.0 * targets + gamma_neg_eff * (1.0 - targets)
+            alpha_t = 0.85 * targets + 0.15 * (1.0 - targets)
+            
+            focal_w = alpha_t * torch.pow(1.0 - pt, gamma_t)
+            
+        bce = F.binary_cross_entropy_with_logits(logits, targets.float(), reduction='none')
+        return focal_w * bce
 
     def forward(
         self, 
