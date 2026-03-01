@@ -48,7 +48,8 @@ class GatedResidualNetwork(nn.Module):
         self.linear2 = nn.Linear(hidden_dim, d_model)
         self.dropout = nn.Dropout(dropout)
         self.glu = SwiGLU(d_model, d_model) # Upgraded to SwiGLU
-        self.norm = nn.LayerNorm(d_model)
+        # [v14.4 SOTA] Scale-Aware Normalization (Deep Hijacking Fix #111)
+        self.norm = RMSNorm(d_model, eps=1e-5)
 
     def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         # 1. Processing
@@ -149,13 +150,22 @@ class RoPEMultiheadAttention(nn.Module):
         if key_padding_mask is not None:
             # [SOTA FIX 1] Strict boolean mask expansion
             mask_expanded = key_padding_mask.unsqueeze(1).unsqueeze(2).bool()
+            
+            # [PHASE 1.5 SOTA] Attention Zero-Sink (Smoking Gun #81)
+            # Rationale: If all keys are masked, Softmax(-inf) yields NaN.
+            # We must detect 'Empty Rows' and bypass them.
+            all_masked = mask_expanded.all(dim=-1, keepdim=True)
+            
             # [SOTA FIX 2] Use -torch.inf for exact 0.0 softmax probability
             scores = scores.masked_fill(mask_expanded, -torch.inf)
             
         weights = F.softmax(scores, dim=-1)
         
-        # [SOTA FIX 3] Iron Dome: If an entire row is masked, Softmax(-inf) yields NaN.
-        # We MUST flush these NaNs to 0.0 to prevent the V-projection from corrupting.
+        # [PHASE 1.5 SOTA] Sink-Aware Re-weighting
+        if key_padding_mask is not None:
+            weights = weights.masked_fill(all_masked, 0.0)
+            
+        # [SOTA FIX 3] Atomic NaN Guard
         weights = weights.nan_to_num(0.0)
         
         output = torch.matmul(weights, v) # [B, H, T, D_h]
@@ -182,7 +192,8 @@ class NTHAttention(nn.Module):
         
         self.local_window = local_window
         self.out_proj = nn.Linear(d_model, d_model)
-        self.norm = nn.LayerNorm(d_model)
+        # [v14.4 SOTA] Scale-Aware Normalization (Deep Hijacking Fix #111)
+        self.norm = RMSNorm(d_model, eps=1e-5)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         residual = x
@@ -225,10 +236,15 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.scale = nn.Parameter(torch.ones(d_model))
 
-    def forward(self, x):
-        norm_x = x.norm(2, dim=-1, keepdim=True)
-        rms_x = norm_x * (x.size(-1) ** -0.5)
-        return self.scale * x / (rms_x + self.eps)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [v14.5 SOTA] Precision-Stable RMS (NASA-Tier)
+        # Rationale: Large activation spikes in FP16 can causing overflow in x.pow(2).
+        # We perform the norm extraction in float32 for safety.
+        orig_dtype = x.dtype
+        x_f32 = x.float()
+        variance = x_f32.pow(2).mean(-1, keepdim=True)
+        x_norm = x_f32 * torch.rsqrt(variance + self.eps)
+        return (self.scale * x_norm).to(orig_dtype)
 
 class SotaTransformerBlock(nn.Module):
     """

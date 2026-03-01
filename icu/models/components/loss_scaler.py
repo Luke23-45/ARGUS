@@ -29,12 +29,8 @@ class BayesianProjectedScaler(nn.Module):
         if num_tasks > 6: log_vars_init[6] = 2.0  # phys starts heavily suppressed
         self.log_vars = nn.Parameter(log_vars_init)
         
-        # [v29.6] Gradient Hardening
-        self.log_vars.register_hook(lambda grad: grad.clamp(min=-0.1, max=0.1))
-        
         # EMA tracking for UW-SO stability
         self.register_buffer("loss_emas", torch.ones(num_tasks))
-        self.register_buffer("decay", torch.tensor([decay]))
         
         # Accumulation Buffers
         self.register_buffer("loss_accumulator", torch.zeros(num_tasks))
@@ -225,6 +221,15 @@ class BayesianProjectedScaler(nn.Module):
         self.log_vars[3].clamp_(max=4.0)
         # 5. Physics Guard
         self.log_vars[6].clamp_(max=8.0)
+        
+        # 6. [v12.1 NASA-TIER FIX] Clinical Precision Floor (Uncertainty Trap Prevention)
+        # Rationale: Bayesian scaling treats high loss as 'noise' to suppress.
+        # For clinical tasks (Aux, ACL, BGSL), high loss is a CRITICAL ERROR.
+        # We enforce a precision floor (log_var ceiling) so these tasks can never 
+        # be suppressed below 25% of their initial priority.
+        # Index 2=Aux, 3=ACL, 4=BGSL
+        for idx in [2, 3, 4]:
+             self.log_vars[idx].clamp_(max=2.0) # precision_floor = exp(-2.0) approx 0.13
 
     @torch.no_grad()
     def calibrate_log_vars(self, loss_dict: Dict[str, torch.Tensor], anchor_key: str = 'diffusion'):

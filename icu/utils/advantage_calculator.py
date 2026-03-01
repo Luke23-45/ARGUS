@@ -1023,8 +1023,8 @@ class ICUAdvantageCalculator(nn.Module):
                 else:
                     g_b_sum, g_b_sq_sum, g_b_count = b_sum, b_sq_sum, b_count[0]
                 
-                # Check for updates (Tensor logic)
-                mask_update = g_b_count > 1
+                # [v14.5 NASA-TIER] Finite-Stats DDP Guard
+                mask_update = (g_b_count > 1) and torch.isfinite(stats).all()
                 if mask_update:
                     curr_mu = g_b_sum / g_b_count
                     curr_var = (g_b_sq_sum / g_b_count) - (curr_mu ** 2)
@@ -1381,8 +1381,8 @@ class ICUAdvantageCalculator(nn.Module):
                 else:
                     a_valid = advantages.reshape(-1)
                 
-                if a_valid.numel() == 0:
-                    return beta_raw
+                # [v800 SOTA FIX] AWR Bisection DDP Deadlock
+                is_empty = a_valid.numel() == 0
                 
                 # [v4.1.10 SOTA FIX] Dynamic Target ESS (Zero-Sync)
                 batch_size = total_batch_size if total_batch_size is not None else float(a_valid.numel())
@@ -1393,14 +1393,24 @@ class ICUAdvantageCalculator(nn.Module):
                 
                 target_ess_t = torch.tensor(target_ess_count, device=device, dtype=torch.float32)
                     
-                a_max = a_valid.max()
-                # [SOTA FIX v4.1] FP16 Overflow Prevention: Force float32 for exponential sums
-                a_norm = (a_valid - a_max).float()
+                # [v14.0 NASA-TIER] Global Beta Synchronization
+                a_max = a_valid.max().detach() if not is_empty else torch.tensor(-100.0, device=device)
+                if dist.is_initialized():
+                    dist.all_reduce(a_max, op=dist.ReduceOp.MAX)
                 
-                def get_ess_at(b):
-                    w = torch.exp(a_norm / (b + 1e-8))
-                    sum_w = w.sum()
-                    return (sum_w * sum_w) / (w.pow(2).sum() + 1e-8)
+                def get_global_ess_at(b):
+                    w = torch.exp((a_valid - a_max).float() / (b + 1e-5))
+                    l_sum_w = w.sum().view(1)
+                    l_sum_w_sq = w.pow(2).sum().view(1)
+                    
+                    if dist.is_initialized():
+                        stats = torch.stack([l_sum_w[0], l_sum_w_sq[0]])
+                        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                        g_sum_w, g_sum_w_sq = stats[0], stats[1]
+                    else:
+                        g_sum_w, g_sum_w_sq = l_sum_w[0], l_sum_w_sq[0]
+                    
+                    return (g_sum_w * g_sum_w) / (g_sum_w_sq + 1e-5)
                 
                 # Tensorized Control Block
                 low_t = torch.tensor(self.min_beta, device=device, dtype=torch.float32)
@@ -1408,12 +1418,13 @@ class ICUAdvantageCalculator(nn.Module):
                 
                 for _ in range(10):
                     mid_t = (low_t + high_t) / 2.0
-                    ess_val = get_ess_at(mid_t)
+                    ess_val = get_global_ess_at(mid_t)
                     condition = ess_val < target_ess_t
                     low_t = torch.where(condition, mid_t, low_t)
                     high_t = torch.where(condition, high_t, mid_t)
                 
-                curr_beta_t = (low_t + high_t) / 2.0
+                beta_target = mid_t.detach()
+                curr_beta_t = torch.clamp(beta_target, min=self.beta * 0.90, max=self.beta * 1.10)
                 
                 # Smooth update with momentum (Tensorized to prevent sync)
                 if not torch.is_tensor(effective_momentum):
@@ -1422,7 +1433,8 @@ class ICUAdvantageCalculator(nn.Module):
                 updated_beta = torch.lerp(self.beta, curr_beta_t.to(self.beta.dtype), mom)
                 
                 # Apply combined update (Saturation vs Standard is already fused)
-                self.beta.copy_(torch.where(standard_mask.bool(), torch.clamp(updated_beta, min=self.min_beta), self.beta))
+                if not is_empty:
+                    self.beta.copy_(torch.where(standard_mask.bool(), torch.clamp(updated_beta, min=self.min_beta, max=self.max_beta), self.beta))
                 
                 # [v2026 SOTA] Dampened Emergency Recovery (Zero-Sync)
                 # Rationale: Growth factor reduced (2.0 -> 1.1) to preserve selective gradients.

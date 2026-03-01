@@ -190,7 +190,8 @@ class TimeAttentionPooling(nn.Module):
         # Learnable query vector (the "What to summarize" expert)
         self.summary_query = nn.Parameter(torch.randn(1, 1, d_model))
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.norm = nn.LayerNorm(d_model)
+        # [v14.5 SOTA] Scale-Aware Pooled Norm (Deep Hijacking Fix #111)
+        self.norm = RMSNorm(d_model, eps=1e-5)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -276,8 +277,15 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        norm_x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return norm_x * self.weight
+        # [v14.5 SOTA] Precision-Stable RMS (NASA-Tier)
+        # Rationale: Large activation spikes in FP16 can causing overflow in x.pow(2).
+        # We perform the norm extraction in float32 for safety.
+        # eps=1e-5 ensures clinical suppression is preserved (Smoking Gun #97).
+        orig_dtype = x.dtype
+        x_f32 = x.float()
+        variance = x_f32.pow(2).mean(-1, keepdim=True)
+        x_norm = x_f32 * torch.rsqrt(variance + self.eps)
+        return (self.weight * x_norm).to(orig_dtype)
 
 
 class SwiGLU(nn.Module):
@@ -426,12 +434,23 @@ def robust_flash_attention(
         # Note: Adding explicit bias may disable Flash kernel in some versions,
         # but correctness > speed for safety-critical applications
 
+    # [v14.5 SOTA] Sink-Aware Attention (Smoking Gun #81)
+    # Rationale: If a row is fully masked, Softmax(-inf) yields NaN. 
+    # We bypass these "empty rows" to preserve the residual identity.
+    if key_padding_mask is not None:
+        all_masked = key_padding_mask.unsqueeze(1).unsqueeze(2).expand(B, n_heads, L_q, L_k).all(dim=-1, keepdim=True)
+    
     # 3. Scaled Dot Product Attention
     out = F.scaled_dot_product_attention(
         q, k, v, 
         attn_mask=attn_bias, 
         dropout_p=dropout if dropout > 0 else 0.0
     )
+    
+    # Re-apply sink mask + NaN guard
+    if key_padding_mask is not None:
+        out = out.masked_fill(all_masked, 0.0)
+    out = out.nan_to_num(0.0)
 
     # Reshape back: [B, H, L, D_h] -> [B, L, D]
     return out.transpose(1, 2).contiguous().view(B, L_q, D)

@@ -2271,6 +2271,9 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
             l_batch_bwd = total_loss_bwd - (l_ref_bwd if l_ref_bwd is not None else 0.0)
 
+            # [SOTA FIX v33.3 / Singularity FIX #670] DDP Clock Drift Sinkhole
+            is_accumulating = not should_step
+
             # [Optimization Context]
             # Use no_backward_sync if we are in DDP and NOT on the stepping batch.
             sync_context = contextlib.nullcontext()
@@ -2498,19 +2501,19 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # Use cached weights for projection; update happens in step block.
             task_weights = self.gradnorm.get_weights().detach()
             
+            # [Abyssal FIX #510] Explicit Accumulation Scaling for PCGrad
+            accum_scale = 1.0 / acc_batches if acc_batches > 1 else 1.0
+            
             # 2. Weighted losses for CAGrad surgery
-            # [v2026 SOTA FIX] Unified Connectivity Guard (Deadlock Prevention)
-            # Rationale: manual_backward on a tensor without grad_fn skips DDP sync.
-            # We add 0.0 * first_param to every task to ENSURE all ranks sync together.
             first_p = next(self.parameters())
             weighted_tasks = [
-                (diff_loss_unweighted * task_weights[0]) + 0.0 * first_p, 
-                (critic_loss * task_weights[1]) + 0.0 * first_p, 
-                (aux_loss * task_weights[2]) + 0.0 * first_p, 
-                (acl_loss * task_weights[3]) + 0.0 * first_p,
-                (l_bgsl * task_weights[4]) + 0.0 * first_p,
-                (l_tcb * task_weights[5]) + 0.0 * first_p,
-                (phys_loss * task_weights[6]) + 0.0 * first_p
+                ((diff_loss_unweighted * task_weights[0]) + 0.0 * first_p) * accum_scale, 
+                ((critic_loss * task_weights[1]) + 0.0 * first_p) * accum_scale, 
+                ((aux_loss * task_weights[2]) + 0.0 * first_p) * accum_scale, 
+                ((acl_loss * task_weights[3]) + 0.0 * first_p) * accum_scale,
+                ((l_bgsl * task_weights[4]) + 0.0 * first_p) * accum_scale,
+                ((l_tcb * task_weights[5]) + 0.0 * first_p) * accum_scale,
+                ((phys_loss * task_weights[6]) + 0.0 * first_p) * accum_scale
             ]
             total_loss = torch.stack([t.detach() for t in weighted_tasks]).sum()
             loss_dict = {
@@ -2574,7 +2577,7 @@ class ICUGeneralistWrapper(pl.LightningModule):
 
             acc_norm = self.cfg.train.get("accumulate_grad_batches", 1)
             raw_pressure = OrthogonalGuard.compute_grad_norm(self.model, extra_params=meta_params)
-            current_grad_pressure = raw_pressure / float(acc_norm)
+            current_grad_pressure = raw_pressure # [Abyssal FIX #510] Removed erroneous scaling
             
             # [v118.2 SOTA FIX] DDP Pressure Consensus (Smoking Gun #118)
             # Rationale: All ranks must agree on the manifold pressure to prevent 
@@ -2611,12 +2614,8 @@ class ICUGeneralistWrapper(pl.LightningModule):
             # [ROBUSTNESS] Use .get() fallback to prevent crash if key is missing
             clip_val = self.cfg.train.get("grad_clip", 1.0)
             
-            # [v27.1 FIX] Scale clip threshold with accumulation steps
-            # Rationale: Accumulated gradients scale as √(accum_steps)
-            # Without scaling, accum=16 retains only 38.6% of gradient info vs 100% for accum=1
+            # [Abyssal FIX #510] Removed erroneous clip_val scaling
             accum_steps = self.cfg.train.get("accumulate_grad_batches", 1)
-            if accum_steps > 1:
-                clip_val = clip_val * (accum_steps ** 0.5)
             
             if clip_val > 0:
                 # [v27.2 SOTA FIX] Late-Stage Iron Dome Protection
@@ -2651,16 +2650,18 @@ class ICUGeneralistWrapper(pl.LightningModule):
                 # [v26.1 FIX] Allow training without clipping (assume finite or trust regularizers)
                 grad_norm_val = torch.tensor(0.0, device=self.device)
 
-            # [v30.0 SOTA] Global Heartbeat Consensus
+            # [Singularity FIX #600] Global Heartbeat Consensus & Escalation Shield
             # Rationale: Ranks MUST step or skip together. A single Inf on one rank 
             # will cause a "One-Armed Bandit" state if others proceed.
+            is_globally_finite = True
             if dist.is_initialized():
                 finite_t = torch.as_tensor(1.0 if torch.isfinite(grad_norm_val) else 0.0, device=self.device)
                 dist.all_reduce(finite_t, op=dist.ReduceOp.MIN)
-                should_apply = (clip_val <= 0) or (finite_t > 0.5)
-
+                is_globally_finite = (finite_t.item() > 0.5)
+                should_apply = (clip_val <= 0) or is_globally_finite
             else:
-                should_apply = (clip_val <= 0) or torch.isfinite(grad_norm_val)
+                is_globally_finite = torch.isfinite(grad_norm_val).item() if isinstance(grad_norm_val, torch.Tensor) else True
+                should_apply = (clip_val <= 0) or is_globally_finite
 
             # [v2026 SOTA] Stabilization Metadata Consolidation
             # Rationale: These variables must be available for both the Deadman Switch 
